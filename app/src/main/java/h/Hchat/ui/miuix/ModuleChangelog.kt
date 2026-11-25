@@ -42,6 +42,14 @@ internal object ModuleChangelog {
     /** 新的在上。版本号按发布顺序倒序排列。 */
     val entries: List<ModuleChangelogEntry> = listOf(
         ModuleChangelogEntry(
+            "6.7.7.15",
+            listOf(
+                "快捷已读：修复滑动时卡顿 —— 按下不再触发全树遍历，拖拽目标推迟到确认上滑后解析并缓存底栏",
+                "快捷已读：全部已读改到后台线程执行，抬手不再阻塞主线程的数据库往返",
+                "快捷已读：拖动阈值只换算一次，避免每帧重复 TypedValue 计算"
+            )
+        ),
+        ModuleChangelogEntry(
             "6.7.7.14",
             listOf(
                 "脚本引擎：布尔/数值等基本类型也能调用 equals/hashCode/toString/compareTo，修复 Boolean.TRUE.equals 报 No such method",
