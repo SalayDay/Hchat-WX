@@ -42,6 +42,13 @@ internal object ModuleChangelog {
     /** 新的在上。版本号按发布顺序倒序排列。 */
     val entries: List<ModuleChangelogEntry> = listOf(
         ModuleChangelogEntry(
+            "6.7.7.13",
+            listOf(
+                "修复脚本插件 hook 回调报 NoSuchFieldException: 恢复兼容层类的 keep 规则，param.thisObject 等字段名不再被 R8 改写",
+                "设置注入诊断日志改为跟随 HLog 开关，设置入口异常时不再无迹可查"
+            )
+        ),
+        ModuleChangelogEntry(
             "6.7.7.12",
             listOf(
                 "修复微信设置页 Hchat 入口消失：兼容层现在会采用 after 钩子对返回值的改写",

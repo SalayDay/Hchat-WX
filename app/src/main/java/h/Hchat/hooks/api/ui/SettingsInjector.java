@@ -56,7 +56,17 @@ public class SettingsInjector {
     private static final String PREFS_KEY = "Hchat_settings";
     private static final String PREFS_TITLE = "Hchat";
     private static final String MODULE_TAG = "Hchat";
-    private static final boolean VERBOSE = false;
+    /**
+     * 设置注入的诊断开关。
+     *
+     * 原来这里是 `false`，导致 39 条 logDetail 全部静默，设置入口消失时
+     * 日志里连一行 `[Hchat:SettingsInjector]` 都看不到，只能靠猜。
+     * 改为跟 HLog 的栈追踪开关联动：默认不开（不产生额外日志），
+     * 排障时打开 {@link h.Hchat.utils.HLog#setStackTraceEnabled} 即可看到每一步。
+     */
+    private boolean verbose() {
+        return h.Hchat.utils.HLog.isStackTraceEnabled();
+    }
 
     // 新版 SettingItem 的 nameResId，用 Context.getString 拦截时判断。
     // 必须使用 Hchat 独有值，避免和 WeKitFork 等同源模块的伪资源 ID 串台。
@@ -1442,7 +1452,7 @@ public class SettingsInjector {
     }
 
     private void logDetail(String message) {
-        if (VERBOSE) {
+        if (verbose()) {
             XposedBridge.log(TAG + " " + message);
         }
     }

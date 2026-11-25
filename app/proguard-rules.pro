@@ -62,6 +62,14 @@
 -keep,allowoptimization,allowobfuscation public class * extends io.github.libxposed.api.XposedModule {
     public <init>();
 }
+# 兼容层必须保留可读类名与字段名。
+# 脚本插件按文档用 `param.thisObject` / `param.args` / `param.method` /
+# `param.getResult()` 反射访问 MethodHookParam；一旦被 R8 改名成 `sa6.b` 这种，
+# 脚本侧就地抛 NoSuchFieldException: sa6.thisObject，插件静默失效。
+# 迁移前这里是 `-keep class de.robv.android.xposed.** { *; }`，迁移时被替换掉，
+# 必须按新包名补回来。
+-keep class de.robv.android.xposed.** { *; }
+-keep class h.Hchat.compat.** { *; }
 -keep class h.Hchat.ModuleEntry { *; }
 -keep class h.Hchat.crash.NativeCrashBridge { *; }
 -keep class h.Hchat.crash.CrashExitInfoApi30 { *; }

@@ -44,7 +44,6 @@ public class SettingsDexFinder {
     private static final String CACHE_KEY = "cache.key";
     private static final String CACHE_CORE_COMPLETE = "cache.core.complete";
     private static final String CACHE_PLUS_COMPLETE = "cache.plus.complete";
-    private static final boolean VERBOSE = false;
 
     private final DexKitBridge dexKit;
     private final ClassLoader classLoader;
@@ -685,9 +684,14 @@ public class SettingsDexFinder {
     }
 
     private void logDetail(String message) {
-        if (VERBOSE) {
+        if (verbose()) {
             XposedBridge.log(TAG + " " + message);
         }
+    }
+
+    /** 与 SettingsInjector 一致：跟随 HLog 的诊断开关，默认静默。 */
+    private boolean verbose() {
+        return h.Hchat.utils.HLog.isStackTraceEnabled();
     }
 
     private boolean loadCache(boolean includePlusMenu) {

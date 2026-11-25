@@ -126,6 +126,11 @@ public final class HLog {
         stackTraceEnabled = enabled;
     }
 
+    /** 诊断开关是否打开；设置注入等模块用它决定是否输出明细日志。 */
+    public static boolean isStackTraceEnabled() {
+        return stackTraceEnabled;
+    }
+
     /** 初始化和同步共用一个后台工作线程，调用方不执行磁盘 IO。 */
     public static void initCapture(Context context) {
         if (context == null) return;
