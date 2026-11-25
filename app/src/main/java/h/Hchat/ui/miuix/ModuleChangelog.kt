@@ -42,6 +42,16 @@ internal object ModuleChangelog {
     /** 新的在上。版本号按发布顺序倒序排列。 */
     val entries: List<ModuleChangelogEntry> = listOf(
         ModuleChangelogEntry(
+            "6.7.7.14",
+            listOf(
+                "脚本引擎：布尔/数值等基本类型也能调用 equals/hashCode/toString/compareTo，修复 Boolean.TRUE.equals 报 No such method",
+                "脚本引擎：lambda 实参按接口 SAM 匹配度打分，修复 get(url, headers, resp -> ...) 报 Ambiguous script method",
+                "小程序强制分享：改按结构定位菜单体系，8.0.76/8.0.80 都能挂上",
+                "截图转发按钮：转发动作 id 与浮层类名改为多锚点尝试，8.0.76 也能定位",
+                "公众号广告拦截：混淆类名改为运行期按候选表解析，兼容 8.0.76/8.0.80"
+            )
+        ),
+        ModuleChangelogEntry(
             "6.7.7.13",
             listOf(
                 "修复脚本插件 hook 回调报 NoSuchFieldException: 恢复兼容层类的 keep 规则，param.thisObject 等字段名不再被 R8 改写",

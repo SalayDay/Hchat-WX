@@ -148,20 +148,15 @@ class RemoveSubscribeAdsFeature : BaseFeature() {
         private val NATIVE_AD_EVENTS = listOf("ZIDL_AV", "ZIDL_BV")
 
         /**
-         * 广告卡专用事件出口（8.0.80 为 `wx.i1`）。
-         *
-         * 只有 `wx.b0` / `wx.c2` 两个子类，都由 `MagicAdBrandServiceFeatureService`
-         * 创建；`H1(key, value)` 只转调 `mu0.i.H1` 的 sendEvent。挂到它就等于把
-         * 广告卡发给 Flutter 的所有事件全部掐掉。
-         */
-        private const val AD_CARD_EVENT_CLASS = "wx.i1"
-
-        /**
          * 广告事件下发出口的候选类，按优先级尝试：
-         * - `wx.i1` 是广告卡专用出口（范围最小、最准，命中即全量丢弃）
-         * - `mu0.i` 是 MagicBrush 运行时基类（兜底，只能按事件名精确匹配）
+         * - 广告卡专用出口（范围最小、最准，命中即全量丢弃）
+         * - MagicBrush 运行时基类（兜底，只能按事件名精确匹配）
+         *
+         * 运行期按候选表逐个尝试，见 [EVENT_GATE_CLASSES] 的使用点。
          */
-        private val EVENT_GATE_CLASSES = listOf(AD_CARD_EVENT_CLASS, "mu0.i")
+        private val AD_CARD_EVENT_CANDIDATES = listOf("wx.i1", "fx.w1")
+
+        private val EVENT_GATE_CLASSES = AD_CARD_EVENT_CANDIDATES + listOf("mu0.i")
 
         /** 明文事件名，来自 MBJsEventOnXxxServerInfo 三个事件类的构造常量。 */
         private val AD_EVENTS = setOf(
@@ -188,54 +183,50 @@ class RemoveSubscribeAdsFeature : BaseFeature() {
         private const val AD_CARD_TYPE = 1
 
         /**
-         * 广告卡片服务 `MagicAdBrandServiceFeatureService` = `wx.p0`（8.0.80 / 3220 实查）。
+         * 广告卡片服务 `MagicAdBrandServiceFeatureService` 的候选类名（按版本从新到旧）。
          *
-         * `wx.w1` 在 8.0.80 有两个子类，**必须分清，不能一起拦**：
-         * - `wx.p0` → 构造串 `MagicAdBrandService`，方法串 `MagicAdBrandServiceFeatureService`
-         *   → 广告卡服务，本功能的唯一目标；
-         * - `wx.g2` → 构造串 `MagicBrandService`，方法串 `MagicBrandServiceFeatureService`
-         *   → 正常品牌卡服务，动了它会顺手把正常卡片弄没。
+         * 基类在同一版本里有两个子类，**必须分清，不能一起拦**：
+         * - 广告卡服务 → 构造串 `MagicAdBrandService`、方法串 `MagicAdBrandServiceFeatureService`
+         *   8.0.80 = `wx.p0`，8.0.76 = `fx.f0`，本功能的唯一目标；
+         * - 正常品牌卡服务 → 构造串 `MagicBrandService`、方法串 `MagicBrandServiceFeatureService`
+         *   8.0.80 = `wx.g2`，8.0.76 = `fx.t1`，**绝不能碰**。
          *
-         * 上一版把两个都按 `Qj/Rj` 拦，结果是"该拦的没拦住、不该拦的被废掉"。
+         * 两版的广告服务名是一一对应的（`wx.p0` ↔ `fx.f0`），所以按「第一个能加载到的」
+         * 取即可，不存在把正常品牌卡认成广告服务的风险。
          */
-        private const val AD_CARD_SERVICE_CLASS = "wx.p0"
+        private val AD_CARD_SERVICE_CANDIDATES = listOf("wx.p0", "fx.f0")
 
-        /** 广告卡服务的两个 MagicBrush 实例（都继承 `wx.i1`，都覆写了 `P9`）。 */
-        private val AD_CARD_INSTANCE_CLASSES = listOf("wx.b0", "wx.c2")
+        /** 广告卡服务的两个 MagicBrush 实例（都继承事件出口类，都覆写了 `P9`）。 */
+        private val AD_CARD_INSTANCE_CANDIDATES = listOf(
+            listOf("wx.b0", "wx.c2"),
+            listOf("fx.b0", "fx.c2")
+        )
 
-        /** `Ej` 所在的基类（静态转发，把 frame 交给广告卡模型 `wx.i1`）。 */
-        private const val AD_CARD_BASE_CLASS = "wx.w1"
+        /** `Ej` 所在的基类（静态转发，把 frame 交给广告卡模型）。 */
+        private val AD_CARD_BASE_CANDIDATES = listOf("wx.w1", "fx.j1")
 
-        /**
-         * 广告卡拉取任务 `wx.m0`（8.0.80 / 3220 实查）。
-         *
-         * 唯一构造点是 `wx.p0.Sj(String)` —— 只有广告卡服务会创建它；
-         * `run()` 的全部动作就是 `px.b.Fj(1)` 取卡、`LinkedList.size()` 统计、
-         * 再打一条 magicbrush 监控。**它不经过 `Oj()`**，所以前 8 道服务门对它无效，
-         * 冷启动时照样能把 cardType=1 拉起来（日志里"卡片门命中、服务门零命中"
-         * 就是它造成的）。
-         *
-         * 直接丢弃这个任务等于"广告卡服务这次取数不执行"：没有返回值可填、没有
-         * 回调可炸，比拦 `Fj` 更靠上游，也不会让 native 侧留下缓存。
-         */
-        private const val AD_FETCH_TASK_CLASS = "wx.m0"
+        /** 广告卡拉取任务（唯一构造点是广告服务的 `Sj`）。 */
+        private val AD_FETCH_TASK_CANDIDATES = listOf("wx.m0", "fx.m0")
 
-        /**
-         * 广告卡帧任务 `wx.v1`（8.0.80 / 3220 实查）。
-         *
-         * `wx.m0` 只是"数卡片"的任务，真正取数并分发的是它：
-         * ```
-         * wx.v1.run()
-         *   → wx.w1.Nj()         取 cardType
-         *   → px.b.Fj(type)      取卡
-         *   → 逐条 wx.w1.Ej(...) 分发给渲染器
-         * ```
-         * 实例上持有发起方服务（字段 `d: Lwx/w1;`）：`wx.p0` = 广告卡服务，
-         * `wx.g2` = 正常品牌卡服务。**只丢 p0 的**，g2 必须放行。
-         *
-         * 6.7.7.4 的日志里，m0 被丢掉之后取数照样每 20~30 秒发生一次，调用方就是它。
-         */
-        private const val AD_FRAME_TASK_CLASS = "wx.v1"
+        /** 广告卡帧任务（真正「取数 + 分发」的那个任务）。 */
+        private val AD_FRAME_TASK_CANDIDATES = listOf("wx.v1", "fx.v1")
+
+        /** 按候选顺序取第一个能加载到的类名，全都不存在时返回 null。 */
+        private fun resolveClassName(loader: ClassLoader, candidates: List<String>): String? =
+            candidates.firstOrNull { candidate ->
+                runCatching { Class.forName(candidate, false, loader) }.isSuccess
+            }
+
+        /** 按候选顺序取第一个能加载到的类名，全都不存在时退回首个候选（保持日志可读）。 */
+        private fun resolveClassNameOrFirst(loader: ClassLoader, candidates: List<String>): String =
+            resolveClassName(loader, candidates) ?: candidates.first()
+
+        // ==== 运行期解析出的混淆类名（见 install 里的 resolveClassNameOrFirst）====
+        @Volatile private var resolvedAdServiceClass: String = "wx.p0"
+        @Volatile private var resolvedAdBaseClass: String = "wx.w1"
+        @Volatile private var resolvedAdFetchTaskClass: String = "wx.m0"
+        @Volatile private var resolvedAdFrameTaskClass: String = "wx.v1"
+        @Volatile private var resolvedAdInstanceClasses: List<String> = listOf("wx.b0", "wx.c2")
 
         private val hits = AtomicInteger()
         private val dropped = AtomicInteger()
@@ -333,6 +324,15 @@ class RemoveSubscribeAdsFeature : BaseFeature() {
                 val enabledFlag = HotConfig.flag(ID, KEY_ENABLE, DEFAULT_ENABLE) {
                     isEnabled(context)
                 }
+                // 混淆类名逐版本变化（8.0.80 = wx.*，8.0.76 = fx.*）：先按候选表解析一次，
+                // 之后各门都用解析结果，避免每个门各自重复尝试。
+                resolvedAdServiceClass = resolveClassNameOrFirst(classLoader, AD_CARD_SERVICE_CANDIDATES)
+                resolvedAdBaseClass = resolveClassNameOrFirst(classLoader, AD_CARD_BASE_CANDIDATES)
+                resolvedAdFetchTaskClass = resolveClassNameOrFirst(classLoader, AD_FETCH_TASK_CANDIDATES)
+                resolvedAdFrameTaskClass = resolveClassNameOrFirst(classLoader, AD_FRAME_TASK_CANDIDATES)
+                resolvedAdInstanceClasses = AD_CARD_INSTANCE_CANDIDATES.firstOrNull { names ->
+                    names.any { runCatching { Class.forName(it, false, classLoader) }.isSuccess }
+                } ?: AD_CARD_INSTANCE_CANDIDATES.first()
                 val pullHooks = hookAdPullGate(classLoader, enabledFlag)
                 val cardGate = hookCardListGate(classLoader, enabledFlag)
                 val fetchTaskGate = hookAdFetchTaskGate(classLoader, enabledFlag)
@@ -473,19 +473,19 @@ class RemoveSubscribeAdsFeature : BaseFeature() {
          * 比拦 `Fj` 更省（少一次跨语言调用 + 少一次监控上报）。
          */
         private fun hookAdFetchTaskGate(loader: ClassLoader, enabled: () -> Boolean): Boolean {
-            val method = exactMethod(AD_FETCH_TASK_CLASS, loader, "run") ?: run {
-                HLog.event("$TAG 广告卡拉取任务 $AD_FETCH_TASK_CLASS#run 未命中（微信 ${wechatVersion()}）")
+            val method = exactMethod(resolvedAdFetchTaskClass, loader, "run") ?: run {
+                HLog.event("$TAG 广告卡拉取任务 ${resolvedAdFetchTaskClass}#run 未命中（微信 ${wechatVersion()}）")
                 return false
             }
             if (method.parameterCount != 0 || method.returnType != java.lang.Void.TYPE) {
-                HLog.event("$TAG 广告卡拉取任务 $AD_FETCH_TASK_CLASS#run 签名不匹配")
+                HLog.event("$TAG 广告卡拉取任务 ${resolvedAdFetchTaskClass}#run 签名不匹配")
                 return false
             }
             // void 方法：setResult(null) 即"整个 run() 不执行"。
             return hookFirstHit(
                 method,
                 enabled,
-                "$AD_FETCH_TASK_CLASS#run",
+                "${resolvedAdFetchTaskClass}#run",
                 "丢弃广告卡拉取任务"
             )
         }
@@ -497,22 +497,22 @@ class RemoveSubscribeAdsFeature : BaseFeature() {
          * 挂着发起方服务，**必须按服务类型区分**，否则会把 `wx.g2`（正常品牌卡）一起干掉。
          */
         private fun hookAdFrameTaskGate(loader: ClassLoader, enabled: () -> Boolean): Boolean {
-            val method = exactMethod(AD_FRAME_TASK_CLASS, loader, "run") ?: run {
-                HLog.event("$TAG 广告卡帧任务 $AD_FRAME_TASK_CLASS#run 未命中（微信 ${wechatVersion()}）")
+            val method = exactMethod(resolvedAdFrameTaskClass, loader, "run") ?: run {
+                HLog.event("$TAG 广告卡帧任务 ${resolvedAdFrameTaskClass}#run 未命中（微信 ${wechatVersion()}）")
                 return false
             }
             if (method.parameterCount != 0 || method.returnType != java.lang.Void.TYPE) {
-                HLog.event("$TAG 广告卡帧任务 $AD_FRAME_TASK_CLASS#run 签名不匹配")
+                HLog.event("$TAG 广告卡帧任务 ${resolvedAdFrameTaskClass}#run 签名不匹配")
                 return false
             }
             // 实例字段 d: Lwx/w1;（按类型找，不写死混淆字段名）。
             val serviceField = runCatching {
-                val serviceType = Class.forName(AD_CARD_BASE_CLASS, false, loader)
-                Class.forName(AD_FRAME_TASK_CLASS, false, loader).declaredFields
+                val serviceType = Class.forName(resolvedAdBaseClass, false, loader)
+                Class.forName(resolvedAdFrameTaskClass, false, loader).declaredFields
                     .firstOrNull { it.type == serviceType }?.also { it.isAccessible = true }
             }.getOrNull()
             val adServiceType = runCatching {
-                Class.forName(AD_CARD_SERVICE_CLASS, false, loader)
+                Class.forName(resolvedAdServiceClass, false, loader)
             }.getOrNull()
             if (serviceField == null || adServiceType == null) {
                 // 拿不到服务字段就无法区分广告与正常品牌卡，宁可放行也不误杀。
@@ -529,7 +529,7 @@ class RemoveSubscribeAdsFeature : BaseFeature() {
                         dropped.incrementAndGet()
                         if (frameLogged.compareAndSet(false, true)) {
                             HLog.boot(
-                                "$TAG 丢弃广告卡帧任务 $AD_FRAME_TASK_CLASS#run（服务 $AD_CARD_SERVICE_CLASS）"
+                                "$TAG 丢弃广告卡帧任务 ${resolvedAdFrameTaskClass}#run（服务 $resolvedAdServiceClass）"
                             )
                         }
                         param.setResult(null)
@@ -537,7 +537,7 @@ class RemoveSubscribeAdsFeature : BaseFeature() {
                 })
                 true
             }.onFailure {
-                HLog.e("$TAG hook $AD_FRAME_TASK_CLASS#run 失败: ${it.message}", it)
+                HLog.e("$TAG hook ${resolvedAdFrameTaskClass}#run 失败: ${it.message}", it)
             }.getOrDefault(false)
         }
 
@@ -565,11 +565,11 @@ class RemoveSubscribeAdsFeature : BaseFeature() {
          */
         private fun hookAdCardServiceGate(loader: ClassLoader, enabled: () -> Boolean): Int {
             var installed = 0
-            val service = AD_CARD_SERVICE_CLASS
+            val service = resolvedAdServiceClass
 
             // ① 总开关：wx.w1.Oj()Z（public final，p0/g2 共用）。native 的 ZIDL_CV / ZIDL_DV /
             //    ZIDL_EV 进门先查它；Xj / Rj / Zj 三个 Java 回调里也各自再查一遍。
-            val masterSwitch = exactMethod(AD_CARD_BASE_CLASS, loader, "Oj")
+            val masterSwitch = exactMethod(resolvedAdBaseClass, loader, "Oj")
             if (masterSwitch != null && masterSwitch.parameterCount == 0 &&
                 masterSwitch.returnType == java.lang.Boolean.TYPE
             ) {
@@ -579,18 +579,18 @@ class RemoveSubscribeAdsFeature : BaseFeature() {
                             if (!enabled()) return
                             dropped.incrementAndGet()
                             if (switchLogged.compareAndSet(false, true)) {
-                                HLog.boot("$TAG 关闭广告卡服务总开关 $AD_CARD_BASE_CLASS#Oj")
+                                HLog.boot("$TAG 关闭广告卡服务总开关 ${resolvedAdBaseClass}#Oj")
                             }
                             param.setResult(false)
                         }
                     })
                     true
                 }.onFailure {
-                    HLog.e("$TAG hook $AD_CARD_BASE_CLASS#Oj 失败: ${it.message}", it)
+                    HLog.e("$TAG hook ${resolvedAdBaseClass}#Oj 失败: ${it.message}", it)
                 }.getOrDefault(false)
                 if (ok) installed++
             } else {
-                HLog.boot("$TAG 广告卡服务总开关 $AD_CARD_BASE_CLASS#Oj 未命中（微信 ${wechatVersion()}）")
+                HLog.boot("$TAG 广告卡服务总开关 ${resolvedAdBaseClass}#Oj 未命中（微信 ${wechatVersion()}）")
             }
 
             // ② 广告服务（只挂 wx.p0，正常品牌卡 wx.g2 一律不碰）的四个出口。
@@ -625,7 +625,7 @@ class RemoveSubscribeAdsFeature : BaseFeature() {
             //    第 1 个参数就是发起帧的服务实例：**只丢 wx.p0 的广告帧**，
             //    wx.g2（正常品牌卡）原样放行 —— 上一版无差别丢弃，把正常卡片也一起干掉了。
             val dispatch = runCatching {
-                val cls = Class.forName(AD_CARD_BASE_CLASS, false, loader)
+                val cls = Class.forName(resolvedAdBaseClass, false, loader)
                 cls.declaredMethods.firstOrNull { method ->
                     method.name == "Ej" && Modifier.isStatic(method.modifiers) &&
                         method.parameterTypes.size == 4 && method.returnType == java.lang.Void.TYPE
@@ -648,16 +648,16 @@ class RemoveSubscribeAdsFeature : BaseFeature() {
                     })
                     true
                 }.onFailure {
-                    HLog.e("$TAG hook $AD_CARD_BASE_CLASS#Ej 失败: ${it.message}", it)
+                    HLog.e("$TAG hook ${resolvedAdBaseClass}#Ej 失败: ${it.message}", it)
                 }.getOrDefault(false)
                 if (ok) installed++
             } else {
-                HLog.boot("$TAG 广告帧转发点 $AD_CARD_BASE_CLASS#Ej 未命中（微信 ${wechatVersion()}）")
+                HLog.boot("$TAG 广告帧转发点 ${resolvedAdBaseClass}#Ej 未命中（微信 ${wechatVersion()}）")
             }
 
             // ④ 事件发送 P9(key,value)：wx.b0 / wx.c2 各自**覆写**了它（内部转 mu0.i#P9），
             //    是广告卡实例往 JS 推数据的另一条出口，只走 H1 会漏。
-            for (className in AD_CARD_INSTANCE_CLASSES) {
+            for (className in resolvedAdInstanceClasses) {
                 val send = exactMethod(className, loader, "P9", String::class.java, String::class.java)
                 if (send != null && send.returnType == java.lang.Void.TYPE) {
                     if (hookFirstHit(send, enabled, "$className#P9", "丢弃广告事件 P9")) installed++
@@ -822,7 +822,7 @@ class RemoveSubscribeAdsFeature : BaseFeature() {
                 // super.sendEvent，发给 Flutter 的全是广告内容 —— 全量丢弃，不认名字。
                 // 广告帧用的 key 并不是那三个 onXxxAdServerInfo，这也是之前只按名字
                 // 丢弃却拦不住的原因。
-                val dropAll = className == AD_CARD_EVENT_CLASS
+                val dropAll = className in AD_CARD_EVENT_CANDIDATES
                 val ok = runCatching {
                     HookRegistry.get().hook(method, object : XC_MethodHook() {
                         override fun beforeHookedMethod(param: MethodHookParam) {

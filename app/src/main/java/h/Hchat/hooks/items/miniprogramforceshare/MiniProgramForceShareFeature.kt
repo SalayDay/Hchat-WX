@@ -90,9 +90,14 @@ class MiniProgramForceShareFeature : BaseFeature() {
     private fun installMenuHooks(context: FeatureContext, enabled: () -> Boolean): Int {
         val loader = context.hostClassLoader()
         var installed = 0
-        val registry = KavaReflector.loadClass(MENU_REGISTRY, loader)
+        val page = MenuTargets.resolve(loader)
+        if (page == null) {
+            HLog.e("$TAG 未定位到小程序菜单体系（微信 ${wechatVersion()}）")
+            return 0
+        }
+        val registry = page.registry
         if (registry == null) {
-            HLog.e("$TAG 未找到菜单注册表 $MENU_REGISTRY")
+            HLog.e("$TAG 未找到菜单注册表（微信 ${wechatVersion()}）")
         } else {
             val add = registry.declaredMethods.firstOrNull(::isMenuItemAppend)
             if (add == null) {
@@ -113,17 +118,18 @@ class MiniProgramForceShareFeature : BaseFeature() {
                 installed++
             }
         }
-        val page = KavaReflector.loadClass(PAGE_MENU_IMPL, loader)
-        // o1 声明在基类 b6 上（t7 只是子类），所以必须按 b6 定位，否则拿不到方法。
-        val base = KavaReflector.loadClass(PAGE_MENU_BASE, loader)
-        val gate = if (base == null) null else KavaReflector.findDeclaredMethod(
-            base,
-            "o1",
-            Integer.TYPE,
-            java.lang.Boolean.TYPE
-        )
-        if (gate == null || gate.returnType != java.lang.Void.TYPE) {
-            HLog.e("$TAG 未找到菜单可见性开关 $PAGE_MENU_BASE#o1(IZ)V")
+        // 可见性开关声明在菜单页基类上（子类只是继承），必须按基类定位。
+        val gate = page.pageBase?.let { base ->
+            KavaReflector.declaredMethods(base).firstOrNull { method ->
+                method.name == page.gateName &&
+                    method.parameterCount == 2 &&
+                    method.parameterTypes[0] == Integer.TYPE &&
+                    method.parameterTypes[1] == java.lang.Boolean.TYPE &&
+                    method.returnType == java.lang.Void.TYPE
+            }
+        }
+        if (gate == null) {
+            HLog.e("$TAG 未找到菜单可见性开关（微信 ${wechatVersion()}）")
         } else {
             HookRegistry.get().hook(KavaReflector.accessible(gate) ?: gate, object : XC_MethodHook() {
                 override fun beforeHookedMethod(param: MethodHookParam) {
@@ -140,23 +146,109 @@ class MiniProgramForceShareFeature : BaseFeature() {
             })
             installed++
         }
-        val build = if (page == null) null else KavaReflector.findDeclaredMethod(page, "k1")
+        val build = page.listMethod
         if (build == null || build.returnType != java.util.List::class.java) {
-            HLog.e("$TAG 未找到菜单列表构建方法 $PAGE_MENU_IMPL#k1()List")
+            HLog.e("$TAG 未找到菜单列表构建方法（微信 ${wechatVersion()}）")
         } else {
             HookRegistry.get().hook(build, object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
                     if (!enabled() || param.hasThrowable()) return
                     val list = param.result as? MutableList<*> ?: return
-                    ensureShareItem(loader, list)
+                    ensureShareItem(loader, list, page)
                     if (HLog.isCaptureEnabled()) {
-                        HLog.event("$TAG 菜单列表 ${describeMenu(loader, list)}")
+                        HLog.event("$TAG 菜单列表 ${describeMenu(page, list)}")
                     }
                 }
             })
             installed++
         }
         return installed
+    }
+
+    /** 微信版本名，用于把定位结果写进日志时区分版本。 */
+    private fun wechatVersion(): String =
+        runCatching { WeChatApis.version()?.current()?.versionName }.getOrNull()
+            ?.takeIf { it.isNotBlank() } ?: "未知"
+
+    /**
+     * 菜单体系的运行期定位结果。
+     *
+     * 8.0.76 与 8.0.80 的混淆类名完全不同（`menu.m1`/`page.u5` vs `menu.w1`/`page.b6`），
+     * 所以不能写死类名，改为按**结构**定位：
+     *
+     * - `registry`：唯一带 `static (List, int, boolean, boolean)V` 的类；
+     * - `pageBase`：唯一带 `(int, boolean)V` 的菜单页基类，`gateName` 就是它的方法名；
+     * - `listMethod`：基类上无参返回 `List` 的构建方法；
+     * - `menuItem`：`(int, boolean, boolean)` 三元组的菜单项类（用于补回转发项）。
+     */
+    internal class MenuTargets(
+        val registry: Class<*>?,
+        val pageBase: Class<*>?,
+        val gateName: String,
+        val listMethod: java.lang.reflect.Method?,
+        val menuItem: Class<*>?,
+        val holderField: java.lang.reflect.Field?
+    ) {
+        companion object {
+            fun resolve(loader: ClassLoader): MenuTargets? {
+                val registry = findMenuItemAppendOwner(loader)
+                val gateOwner = findVisibilityGateOwner(loader)
+                if (registry == null && gateOwner == null) return null
+                val gateName = gateOwner?.let { (_, name) -> name }.orEmpty()
+                val pageBase = gateOwner?.first
+                val listMethod = pageBase?.let { base ->
+                    KavaReflector.declaredMethods(base).firstOrNull {
+                        it.parameterCount == 0 && it.returnType == java.util.List::class.java
+                    }
+                }
+                val menuItem = findMenuItemClass(loader, registry)
+                val holderField = registry?.let { cls ->
+                    KavaReflector.declaredFields(cls).firstOrNull { field ->
+                        Modifier.isStatic(field.modifiers) &&
+                            android.util.SparseArray::class.java.isAssignableFrom(field.type)
+                    }
+                }
+                return MenuTargets(registry, pageBase, gateName, listMethod, menuItem, holderField)
+            }
+
+            private fun findMenuItemAppendOwner(loader: ClassLoader): Class<*>? {
+                val candidates = MENU_CANDIDATE_CLASSES.mapNotNull {
+                    KavaReflector.loadClass(it, loader)
+                }
+                return candidates.firstOrNull { cls ->
+                    cls.declaredMethods.any { method ->
+                        Modifier.isStatic(method.modifiers) &&
+                            method.returnType == Void.TYPE &&
+                            method.parameterCount == 4 &&
+                            method.parameterTypes[0] == java.util.List::class.java &&
+                            method.parameterTypes[1] == Integer.TYPE &&
+                            method.parameterTypes[2] == java.lang.Boolean.TYPE &&
+                            method.parameterTypes[3] == java.lang.Boolean.TYPE
+                    }
+                }
+            }
+
+            private fun findVisibilityGateOwner(loader: ClassLoader): Pair<Class<*>, String>? {
+                for (name in PAGE_CANDIDATE_CLASSES) {
+                    val cls = KavaReflector.loadClass(name, loader) ?: continue
+                    val method = KavaReflector.declaredMethods(cls).firstOrNull {
+                        it.parameterCount == 2 &&
+                            it.parameterTypes[0] == Integer.TYPE &&
+                            it.parameterTypes[1] == java.lang.Boolean.TYPE &&
+                            it.returnType == Void.TYPE
+                    } ?: continue
+                    return cls to method.name
+                }
+                return null
+            }
+
+            private fun findMenuItemClass(loader: ClassLoader, registry: Class<*>?): Class<*>? {
+                for (name in MENU_ITEM_CANDIDATES) {
+                    KavaReflector.loadClass(name, loader)?.let { return it }
+                }
+                return null
+            }
+        }
     }
 
     private fun isMenuItemAppend(method: java.lang.reflect.Method): Boolean {
@@ -170,19 +262,19 @@ class MiniProgramForceShareFeature : BaseFeature() {
     }
 
     /** 菜单构建完成后若缺少转发项，从注册表取出原始菜单项重新包装后补回队首。 */
-    private fun ensureShareItem(loader: ClassLoader, list: MutableList<*>) {
+    private fun ensureShareItem(loader: ClassLoader, list: MutableList<*>, page: MenuTargets) {
         runCatching {
-            val itemClass = KavaReflector.loadClass(MENU_ITEM, loader) ?: return
-            val idField = KavaReflector.findDeclaredField(itemClass, "a") ?: return
+            val itemClass = page.menuItem ?: return
+            val idField = KavaReflector.declaredFields(itemClass).firstOrNull {
+                it.type == Integer.TYPE
+            } ?: return
             idField.isAccessible = true
             val present = list.mapNotNull { idField.get(it) as? Int }
             if (SHARE_INDEX in present) return
-            val holder = KavaReflector.loadClass(MENU_HOLDER, loader) ?: return
-            val holderField = KavaReflector.findDeclaredField(holder, "a") ?: return
+            val holderField = page.holderField ?: return
             holderField.isAccessible = true
             val registry = holderField.get(null) ?: return
-            // w1.a 就是注册表本体（android.util.SparseArray），按已知类型直接取。
-            @Suppress("UNCHECKED_CAST")
+            // 注册表本体是 android.util.SparseArray，按已知类型直接取。
             val array = KavaReflector.readField(registry, "a") as? android.util.SparseArray<Any?> ?: return
             val item = array.get(SHARE_INDEX) ?: return
             val ctor = itemClass.declaredConstructors.firstOrNull { it.parameterTypes.size == 3 } ?: return
@@ -196,9 +288,11 @@ class MiniProgramForceShareFeature : BaseFeature() {
         }
     }
 
-    private fun describeMenu(loader: ClassLoader, list: List<*>): String {
-        val itemClass = KavaReflector.loadClass(MENU_ITEM, loader) ?: return "size=${list.size}"
-        val idField = KavaReflector.findDeclaredField(itemClass, "a") ?: return "size=${list.size}"
+    private fun describeMenu(page: MenuTargets, list: List<*>): String {
+        val itemClass = page.menuItem ?: return "size=${list.size}"
+        val idField = KavaReflector.declaredFields(itemClass).firstOrNull {
+            it.type == Integer.TYPE
+        } ?: return "size=${list.size}"
         idField.isAccessible = true
         val ids = list.take(40).mapNotNull { idField.get(it) as? Int }
         return "size=${list.size} ids=$ids"
@@ -211,12 +305,33 @@ class MiniProgramForceShareFeature : BaseFeature() {
 
         private const val TAG = "[Hchat:ForceShare]"
 
-        // 微信 8.0.80 菜单体系（已用 DexSQL 逐项核对）。
-        private const val MENU_REGISTRY = "com.tencent.mm.plugin.appbrand.menu.w1"
-        private const val MENU_HOLDER = "com.tencent.mm.plugin.appbrand.menu.v1"
-        private const val MENU_ITEM = "com.tencent.mm.plugin.appbrand.menu.e1"
-        private const val PAGE_MENU_IMPL = "com.tencent.mm.plugin.appbrand.page.t7"
-        private const val PAGE_MENU_BASE = "com.tencent.mm.plugin.appbrand.page.b6"
+        // 菜单体系按版本变化的混淆类名（8.0.80 / 8.0.76 已用 DexSQL 逐项核对）。
+        // 定位逻辑不依赖这些名字本身：按方法签名在候选里挑，名字只是候选取样，
+        // 新版本只要类还在这几个包内，换代时把新名字追加进来即可。
+        private val MENU_CANDIDATE_CLASSES = listOf(
+            // 8.0.80：w1 是 List(int,int,boolean,boolean) 的持有者
+            "com.tencent.mm.plugin.appbrand.menu.w1",
+            // 8.0.76：m1
+            "com.tencent.mm.plugin.appbrand.menu.m1",
+            "com.tencent.mm.plugin.appbrand.menu.w0",
+            "com.tencent.mm.plugin.appbrand.menu.v0"
+        )
+
+        private val PAGE_CANDIDATE_CLASSES = listOf(
+            // 8.0.80：b6 声明 o1(IZ)V，t7 是子类
+            "com.tencent.mm.plugin.appbrand.page.b6",
+            // 8.0.76：u5 声明 n1(IZ)V
+            "com.tencent.mm.plugin.appbrand.page.u5",
+            "com.tencent.mm.plugin.appbrand.page.t7",
+            "com.tencent.mm.plugin.appbrand.page.m7"
+        )
+
+        private val MENU_ITEM_CANDIDATES = listOf(
+            // 8.0.80：e1 带 (int,boolean,boolean) 构造
+            "com.tencent.mm.plugin.appbrand.menu.e1",
+            // 8.0.76：u0 带 (int,boolean,boolean) 三元组字段
+            "com.tencent.mm.plugin.appbrand.menu.u0"
+        )
 
         /**
          * 菜单项 index：3 = 发送给朋友（menu.v0），4 = 分享到朋友圈（menu.x0）。

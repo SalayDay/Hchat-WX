@@ -105,19 +105,30 @@ class ScreenshotForwardButtonFeature : BaseFeature() {
         val methods = if (cached.isNotEmpty()) {
             cached
         } else {
+            // 动作 id 的**字符串常量**在不同微信版本写法不一样：
+            //   8.0.80 → "forward"（u0.a 里 zs5.s("forward", ...) 的首参）
+            //   8.0.76 → 只有 "forward_method" / "forward_screenshot_btn" 这类带后缀的键，
+            //            纯 "forward" 在那个方法体里根本不出现，只锚 "forward" 会零命中，
+            //            于是 installProviderHook 直接返回 false，整个功能静默失效。
+            // 这里按候选串逐个扫，命中即停，避免一次性放宽成模糊匹配把别的 provider 也扫进来。
             val located = runCatching {
-                context.dexKitBridge().findMethod(
-                    FindMethod().apply {
-                        matcher(
-                            MethodMatcher().apply {
-                                usingEqStrings(FORWARD_ACTION_ID)
-                                paramCount(1)
-                                returnType("java.util.List")
-                            }
-                        )
-                    }
-                ).mapNotNull { data -> runCatching { data.getMethodInstance(loader) }.getOrNull() }
-                    .filter(::isForwardProviderMethod)
+                var found = emptyList<Method>()
+                for (anchor in FORWARD_ACTION_ANCHORS) {
+                    found = context.dexKitBridge().findMethod(
+                        FindMethod().apply {
+                            matcher(
+                                MethodMatcher().apply {
+                                    usingEqStrings(anchor)
+                                    paramCount(1)
+                                    returnType("java.util.List")
+                                }
+                            )
+                        }
+                    ).mapNotNull { data -> runCatching { data.getMethodInstance(loader) }.getOrNull() }
+                        .filter(::isForwardProviderMethod)
+                    if (found.isNotEmpty()) break
+                }
+                found
             }.getOrElse {
                 logError("定位截图转发 provider 失败", it)
                 return false
@@ -154,9 +165,15 @@ class ScreenshotForwardButtonFeature : BaseFeature() {
      */
     private fun installOverlayHook(context: FeatureContext, enabled: () -> Boolean): Boolean {
         val loader = context.hostClassLoader()
-        val clazz = runCatching { Class.forName(OVERLAY_CLASS, false, loader) }.getOrNull()
+        // 8.0.76 起浮层类被混淆，「类名固定」的前提不再成立：
+        // 按候选名找，再退到包内按方法签名找（单 List 参数 + 有返回值）。
+        val clazz = OVERLAY_CANDIDATE_CLASSES.asSequence()
+            .mapNotNull { runCatching { Class.forName(it, false, loader) }.getOrNull() }
+            .firstOrNull { candidate ->
+                KavaReflector.declaredMethods(candidate).any(::isActionBindMethod)
+            }
         if (clazz == null) {
-            HLog.e("$TAG 未找到截图动作浮层 $OVERLAY_CLASS，跳过兜底过滤")
+            HLog.e("$TAG 未找到截图动作浮层（微信 ${wechatVersion()}），跳过兜底过滤")
             return false
         }
         val targets = KavaReflector.declaredMethods(clazz).filter(::isActionBindMethod)
@@ -213,12 +230,34 @@ class ScreenshotForwardButtonFeature : BaseFeature() {
 
         private const val TAG = "[Hchat:ScreenshotButton]"
         private const val CACHE_PREFS = "Hchat_screenshot_button_method_cache"
-        private const val CACHE_PROVIDER = "provider_v1"
-        private const val OVERLAY_CLASS = "com.tencent.mm.ui.screenshot.action.ScreenShotActionOverlay"
+        private const val CACHE_PROVIDER = "provider_v2"
         private const val PROVIDER_PACKAGE = "com.tencent.mm.ui.feature.api.screenshot."
 
-        /** 转发动作的内部 id，反编译自 `u0.a()` 里 `zs5.s("forward", ...)` 的首参。 */
-        private const val FORWARD_ACTION_ID = "forward"
+        /**
+         * 转发动作 id 的候选串，按出现频率从新到旧。
+         *
+         * 8.0.80 的动作表用纯 `forward`；8.0.76 只有带后缀的键
+         * （`forward_method` / `forward_screenshot_btn`），纯 `forward` 在该方法体里
+         * 不存在。逐个尝试、命中即停，比放宽成长度/前缀匹配安全得多
+         * （模糊匹配会把 `forward` 以外的分享动作也扫进来）。
+         */
+        private val FORWARD_ACTION_ANCHORS = listOf(
+            "forward",
+            "forward_method",
+            "forward_screenshot_btn"
+        )
+
+        /**
+         * 截图动作浮层的候选类名。
+         *
+         * 8.0.80 是明文的 `ScreenShotActionOverlay`；8.0.76 起该类被整包混淆，
+         * 只保留在 `com.tencent.mm.ui.screenshot` 包下（实测只剩 MMImageBottomSheet）。
+         * 因此浮层兜底改为「包内按方法签名找」，类名列表不再视为必需。
+         */
+        private val OVERLAY_CANDIDATE_CLASSES = listOf(
+            "com.tencent.mm.ui.screenshot.action.ScreenShotActionOverlay",
+            "com.tencent.mm.ui.screenshot.MMImageBottomSheet"
+        )
 
         private val providerHitLogged = java.util.concurrent.atomic.AtomicBoolean(false)
         private val overlayHitLogged = java.util.concurrent.atomic.AtomicBoolean(false)

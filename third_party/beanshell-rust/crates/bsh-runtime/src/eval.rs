@@ -2680,7 +2680,17 @@ impl Interpreter {
         if self.value_instance_of(value, parameter) { return Some((0, 0)); }
         if let Some(jvm) = self.jvm() {
             if matches!(value, Value::Lambda(_) | Value::MethodRef(_) | Value::Object(_)) {
-                return score_host_argument(&jvm, self.runtime_id, value, parameter).map(|_| (1, 0));
+                // Keep the host-side quality score as the secondary rank.
+                // Dropping it (`.map(|_| (1, 0))`) made every interface parameter
+                // score identically, so a lambda that matches a real SAM interface
+                // tied with one that does not, and overload selection reported
+                // "Ambiguous script method: get(String, java.util.HashMap, Lambda)"
+                // even though only one overload was actually callable.
+                // Secondary is "lower is better", so map a better host score to a
+                // smaller number.
+                return score_host_argument(&jvm, self.runtime_id, value, parameter)
+                    .filter(|score| *score > 0)
+                    .map(|score| (1, 255u8.saturating_sub(score.min(255) as u8)));
             }
         }
         None
@@ -2997,6 +3007,17 @@ impl Interpreter {
         if args.is_empty() {
             if let Some(value) = primitive_wrapper_method(base, name) {
                 return Ok(value);
+            }
+        }
+        // Primitive values must still answer the ordinary java.lang.Object contract.
+        // Without this, `Boolean.TRUE.equals(x)` / `Integer.valueOf(n).equals(m)` style
+        // code (extremely common in plugins) fails with
+        // "No such method: equals() on boolean" because primitives have no method
+        // dispatch of their own. Implement the Object contract natively instead of
+        // allocating a boxed JVM object on every call.
+        if is_primitive_value(base) {
+            if let Some(result) = primitive_object_method(base, name, &args) {
+                return result;
             }
         }
         match base {
@@ -3572,6 +3593,92 @@ fn loose_equals(a: &Value, b: &Value) -> bool {
     a.equality(b)
 }
 
+/// Whether the value is a Java primitive (boxed value type) rather than an object.
+fn is_primitive_value(v: &Value) -> bool {
+    matches!(
+        v,
+        Value::Bool(_)
+            | Value::Char(_)
+            | Value::Byte(_)
+            | Value::Short(_)
+            | Value::Int(_)
+            | Value::Long(_)
+            | Value::Float(_)
+            | Value::Double(_)
+    )
+}
+
+/// The `java.lang.Object` contract for primitive values.
+///
+/// Plugins routinely write `Boolean.TRUE.equals(x)`, `Integer.valueOf(n).equals(m)`
+/// or compare two boxed numbers. In real Java those are *boxed objects* and answer
+/// `equals` / `hashCode` / `toString` / `compareTo`; here primitives are unboxed
+/// `Value`s with no method table, so without this they fail with
+/// `No such method: equals() on boolean`.
+///
+/// Implemented natively (no JVM allocation per call) because these sit on hot paths.
+/// Returns `None` for names that are not part of the Object contract, so the caller
+/// falls through to the normal "no such method" error.
+fn primitive_object_method(base: &Value, name: &str, args: &[Value]) -> Option<Result<Value>> {
+    match name {
+        "equals" if args.len() == 1 => Some(Ok(Value::Bool(primitive_equals(base, &args[0])))),
+        "booleanValue" if args.is_empty() => match base {
+            Value::Bool(b) => Some(Ok(Value::Bool(*b))),
+            _ => None,
+        },
+        "toString" if args.is_empty() => {
+            Some(Ok(Value::string(builtins::display_java(base))))
+        }
+        "hashCode" if args.is_empty() => Some(Ok(Value::Int(primitive_hash(base)))),
+        // compareTo(T): the two values are compared with the usual numeric rules,
+        // matching java.lang.Boolean / Integer / Double#compareTo.
+        "compareTo" if args.len() == 1 => Some(
+            crate::primitive::compare(base, &args[0]).map(|order| Value::Int(order.signum())),
+        ),
+        _ => None,
+    }
+}
+
+/// `equals` on a primitive compares by value, and compares equal to an equal boxed
+/// value of a different width only when both are numeric (Java would resolve that
+/// through widening at the call site, not `equals`; we keep the numeric comparison
+/// because scripts rely on it for `Long == Integer` style checks).
+fn primitive_equals(base: &Value, other: &Value) -> bool {
+    if is_primitive_value(other) {
+        return base.equality(other);
+    }
+    // Comparing a primitive against a Java object: unwrap boxed wrappers by value.
+    matches!(other, Value::Java(_)) && base.equality(other)
+}
+
+/// Matches `java.lang.*` wrapper `hashCode` for the common cases.
+fn primitive_hash(v: &Value) -> i32 {
+    match v {
+        Value::Bool(b) => {
+            if *b {
+                1231
+            } else {
+                1237
+            }
+        }
+        Value::Char(c) => *c as i32,
+        Value::Byte(b) => *b as i32,
+        Value::Short(s) => *s as i32,
+        Value::Int(i) => *i,
+        // Long.hashCode is xor of the two halves.
+        Value::Long(l) => (*l ^ (*l >> 32)) as i32,
+        Value::Float(f) => {
+            let bits = f.to_bits();
+            bits as i32
+        }
+        Value::Double(d) => {
+            let bits = d.to_bits();
+            ((bits >> 32) ^ bits) as i32
+        }
+        _ => 0,
+    }
+}
+
 /// Invoke a method on an object of the given class (used by host conversions).
 pub fn invoke_method(
     interp: &mut Interpreter,
@@ -4001,5 +4108,63 @@ mod overload_tests {
         check(&mut interp, "pick(\"text\");", "string");
         check(&mut interp, "pick(new Object());", "object");
         check(&mut interp, "this.pick(new ArrayList());", "list");
+    }
+}
+
+mod primitive_object_contract_tests {
+    use super::*;
+
+    fn interpreter() -> Interpreter {
+        let mut interp = Interpreter::new(Box::new(std::io::sink()));
+        interp.jvm_enabled = false;
+        interp
+    }
+
+    fn check(interp: &mut Interpreter, source: &str, expected: &str) {
+        let result = interp.eval_source(source).unwrap();
+        assert_eq!(result.to_display_string(), expected, "{}", source);
+    }
+
+    /// `Boolean.TRUE.equals(x)` used to fail with
+    /// "No such method: equals() on boolean" because primitives had no method
+    /// dispatch. Plugins hit this on every message callback.
+    #[test]
+    fn primitive_equals_is_available() {
+        let mut interp = interpreter();
+        check(&mut interp, "Boolean.TRUE.equals(Boolean.TRUE);", "true");
+        check(&mut interp, "Boolean.TRUE.equals(false);", "false");
+        check(&mut interp, "Boolean.TRUE.equals(\"true\");", "false");
+        check(&mut interp, "1.equals(1);", "true");
+        check(&mut interp, "1.equals(2);", "false");
+        check(&mut interp, "(1L).equals(1);", "true");
+        check(&mut interp, "(1.0).equals(1.0);", "true");
+        check(&mut interp, "\"a\".equals(\"a\");", "true");
+    }
+
+    #[test]
+    fn primitive_to_string_and_hash_code() {
+        let mut interp = interpreter();
+        check(&mut interp, "(42).toString();", "42");
+        check(&mut interp, "Boolean.TRUE.toString();", "true");
+        // java.lang.Boolean#hashCode is 1231 / 1237.
+        check(&mut interp, "Boolean.TRUE.hashCode();", "1231");
+        check(&mut interp, "Boolean.FALSE.hashCode();", "1237");
+        check(&mut interp, "(7).hashCode();", "7");
+    }
+
+    #[test]
+    fn primitive_compare_to() {
+        let mut interp = interpreter();
+        check(&mut interp, "(1).compareTo(2);", "-1");
+        check(&mut interp, "(2).compareTo(1);", "1");
+        check(&mut interp, "(1).compareTo(1);", "0");
+    }
+
+    /// Names outside the Object contract must still raise, so typos are not hidden.
+    #[test]
+    fn unknown_primitive_method_still_fails() {
+        let mut interp = interpreter();
+        let error = interp.eval_source("(1).noSuchMethod();").unwrap_err().to_string();
+        assert!(error.contains("No such method"), "{}", error);
     }
 }

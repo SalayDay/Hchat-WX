@@ -46,6 +46,26 @@ Android/JVM 下的 `List`、`Set`、`Map` 使用平台真实集合，跨 JNI 调
 
 包装器采用弱引用缓存，失效句柄按批清理，插件卸载时释放对应原生对象和代理登记。公开 `set`、`get`、方法调用与后台回调使用相同的归属检查，拒绝将一个插件的脚本对象交给另一个插件解释器。快照格式不变，执行快照时同样适用。
 
+## 基本类型的方法契约
+
+布尔、字符、各类数值在引擎里是未装箱的 `Value`，没有自己的方法表。但它们必须满足
+`java.lang.Object` 的契约，否则 `Boolean.TRUE.equals(x)`、`Integer.valueOf(n).equals(m)`
+这类插件常用写法会直接抛 `No such method: equals() on boolean`：
+
+- `equals(any)` 按值比较（基本类型之间走同一套数值归一，不会因 int/long 宽度不同而失配）
+- `hashCode()` 对齐 `java.lang.*` 包装类（`Boolean` 为 1231/1237，`Long` 取上下半异或）
+- `toString()` 与 `compareTo(other)` 同包装类语义
+
+实现走原生分支，不为了调用一次 `equals` 就分配一个 Java 对象——这些都在消息回调热路径上。
+契约之外的方法名仍然报错，不会把拼写错误吞掉。
+
+## 重载选择
+
+lambda / 方法引用 / 脚本对象的实参在候选签名里打分时，除了「是不是接口」之外还要带上
+宿主侧的 SAM 匹配质量（参数个数对齐的接口得分更高）。只用 `(1, 0)` 这类常量分数会让
+可调用与不可调用的两个重载打平，进而报
+`Ambiguous script method: get(String, HashMap, Lambda)`。
+
 ## 验证口径
 
 分别核对真实 Rust JNI 行为、Android 动态类转换、APK 编译和设备运行。JVM 测试成功不等于 Android ART、LSPosed 或微信中所有插件已验证；设备仍需检查脚本启停、异步回调、动态类、快照和多插件隔离。
