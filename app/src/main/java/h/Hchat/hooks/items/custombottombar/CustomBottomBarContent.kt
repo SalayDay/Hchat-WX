@@ -9,6 +9,15 @@ import android.os.Vibrator
 import android.os.VibratorManager
 import android.view.HapticFeedbackConstants
 import android.view.View
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
@@ -32,10 +41,13 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.Stable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.graphics.PathFillType
@@ -49,6 +61,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import h.Hchat.hooks.items.bottombarstyle.BottomBarStyleStore
 import h.Hchat.ui.miuix.FloatingBottomBar
 import h.Hchat.ui.miuix.FloatingBottomBarItem
 import h.Hchat.ui.miuix.rememberViewBackdrop
@@ -136,6 +149,12 @@ private fun FloatingNavigationBar(
     onTabClicked: (Int) -> Unit
 ) {
     val backdrop = rememberViewBackdrop(sourceView)
+    // 样式在绘制时直接读模块配置：底栏是模块自己的 Compose，不需要 hook 微信。
+    val styleContext = sourceView.context
+    val jellyEnabled = remember { BottomBarStyleStore.jellyEnabled(styleContext) }
+    val breathEnabled = remember { BottomBarStyleStore.breathEnabled(styleContext) }
+    val badgeColor = remember { BottomBarStyleStore.badgeColor(styleContext) }
+    val breathAlpha = rememberBadgeBreath(breathEnabled)
     val contentColor = if (isDarkMode()) Color(0xFFE8E8E8) else Color(0xFF202020)
     val selectedColor = MiuixTheme.colorScheme.primary
     Box(
@@ -172,7 +191,9 @@ private fun FloatingNavigationBar(
                 NAV_ITEMS.indices.forEach { index ->
                     BottomBarBadgeOverlay(
                         badge = badgeFor(index, state, config),
-                        showLabelSlot = !config.hideLabels
+                        showLabelSlot = !config.hideLabels,
+                        badgeColor = badgeColor,
+                        breathAlpha = breathAlpha
                     )
                 }
             }
@@ -186,7 +207,8 @@ private fun FloatingNavigationBar(
                     BottomBarIcon(
                         item = item,
                         selected = selected,
-                        selectedColor = selectedColor
+                        selectedColor = selectedColor,
+                        jelly = jellyEnabled
                     )
                     if (!config.hideLabels) {
                         BasicText(
@@ -211,14 +233,24 @@ private fun FloatingNavigationBar(
 private fun BottomBarIcon(
     item: BottomBarItem,
     selected: Boolean,
-    selectedColor: Color
+    selectedColor: Color,
+    jelly: Boolean
 ) {
+    // 果冻缩放：选中弹到 1.10、未选中回落到 0.94，低阻尼弹簧带一点回弹手感。
+    val scale by animateFloatAsState(
+        targetValue = if (!jelly) 1f else if (selected) 1.10f else 0.94f,
+        animationSpec = spring(dampingRatio = 0.45f, stiffness = Spring.StiffnessMediumLow),
+        label = "bottomBarTabJelly"
+    )
     Box(modifier = Modifier.size(width = 42.dp, height = 30.dp), contentAlignment = Alignment.Center) {
         Image(
             imageVector = if (selected) item.selectedIcon else item.normalIcon,
             contentDescription = item.label,
             colorFilter = ColorFilter.tint(if (selected) selectedColor else WX_ICON_GRAY),
-            modifier = Modifier.size(24.dp)
+            modifier = Modifier.size(24.dp).graphicsLayer {
+                scaleX = scale
+                scaleY = scale
+            }
         )
     }
 }
@@ -226,7 +258,9 @@ private fun BottomBarIcon(
 @Composable
 private fun RowScope.BottomBarBadgeOverlay(
     badge: BottomBarBadge,
-    showLabelSlot: Boolean
+    showLabelSlot: Boolean,
+    badgeColor: Color,
+    breathAlpha: Float
 ) {
     Column(
         modifier = Modifier
@@ -238,13 +272,14 @@ private fun RowScope.BottomBarBadgeOverlay(
     ) {
         Box(modifier = Modifier.size(width = 42.dp, height = 30.dp)) {
             when {
-                badge.count > 0 -> CountBadge(badge.count, Modifier.align(Alignment.TopEnd))
+                badge.count > 0 -> CountBadge(badge.count, Modifier.align(Alignment.TopEnd), badgeColor, breathAlpha)
                 badge.dot -> Box(
                     modifier = Modifier
                         .align(Alignment.TopEnd)
                         .padding(top = 1.dp, end = 2.dp)
                         .size(8.dp)
-                        .background(BADGE_RED, CircleShape)
+                        .background(badgeColor, CircleShape)
+                        .alpha(breathAlpha)
                 )
             }
         }
@@ -253,12 +288,18 @@ private fun RowScope.BottomBarBadgeOverlay(
 }
 
 @Composable
-private fun CountBadge(count: Int, modifier: Modifier = Modifier) {
+private fun CountBadge(
+    count: Int,
+    modifier: Modifier = Modifier,
+    color: Color = BADGE_RED,
+    alpha: Float = 1f
+) {
     val text = if (count > 99) "99+" else count.toString()
     Box(
         modifier = modifier
             .defaultMinSize(minWidth = 17.dp, minHeight = 17.dp)
-            .background(BADGE_RED, CircleShape)
+            .background(color, CircleShape)
+            .alpha(alpha)
             .padding(horizontal = 4.dp),
         contentAlignment = Alignment.Center
     ) {
@@ -274,6 +315,24 @@ private fun CountBadge(count: Int, modifier: Modifier = Modifier) {
             maxLines = 1
         )
     }
+}
+
+/** 红点呼吸：透明度在 0.55~1 之间往复；关闭时恒为 1，不创建 animation。 */
+@Composable
+private fun rememberBadgeBreath(enabled: Boolean): Float {
+    // 动画本身无条件创建：条件式创建 Composable 会让组合结构随开关跳变，
+    // 关闭时只把结果固定成 1f 即可（此时动画不驱动任何绘制）。
+    val transition = rememberInfiniteTransition(label = "bottomBarBadgeBreath")
+    val alpha by transition.animateFloat(
+        initialValue = 0.55f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 900, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "bottomBarBadgeAlpha"
+    )
+    return if (enabled) alpha else 1f
 }
 
 private fun badgeFor(

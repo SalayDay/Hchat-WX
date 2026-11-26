@@ -42,6 +42,14 @@ internal object ModuleChangelog {
     /** 新的在上。版本号按发布顺序倒序排列。 */
     val entries: List<ModuleChangelogEntry> = listOf(
         ModuleChangelogEntry(
+            "6.7.7.22",
+            listOf(
+                "新增「底栏动效与红点」：Tab 果冻缩放、红点呼吸光晕、红点四档配色（美化，默认关闭）",
+                "新增「界面净化」：隐藏首页列表分割线、隐藏聊天系统灰字提示（美化，默认关闭）",
+                "新增「长按菜单磨砂卡片」：长按菜单改为圆角半透明卡片，深浅色自适应（美化，默认关闭）"
+            )
+        ),
+        ModuleChangelogEntry(
             "6.7.7.21",
             listOf(
                 "新增「全局背景」：首页/通讯录/发现/我 统一背景图，支持离线模糊与暗化档位（美化，默认关闭）",

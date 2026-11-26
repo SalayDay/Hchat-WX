@@ -240,6 +240,10 @@ import h.Hchat.hooks.items.callmedialimit.CallMediaLimitFeature
 import h.Hchat.hooks.items.callmedialimit.CallMediaLimitSettings
 import h.Hchat.hooks.items.callmedialimit.CallRingtoneBlockFeature
 import h.Hchat.hooks.items.bottombar.BottomBarAutoHideFeature
+import h.Hchat.hooks.items.bottombarstyle.BottomBarStyleFeature
+import h.Hchat.hooks.items.bottombarstyle.BottomBarStyleStore
+import h.Hchat.hooks.items.menustyle.MenuStyleFeature
+import h.Hchat.hooks.items.purify.ChatPurifyFeature
 import h.Hchat.hooks.items.bottombar.BottomBarAutoHideSettings
 import h.Hchat.hooks.items.chatanimation.ChatMessageEnterAnimationFeature
 import h.Hchat.hooks.items.chatanimation.ChatMessageEnterAnimationSettings
@@ -3282,7 +3286,10 @@ internal fun practicalFeatureGroups(
                 GlobalBackgroundFeature.ID,
                 GlobalFontFeature.ID,
                 ThemePackFeature.ID,
-                ChatImmersionFeature.ID
+                ChatImmersionFeature.ID,
+                BottomBarStyleFeature.ID,
+                ChatPurifyFeature.ID,
+                MenuStyleFeature.ID
             )
         ),
         FeatureGroupEntry(
@@ -4055,6 +4062,9 @@ internal fun featureSubSearchTerms(featureId: String): List<String> {
         GlobalFontFeature.ID -> listOf("全局字体", "字体", "ttf", "otf", "字重", "字体粗细")
         ThemePackFeature.ID -> listOf("主题包", "导出主题", "导入主题", "一键美化", "皮肤")
         ChatImmersionFeature.ID -> listOf("沉浸式", "聊天透明", "顶栏透明", "输入栏透明", "一体化")
+        BottomBarStyleFeature.ID -> listOf("底栏动效", "果冻", "红点呼吸", "红点颜色", "底栏红点")
+        ChatPurifyFeature.ID -> listOf("净化", "隐藏分割线", "系统提示", "灰字", "拍一拍")
+        MenuStyleFeature.ID -> listOf("菜单美化", "长按菜单", "磨砂卡片", "圆角菜单")
         MessageBubbleFeature.ID -> listOf("消息气泡", "聊天气泡", "自定义气泡", "左侧气泡", "右侧气泡", "红包气泡", "转账气泡", "系统消息气泡", "浅色模式", "深色模式", "NinePatch", "九宫格")
         MessageTextColorFeature.ID -> listOf("消息文本颜色", "文字颜色", "聊天气泡文字", "取色器", "浅色模式", "深色模式")
         HomeTextColorFeature.ID -> listOf("首页文字颜色", "标题颜色", "副标题颜色", "渐变文字", "微信首页", "通讯录", "发现", "我")
@@ -4909,6 +4919,18 @@ internal fun FeatureSettingsPage(
             defaultValue = ChatImmersionFeature.DEFAULT_ENABLED,
             summary = "聊天页的标题栏与输入面板背景改成透明，让「全局背景」从聊天界面透出来。" +
                 "Android 品牌定制差异较大，如果某版微信的栏识别不到，这一项会安静地不生效。",
+            onBack = onBack,
+            useFeaturePrefs = true
+        )
+        BottomBarStyleFeature.ID -> BottomBarStyleMiuixPage(context, provider, onBack)
+        ChatPurifyFeature.ID -> ChatPurifyMiuixPage(context, provider, onBack)
+        MenuStyleFeature.ID -> HchatExtraToggleMiuixPage(
+            context = context,
+            provider = provider,
+            key = MenuStyleFeature.KEY_ENABLED,
+            defaultValue = MenuStyleFeature.DEFAULT_ENABLED,
+            summary = "长按消息弹出的菜单改成圆角半透明卡片（浅色/深色各自适配）。" +
+                "只处理内容类名含 Menu 的弹窗，其它弹窗不受影响。",
             onBack = onBack,
             useFeaturePrefs = true
         )
@@ -16743,6 +16765,141 @@ internal fun ThemePackMiuixPage(
                         text = "主题包包含全部模块配置（含美化项）与导入的背景图、字体。" +
                             "导入会覆盖本机同名配置，必须重启微信才会生效；" +
                             "素材存相对路径，换设备也能对上。",
+                        style = MiuixTheme.textStyles.footnote1,
+                        color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                        modifier = Modifier.padding(horizontal = 18.dp, vertical = 12.dp)
+                    )
+                }
+            }
+        }
+    }
+}
+/** 悬浮底栏动效与红点样式。 */
+@Composable
+internal fun BottomBarStyleMiuixPage(
+    context: Context,
+    provider: FeatureSettingsProvider,
+    onBack: () -> Unit
+) {
+    val sp = remember(context, provider.featureId()) {
+        ConfigStore(context).getFeaturePrefs(provider.featureId())
+    }
+    val listState = rememberLazyListState()
+    val scrollBehavior = MiuixScrollBehavior()
+    var colorIndex by remember { mutableStateOf(BottomBarStyleStore.badgeColorIndex(context)) }
+
+    PageScaffold(
+        title = provider.title(),
+        largeTitle = provider.title(),
+        scrollBehavior = scrollBehavior,
+        bottomBar = { BottomActionBar("返回", onBack) }
+    ) { padding ->
+        LazyColumn(
+            modifier = Modifier.fillMaxSize().nestedScroll(scrollBehavior.nestedScrollConnection),
+            state = listState,
+            contentPadding = PaddingValues(
+                top = padding.calculateTopPadding() + 8.dp,
+                bottom = padding.calculateBottomPadding() + 84.dp
+            )
+        ) {
+            item { SmallTitle(text = "动效与红点") }
+            item {
+                SettingsCard {
+                    SwitchRow(
+                        sp,
+                        BottomBarStyleStore.KEY_JELLY,
+                        "Tab 果冻动效",
+                        "点击底栏图标时弹簧缩放入场",
+                        false
+                    )
+                    InsetDivider()
+                    SwitchRow(
+                        sp,
+                        BottomBarStyleStore.KEY_BADGE_BREATH,
+                        "红点呼吸光晕",
+                        "未读红点在 55%～100% 透明度之间缓慢往复",
+                        false
+                    )
+                    InsetDivider()
+                    ActionRow(
+                        "红点颜色",
+                        BottomBarStyleStore.COLOR_LABELS[colorIndex]
+                    ) {
+                        val next = (colorIndex + 1) % BottomBarStyleStore.COLOR_LABELS.size
+                        BottomBarStyleStore.setBadgeColorIndex(context, next)
+                        colorIndex = next
+                    }
+                }
+            }
+            item { SmallTitle(text = "说明") }
+            item {
+                SettingsCard {
+                    Text(
+                        text = "只作用于模块自己的悬浮底栏（需要先开启悬浮底栏）；" +
+                            "切换后重新进入首页即可看到效果，不用重启微信。",
+                        style = MiuixTheme.textStyles.footnote1,
+                        color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                        modifier = Modifier.padding(horizontal = 18.dp, vertical = 12.dp)
+                    )
+                }
+            }
+        }
+    }
+}
+
+/** 界面净化：分割线 / 系统灰字。 */
+@Composable
+internal fun ChatPurifyMiuixPage(
+    context: Context,
+    provider: FeatureSettingsProvider,
+    onBack: () -> Unit
+) {
+    val sp = remember(context, provider.featureId()) {
+        ConfigStore(context).getFeaturePrefs(provider.featureId())
+    }
+    val listState = rememberLazyListState()
+    val scrollBehavior = MiuixScrollBehavior()
+
+    PageScaffold(
+        title = provider.title(),
+        largeTitle = provider.title(),
+        scrollBehavior = scrollBehavior,
+        bottomBar = { BottomActionBar("返回", onBack) }
+    ) { padding ->
+        LazyColumn(
+            modifier = Modifier.fillMaxSize().nestedScroll(scrollBehavior.nestedScrollConnection),
+            state = listState,
+            contentPadding = PaddingValues(
+                top = padding.calculateTopPadding() + 8.dp,
+                bottom = padding.calculateBottomPadding() + 84.dp
+            )
+        ) {
+            item { SmallTitle(text = "净化开关") }
+            item {
+                SettingsCard {
+                    SwitchRow(
+                        sp,
+                        ChatPurifyFeature.KEY_HIDE_DIVIDER,
+                        "隐藏首页列表分割线",
+                        "只跳过首页会话列表里类名含 Divider/Separator 的分割装饰",
+                        ChatPurifyFeature.DEFAULT_HIDE_DIVIDER
+                    )
+                    InsetDivider()
+                    SwitchRow(
+                        sp,
+                        ChatPurifyFeature.KEY_HIDE_SYSTEM_TIP,
+                        "隐藏系统灰字提示",
+                        "聊天里类型为 10000 的系统提示（撤回、拍一拍、入群提示等）整行隐藏",
+                        ChatPurifyFeature.DEFAULT_HIDE_SYSTEM_TIP
+                    )
+                }
+            }
+            item { SmallTitle(text = "说明") }
+            item {
+                SettingsCard {
+                    Text(
+                        text = "两项都只处理识别得到的目标：分割线按装饰类名判断，系统提示按消息类型判断，" +
+                            "识别不到就不动界面，不会按文字内容猜、也不会误伤正常消息。",
                         style = MiuixTheme.textStyles.footnote1,
                         color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
                         modifier = Modifier.padding(horizontal = 18.dp, vertical = 12.dp)

@@ -503,6 +503,24 @@ String avatar = getAvatarUrl("wxid_xxx", true);
 
 - `聊天沉浸式`（featureId `chat_immersion`）属于实用功能，`美化` 分组，默认关闭。Hook `com.tencent.mm.ui.chatting.ChattingUI#onResume`，把聊天页标题栏（类名含 ActionBar/MMTitle，且位于屏幕顶部 1/5）与输入面板（类名含 ChatFooter，且底边在屏幕 2/3 以下）背景清成透明，**只透明化栏本身**，不动窗口与内容层底色 —— 清了会露出系统窗口色，反而盖掉微信自己的聊天壁纸。
 - 这一版**不动消息列表的 padding**：`clipToPadding=false` + 上下 padding 补偿需要按版本拿列表真实 id 与栏高度，盲改会把消息顶到栏上或留出空洞。当前只做「栏透明 + 窗口透明」，视觉上已是三者同底且不动物流；「消息从栏下穿过」留到能真机调参时再做。
+底栏动效与红点：
+
+- `底栏动效与红点`（featureId `bottom_bar_style`）属于实用功能，`美化` 分组，全部默认关闭。底栏是模块自己的 Compose（`CustomBottomBarContent`），所以这三项**直接改绘制参数**，不 hook 微信任何方法。
+- Tab 果冻：`animateFloatAsState` + `spring(dampingRatio = 0.45f, stiffness = MediumLow)`，选中 1.10、未选中 0.94 缩放，`graphicsLayer` 应用。
+- 红点呼吸：`rememberInfiniteTransition` 让透明度在 0.55～1.0 之间 `tween(900ms)` 往复；关闭时不创建 animation（不空转）。
+- 红点颜色：四档预设（微信红 / 莫兰迪灰蓝 / 柔粉 / 雾绿），替换 `BADGE_RED`。只作用于悬浮底栏的角标；微信原生底栏角标不在此功能范围。
+
+界面净化：
+
+- `界面净化`（featureId `chat_purify`）属于实用功能，`美化` 分组，两项独立开关，默认关闭。
+- 隐藏首页列表分割线：hook `RecyclerView.addItemDecoration(ItemDecoration)`，只在**类名含 conversation** 的列表上、且装饰类名含 `Divider`/`Separator`/`ItemOffset` 时跳过注册（`param.result = null`），其它 RecyclerView 与装饰不动。
+- 隐藏系统灰字：hook 聊天列表的 `getView(int, View, ViewGroup)`，用 `adapter.getItem(position)` 取消息，**只在该消息类型为 10000（微信系统提示）**时把整行 `GONE` 并把 `layoutParams.height` 压到 0。绝不按文字内容猜，避免误伤正常消息。
+
+长按菜单磨砂卡片：
+
+- `长按菜单磨砂卡片`（featureId `menu_style`）属于实用功能，`美化` 分组，默认关闭。hook `PopupWindow.showAtLocation` / `showAsDropDown`，只处理**内容视图类名含 Menu** 的弹窗：容器背景换成圆角（16dp）半透明卡片 + 1px 描边 + 8dp 内边距，浅色用 `0xF2FFFFFF`、深色用 `0xF22B2B2B`，弹窗外层背景置透明以免圆角外露出原矩形底。
+- 只改容器不重排内部 item（内部布局逐版本不同，盲改风险高于收益）。`WRAP_CONTENT`/`MATCH_PARENT` 的弹窗不做宽度补偿，只有固定宽度才补内边距。
+
 
 - `保存表情` 属于实用功能，设置页放在 `聊天` 分组，默认关闭。开启后只在 type 47 聊天表情的长按菜单中注入带 `icons_filled_download` 图标的 `保存[H]`，菜单项直接绑定本次长按的原生消息，点击后仍放行微信原菜单收尾，避免残留文字选择态。
 - `发送文本格式` 属于实用功能，设置页放在 `聊天` 分组，默认关闭。文本模板支持以中文名称点击插入 `原消息`、`换行`、`发送时间`、`发送耗时`、`发送总数`、`文字消息数`、`文字字数`、`表情消息数`、`转账消息数`、`红包消息数`、`文件消息数`，底层稳定占位符依次为 `${sendText}`、`${line}`、`${sendTime}`、`${sendDuration}`、`${totalMsg}`、`${textMsg}`、`${textWord}`、`${emojiMsg}`、`${transferMsg}`、`${redBagMsg}`、`${fileMsg}`。发送时间格式可单独配置；发送耗时从当前会话首次点击输入框开始计算，到点击发送按钮为止，发送成功后重置，微信拒绝发送且输入框仍保留文本时继续沿用本次计时；没有输入过程的后台发送显示为 `0秒`。模板必须且只能保留一个原消息变量，空模板回退为仅发送原文，导入的非法模板在运行时直接放行原文。用户点击微信原生发送按钮且模块处理器、脚本 `onClickSendBtn` 均未拦截时，模板前后内容会原位插入 ChatFooter 的 `Editable`，保留艾特等 span 并继续使用微信原生文字发送流程；模块和脚本插件通过公共文本接口调用 `sendText`、`sendTextWithAtList`、`sendAt`、`sendAtAll` 或 `sendRaw(type=1)` 时也会经过同一格式化器，因此自动回复等复用公共接口的文本发送同样生效。七个统计变量与输入框提示共用当前本地自然日的真实发送统计，包含手动、模块和脚本插件实际发送的消息。
