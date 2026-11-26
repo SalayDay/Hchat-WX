@@ -30,6 +30,7 @@ import h.Hchat.hooks.items.floatingshortcut.FloatingShortcutFeature
 import h.Hchat.hooks.items.forwardlimit.RemoveForwardLimitFeature
 import h.Hchat.hooks.items.gameemoji.GameEmojiFeature
 import h.Hchat.hooks.items.groupleave.GroupLeaveMonitorFeature
+import h.Hchat.hooks.items.groupadminlabel.GroupAdminLabelFeature
 import h.Hchat.hooks.items.grouplabel.GroupChatLabelFeature
 import h.Hchat.hooks.items.grouplabel.QuickGroupChatLabelFeature
 import h.Hchat.hooks.items.grouprename.GroupRenameMonitorFeature
@@ -186,6 +187,7 @@ object FeatureRegistry {
             .register(SnsAntiRecallFeature())
             .register(MomentsFakeInteractionFeature())
             .register(GroupChatLabelFeature())
+            .register(GroupAdminLabelFeature())
             .register(GroupLeaveMonitorFeature())
             .register(GroupRenameMonitorFeature())
             .register(RemoveMomentsAdsFeature())

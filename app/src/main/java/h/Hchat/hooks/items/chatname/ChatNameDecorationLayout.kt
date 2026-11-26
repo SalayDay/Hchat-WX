@@ -33,10 +33,25 @@ object ChatNameDecorationLayout {
         val onClick: (() -> Unit)? = null
     )
 
+    /**
+     * 名字前面的小标签（群主 / 管理员 / 部分真名）。
+     *
+     * 与 [TitleState] 分开：title 是「头衔」这种单块装饰，前缀标签可能有多个，
+     * 每个自带背景色，需要各自成块渲染。
+     */
+    data class PrefixBadge(
+        val text: String,
+        val bgStart: Int,
+        val bgEnd: Int,
+        val textStart: Int,
+        val textEnd: Int
+    )
+
     private data class State(
         var baseName: CharSequence = "",
         var baseNameStyle: BaseNameStyle? = null,
         var title: TitleState = TitleState(),
+        var prefixes: List<PrefixBadge> = emptyList(),
         var tail: CharSequence = "",
         var lastRendered: String = ""
     )
@@ -116,6 +131,20 @@ object ChatNameDecorationLayout {
         compose(row)
     }
 
+    /** 设置名字前面的前缀标签；传空列表等同于 [hidePrefixBadges]。 */
+    fun showPrefixBadges(row: Row, badges: List<PrefixBadge>) {
+        stateForDecoration(row).prefixes = badges
+        compose(row)
+    }
+
+    fun hidePrefixBadges(row: Row) {
+        stateForDecoration(row).prefixes = emptyList()
+        compose(row)
+    }
+
+    /** 当前已挂的前缀标签文本，供调用方判断是否需要重设（避免每帧重建 span）。 */
+    fun prefixBadgeTexts(row: Row): List<String> = state(row).prefixes.map { it.text }
+
     fun showTail(row: Row, text: CharSequence) {
         stateForDecoration(row).tail = text
         compose(row)
@@ -152,6 +181,20 @@ object ChatNameDecorationLayout {
         val tv = row.nameView
         val state = state(row)
         val builder = SpannableStringBuilder()
+        // 前缀标签（群主 / 管理员 / 部分真名）排在最前，其次头衔，最后才是名字本体。
+        state.prefixes.forEach { badge ->
+            if (badge.text.isEmpty()) return@forEach
+            val start = builder.length
+            builder.append(badge.text)
+            val end = builder.length
+            builder.setSpan(
+                TitleBadgeSpan(badge.bgStart, badge.bgEnd, badge.textStart, badge.textEnd),
+                start,
+                end,
+                Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
+            )
+            builder.append(" ")
+        }
         val title = state.title
         if (title.text.isNotEmpty()) {
             val start = builder.length

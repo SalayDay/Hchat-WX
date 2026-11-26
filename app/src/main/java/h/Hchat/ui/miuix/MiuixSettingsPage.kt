@@ -279,6 +279,8 @@ import h.Hchat.hooks.items.groupleave.GroupLeaveMonitorFeature
 import h.Hchat.hooks.items.groupleave.GroupLeaveReplyTemplate
 import h.Hchat.hooks.items.groupleave.GroupLeaveReplyTemplateBinding
 import h.Hchat.hooks.items.groupleave.GroupLeaveMonitorSettings
+import h.Hchat.hooks.items.groupadminlabel.GroupAdminLabelFeature
+import h.Hchat.hooks.items.groupadminlabel.GroupAdminLabelSettings
 import h.Hchat.hooks.items.grouplabel.GroupChatLabel
 import h.Hchat.hooks.items.grouplabel.GroupChatLabelFeature
 import h.Hchat.hooks.items.grouplabel.GroupChatLabelStore
@@ -3224,6 +3226,7 @@ internal fun practicalFeatureGroups(
             title = "群组",
             providers = practicalProviders.filterByIds(
                 GroupChatLabelFeature.ID,
+                GroupAdminLabelFeature.ID,
                 AtAllNotificationBlockFeature.ID,
                 GroupLeaveMonitorFeature.ID,
                 GroupRenameMonitorFeature.ID
@@ -4005,6 +4008,7 @@ internal fun featureSubSearchTerms(featureId: String): List<String> {
         ZombieCheckFeature.ID -> listOf("僵尸粉检测", "好友关系检测", "单向好友", "删除好友", "异常好友", "好友标签")
         QQMusicOrderFeature.ID -> listOf("QQ点歌", "点歌", "音乐卡片", "点歌发送卡片", "点歌发送语音", "触发词", "歌手", "封面", "AppID", "允许点歌聊天")
         GroupChatLabelFeature.ID -> listOf("群聊标签", "群组分类", "群聊分类", "标签群聊", "批量选择群聊")
+        GroupAdminLabelFeature.ID -> listOf("群聊管理员标签", "群主标签", "管理员标签", "真名标签", "群成员标签")
         QuickGroupChatLabelFeature.ID -> listOf("快捷设置群聊标签", "群聊标签", "会话长按菜单", "聊天分组", "群聊分类")
         GroupLeaveMonitorFeature.ID -> listOf("进退群监控", "进群邀请", "退群提醒", "监听群", "批量保护", "新群保护", "群成员变化")
         GroupRenameMonitorFeature.ID -> listOf("改名监控", "群昵称", "群内昵称", "改名提醒", "改名卡片", "改名模板", "批量套用", "改名系统消息")
@@ -4889,6 +4893,7 @@ internal fun FeatureSettingsPage(
         CustomFriendAvatarFeature.ID -> CustomFriendAvatarMiuixPage(context, provider, onBack)
         MessageBlockFeature.ID -> MessageBlockMiuixPage(context, provider, onBack)
         GroupChatLabelFeature.ID -> GroupChatLabelMiuixPage(context, provider, onBack)
+        GroupAdminLabelFeature.ID -> GroupAdminLabelMiuixPage(context, provider, onBack)
         GroupLeaveMonitorFeature.ID -> GroupLeaveMonitorMiuixPage(context, provider, onBack)
         GroupRenameMonitorFeature.ID -> GroupRenameMonitorMiuixPage(context, provider, onBack)
         MomentsAutoLikeFeature.ID -> MomentsAutoLikeMiuixPage(context, provider, onBack)
@@ -9557,6 +9562,84 @@ internal fun HchatExtraToggleMiuixPage(
                         provider.title(),
                         summary,
                         defaultValue
+                    )
+                }
+            }
+        }
+    }
+}
+
+/**
+ * 群聊管理员标签显示：三个独立开关。
+ *
+ * 开关直接写 feature prefs，运行时通过 `HotConfig.flag` 读取（3 秒缓存），
+ * 所以切换后不需要重启微信，滚动一下聊天列表就生效。
+ */
+@Composable
+internal fun GroupAdminLabelMiuixPage(
+    context: Context,
+    provider: FeatureSettingsProvider,
+    onBack: () -> Unit
+) {
+    val sp = remember(context, provider.featureId()) {
+        ConfigStore(context).getFeaturePrefs(provider.featureId())
+    }
+    val listState = rememberLazyListState()
+    val scrollBehavior = MiuixScrollBehavior()
+
+    PageScaffold(
+        title = provider.title(),
+        largeTitle = provider.title(),
+        scrollBehavior = scrollBehavior,
+        bottomBar = { BottomActionBar("返回", onBack) }
+    ) { padding ->
+        LazyColumn(
+            modifier = Modifier.fillMaxSize().nestedScroll(scrollBehavior.nestedScrollConnection),
+            state = listState,
+            contentPadding = PaddingValues(
+                top = padding.calculateTopPadding() + 8.dp,
+                bottom = padding.calculateBottomPadding() + 84.dp
+            )
+        ) {
+            item { SmallTitle(text = "群聊聊天界面显示") }
+            item {
+                SettingsCard {
+                    SwitchRow(
+                        sp,
+                        GroupAdminLabelSettings.KEY_OWNER,
+                        "群主标签",
+                        "群主发的消息，昵称前显示「群主」",
+                        GroupAdminLabelSettings.DEFAULT_SHOW
+                    )
+                    InsetDivider()
+                    SwitchRow(
+                        sp,
+                        GroupAdminLabelSettings.KEY_ADMIN,
+                        "管理员标签",
+                        "群管理员发的消息，昵称前显示「管理员」（群主不重复显示）",
+                        GroupAdminLabelSettings.DEFAULT_SHOW
+                    )
+                    InsetDivider()
+                    SwitchRow(
+                        sp,
+                        GroupAdminLabelSettings.KEY_REAL_NAME,
+                        "部分真名标签",
+                        "昵称前显示脱敏真名（如「张*」），复用「实名尾字」已缓存的真名数据",
+                        GroupAdminLabelSettings.DEFAULT_SHOW
+                    )
+                }
+            }
+            item { SmallTitle(text = "说明") }
+            item {
+                SettingsCard {
+                    Text(
+                        text = "标签只在群聊里出现，单聊不显示；自己发的消息不加标签。" +
+                            "三个开关互相独立，可以只开其中一个。「部分真名」需要该成员的真名" +
+                            "已经由「实名尾字」功能获取过，没获取到就先不显示。" +
+                            "标签排在昵称前面，「实名尾字」的尾字仍在昵称后面，两者可以同时使用。",
+                        style = MiuixTheme.textStyles.footnote1,
+                        color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                        modifier = Modifier.padding(horizontal = 18.dp, vertical = 12.dp)
                     )
                 }
             }

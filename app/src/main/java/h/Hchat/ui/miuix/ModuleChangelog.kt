@@ -42,6 +42,12 @@ internal object ModuleChangelog {
     /** 新的在上。版本号按发布顺序倒序排列。 */
     val entries: List<ModuleChangelogEntry> = listOf(
         ModuleChangelogEntry(
+            "6.7.7.18",
+            listOf(
+                "新增「群聊管理员标签显示」：群聊昵称前显示群主 / 管理员 / 部分真名标签（实用 - 群组，三个开关默认关闭）"
+            )
+        ),
+        ModuleChangelogEntry(
             "6.7.7.17",
             listOf(
                 "「图片保存为表情」明确只处理普通图片：表情消息（type 47）不再放行，菜单文案改为「保存为表情」"
