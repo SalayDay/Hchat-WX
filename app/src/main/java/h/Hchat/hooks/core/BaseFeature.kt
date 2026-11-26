@@ -126,4 +126,17 @@ abstract class BaseFeature : Feature {
             throwable
         )
     }
+
+    /**
+     * 记录"功能挂上了没"这类每次启动只输出一次的关键信息。
+     *
+     * 走 `HLog.boot` 而不是 `logError`：功能安装在启动期完成，而用户通常过几秒
+     * 才在设置页打开日志采集。普通日志此时 `captureEnabled == false` 会被直接丢弃，
+     * 只剩 LSPosed 那一路；而 boot 会先暂存在 [HLog] 的启动缓冲里，采集一开启就补写。
+     *
+     * 这也解释了「开了采集但看不到任何功能日志」的现象。
+     */
+    protected fun logBoot(message: String) {
+        HLog.boot("[Hchat:${featureId()}] $message")
+    }
 }

@@ -37,7 +37,10 @@ class ChatImmersionFeature : BaseFeature() {
     }
 
     override fun onFeatureInstall(context: FeatureContext) {
-        runtime = ChatImmersionRuntime(context, ::logFeatureError)
+        // 安装结果一律走 boot 缓冲：功能在启动期安装，而日志采集通常是之后才打开。
+        runtime = ChatImmersionRuntime(context) { message, throwable ->
+            if (throwable == null) logBoot(message) else logError(message, throwable)
+        }
         scheduleInstall()
         subscribe(Events.DexReady::class.java) { scheduleInstall() }
     }

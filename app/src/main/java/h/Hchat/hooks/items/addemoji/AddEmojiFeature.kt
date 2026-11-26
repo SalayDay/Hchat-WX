@@ -48,7 +48,7 @@ class AddEmojiFeature : BaseFeature() {
     }
 
     override fun onFeatureInstall(context: FeatureContext) {
-        runtime = AddEmojiRuntime(context, ::logFeatureError)
+        runtime = AddEmojiRuntime(context, ::logFeatureError, ::logFeatureBoot)
         scheduleInstall()
         subscribe(Events.DexReady::class.java) {
             scheduleInstall()
@@ -69,6 +69,11 @@ class AddEmojiFeature : BaseFeature() {
         logError(message, throwable)
     }
 
+    /** 安装结果只输出一次，必须走 boot 缓冲，否则采集开启前会被丢掉。 */
+    private fun logFeatureBoot(message: String) {
+        logBoot(message)
+    }
+
     companion object {
         const val ID = "add_emoji_from_image"
         internal const val MENU_ITEM_ID = 0x4841454d
@@ -78,11 +83,14 @@ class AddEmojiFeature : BaseFeature() {
 
 private class AddEmojiRuntime(
     private val context: FeatureContext,
-    private val logger: (String, Throwable?) -> Unit
+    private val logger: (String, Throwable?) -> Unit,
+    private val bootLog: (String) -> Unit
 ) {
     private val writer = EmojiCollectionWriter(context, logger)
     private val hookedMethods = Collections.newSetFromMap(ConcurrentHashMap<Method, Boolean>())
     private val bindings = Collections.synchronizedMap(WeakHashMap<MenuItem, Any>())
+    /** 每个 tag 类的「消息 getter」缓存，null 表示这个类没有。 */
+    private val messageGetterCache = ConcurrentHashMap<String, Method?>()
     private val enabled = HotConfig.flag(
         AddEmojiFeature.ID,
         AddEmojiSettings.KEY_ENABLED,
@@ -104,6 +112,11 @@ private class AddEmojiRuntime(
         // 已经 hook 过的方法由 hookedMethods 去重，重试不会重复挂。
         val chatHooked = installChatMenu()
         val snsInstalled = installSnsMenu()
+        bootLog(
+            "图片保存为表情挂载：聊天菜单门 ${if (chatHooked) "已挂载" else "未命中"}" +
+                "，朋友圈菜单门 ${if (snsInstalled) "已挂载" else "未命中"}" +
+                "，开关 ${if (enabled()) "开" else "关"}"
+        )
         return chatHooked || snsInstalled
     }
 
@@ -314,8 +327,9 @@ private class AddEmojiRuntime(
     /**
      * 从长按上下文里挖出原生消息对象。
      *
-     * 长按菜单拿不到消息本身，只能顺着 `view.tag`、参数数组和对象字段往下找，
-     * 直到命中 `com.tencent.mm.storage.*` 且带有效 msgId 的实例。
+     * 长按菜单拿不到消息本身。8.0.80 里 `view.tag` 是 `chatting.viewitems.ws`，
+     * 消息由它的 **方法** `c()` 返回（不是字段！）—— 只顺着字段找永远找不到，
+     * 这正是菜单项一直不出现的原因。所以这里字段和方法都要试。
      */
     private fun resolveNativeMessage(source: Any?): Any? {
         val visited = Collections.newSetFromMap(IdentityHashMap<Any, Boolean>())
@@ -342,6 +356,11 @@ private class AddEmojiRuntime(
         }
         val className = source.javaClass.name
         if (className.startsWith("java.") || className.startsWith("android.")) return null
+        // 先试「无参、返回 storage 消息」的 getter：ws#c() 就是这类。
+        messageGetter(className)?.let { getter ->
+            val value = KavaReflector.invoke(getter, source)
+            resolveNativeMessage(value, visited, depth + 1)?.let { return it }
+        }
         var current: Class<*>? = source.javaClass
         while (current != null && current != Any::class.java) {
             for (field in KavaReflector.declaredFields(current)) {
@@ -352,6 +371,29 @@ private class AddEmojiRuntime(
             current = current.superclass
         }
         return null
+    }
+
+    /**
+     * 找「无参、返回 `com.tencent.mm.storage.*`」的 getter。
+     *
+     * 8.0.80 的长按 tag 类是 `chatting.viewitems.ws`，消息由 `c()` 返回。
+     * 方法名逐版本变化，所以按返回类型特征找，不写死 `c`。结果按类缓存。
+     */
+    private fun messageGetter(className: String): Method? {
+        if (messageGetterCache.containsKey(className)) return messageGetterCache[className]
+        val clazz = runCatching { Class.forName(className) }.getOrNull() ?: run {
+            messageGetterCache[className] = null
+            return null
+        }
+        val getter = runCatching {
+            KavaReflector.declaredMethods(clazz).firstOrNull { method ->
+                method.parameterTypes.isEmpty() &&
+                    !Modifier.isStatic(method.modifiers) &&
+                    method.returnType.name.startsWith(MESSAGE_PACKAGE)
+            }
+        }.getOrNull()
+        messageGetterCache[className] = getter
+        return getter
     }
 
 

@@ -463,7 +463,7 @@ String avatar = getAvatarUrl("wxid_xxx", true);
 图片保存为表情：
 
 - `图片保存为表情`（featureId `add_emoji_from_image`）属于实用功能，设置页放在 `聊天` 分组，默认关闭。开启后长按聊天里的普通图片（type 3）或朋友圈的图片，菜单里多一项 `保存为表情[H]`，点击即可把这张图存进微信「自定义表情」库。**只处理普通图片**：表情消息（type 47）本来就在表情库里，不再放行；视频、文件、链接、小程序卡片也都不放行，类型判定统一走 `WeChatMessageTypes.isImage`（会先归一化高位标志位）。
-- 聊天入口复用 `SingleMessageMenuLocator` 的单消息长按菜单创建/点击 Hook，与「保存表情」「转发」共用同一套定位结果；朋友圈入口复用 `SnsContextMenuDispatcher` 共享注册表，与「转发[H]」共存，`isApplicable` 只在该条朋友圈存在图片媒体时放行。两处都不新增独立 DexKit 定位。
+- 长按菜单拿不到消息对象本身：8.0.80 里 `view.tag` 是 `chatting.viewitems.ws`，消息由它的**方法** `c()` 返回而不是字段，只顺着字段找永远取不到 —— 这是菜单项一直不出现的根因。解析时先找「无参、返回 `com.tencent.mm.storage.*`」的 getter 并按类缓存结果，再退回字段遍历。
 - 图片字节来源：聊天图片优先用 `WeChatImageApi.resolveBestAvailablePath(原生消息)` 取本地原图，本地没有时退化为 `resolvePathToken(imgPath)`；朋友圈图片用 `SnsForwardContentResolver.imagePath(media)`，本地有文件直接用，没有就按需下载到 `Hchat_sns_forward` 缓存。取不到文件时提示「图片还没下载好，先打开看一下再长按」，绝不写入空表情。
 - 落库必须照微信自己的 `EmojiAddCustomDialogUI.save` 序列，不能自己拼 SQL 往 `EmojiInfo` 表插：`field_catalog` 固定 `0x51`（自定义表情目录）、`field_reserved3` 取 `EmojiInfoStorage.getCustomEmojiMaxIndex() + 1`（决定面板排序位）、`field_temp` 与 `field_needupload` 为 0。写库分三路，且**三个候选方法都按方法体内语义字符串锚定、并要求声明类一致**：新增走 `create_emoji_info_notify`（`(EmojiInfo, boolean) → EmojiInfo`）、已有行走 `event_update_emoji`（`(EmojiInfo) → boolean`，带观察者通知）、兜底走 `insert: %s, %s`。不能用 `insert assertion!, invalid emojiInfo` 去锚 insert —— 8.0.80 上有三份方法带这个断言（update / updateNoNotify / insert），只按签名筛会选错；8.0.76 的 `create_emoji_info_notify` 同时出现在 `ui/g0`、`l32/v` 等非存储类里，所以必须先由 `insert: %s, %s` 定出存储类再交叉约束。落库成功后补发 `EmojiUpdatePanelEvent`，其 `post()` 声明在 `IEvent` 接口上（8.x 混淆为 `e()`），事件类自身不声明时必须顺接口查，不能用只沿父类查找的 `findMethodRecursive`；该事件必须在主线程投递。
 - 表情文件路径是「表情根目录 + md5」（微信 `EmojiInfo.getPath()` 在 groupId 为空时同此拼法）；根目录经 `content://<包名>.storage.provider.emotion/` 的 `getAccPath` 取得，`EmojiInfo` 经同 provider 的 `createEmojiInfo(md5, catalog, type, size)` 创建。`getEmojiByMd5` 显示已存在且 catalog 为 `0x51` 时直接提示已在表情库，不重复插入；落库后再用一次 `EmojiInfo.getPath()` 校正路径，目录不同时补写一份。
@@ -478,7 +478,7 @@ String avatar = getAvatarUrl("wxid_xxx", true);
 - 与「成员头衔」功能去重：若「成员头衔」已启用且该角色配了非空头衔，本功能不再叠同名标签，避免出现「群主 群主 昵称」；部分真名标签不受此限制。
 消息入场动效：
 
-- `消息入场动效`（featureId `chat_message_enter_animation`）属于实用功能，设置页放在 `美化` 分组，默认关闭。开启后聊天列表新建的消息 View 以「缩放 0.90 → 1 + 位移 8dp → 0 + alpha 0 → 1」、200ms、`OvershootInterpolator(1.15)` 入场。
+- `消息入场动效`（featureId `chat_message_enter_animation`）属于实用功能，设置页放在 `美化` 分组，默认关闭。开启后聊天列表新建的消息 View 以「缩放 0.90 → 1 + 位移 8dp → 0 + alpha 0 → 1」、200ms、`OvershootInterpolator(1.15)` 入场。  安装结果统一走 HLog.boot 缓冲而不是普通日志：功能在启动期安装，用户通常过几秒才打开日志采集，普通日志此时会被丢弃，boot 缓冲会在采集开启后补写，否则永远看不到「挂上了没」。
 - 聊天列表是 **RecyclerView 架构**（`ChattingDataAdapterV3`），`getView` 在全 dex 没有调用点，按 `getView` 定位一定失败。定位改为按方法体内字符串 `MicroMsg.ChattingDataAdapterV3` + `_onBindViewHolder[` + `msgInfo` 找 `onBindViewHolder(holder, position)`（与「消息文字颜色」「滑动引用」同一套已验证锚点），结果写 `Hchat_chat_enter_animation_cache`。动画只对**首次绑定**的 item View 执行，用弱表记录已处理过的 View，滚动回流不重复播放，也不改微信的 item 复用逻辑。
 
 悬浮底栏滑动隐藏：

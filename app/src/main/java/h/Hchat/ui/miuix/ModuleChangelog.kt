@@ -42,6 +42,13 @@ internal object ModuleChangelog {
     /** 新的在上。版本号按发布顺序倒序排列。 */
     val entries: List<ModuleChangelogEntry> = listOf(
         ModuleChangelogEntry(
+            "6.7.7.25",
+            listOf(
+                "修复「图片保存为表情」无效：8.0.80 的消息由长按 tag 对象的方法（ws#c）返回，原来只找字段所以永远取不到消息",
+                "修复功能安装日志看不到：功能在启动期安装、日志采集通常之后才开，改为走 HLog.boot 缓冲，采集一开启就能补看"
+            )
+        ),
+        ModuleChangelogEntry(
             "6.7.7.24",
             listOf(
                 "修复悬浮底栏滑动隐藏无效：onScrolled 是 OnScrollListener 接口方法、类上不存在，改为拦 onTouchEvent 并用滚动偏移差值判断方向",
