@@ -261,6 +261,8 @@ import h.Hchat.hooks.items.customnotify.CustomNotificationSettings
 import h.Hchat.hooks.items.editmsg.EditMessageFeature
 import h.Hchat.hooks.items.editmsg.EditMessageSettings
 import h.Hchat.hooks.items.emojilimit.EmojiCollectionLimitFeature
+import h.Hchat.hooks.items.addemoji.AddEmojiFeature
+import h.Hchat.hooks.items.addemoji.AddEmojiSettings
 import h.Hchat.hooks.items.emojisave.EmojiSaveFeature
 import h.Hchat.hooks.items.emojisave.EmojiSaveSettings
 import h.Hchat.hooks.items.fakelocation.FakeLocationFeature
@@ -3191,6 +3193,7 @@ internal fun practicalFeatureGroups(
                 QuoteDeleteClearFeature.ID,
                 SwipeQuoteFeature.ID,
                 EmojiSaveFeature.ID,
+                AddEmojiFeature.ID,
                 EmojiCollectionLimitFeature.ID,
                 CallMediaLimitFeature.ID,
                 CallRingtoneBlockFeature.ID
@@ -3946,6 +3949,7 @@ internal fun featureSubSearchTerms(featureId: String): List<String> {
         QuoteDeleteClearFeature.ID -> listOf("删除键清引用", "清除引用", "引用消息", "删除引用")
         EmojiCollectionLimitFeature.ID -> listOf("表情收藏", "收藏上限", "5000")
         EmojiSaveFeature.ID -> listOf("保存表情", "表情保存", "动画表情", "长按菜单", "本地文件")
+        AddEmojiFeature.ID -> listOf("添加到表情", "图片转表情", "自定义表情", "朋友圈表情")
         SwipeQuoteFeature.ID -> listOf("滑动手势", "左滑引用", "右滑复读", "长按复读", "菜单复读", "+1", "复读语音", "语音时长", "滑动距离")
         CallMediaLimitFeature.ID -> listOf("通话媒体限制", "语音通话", "视频通话", "播放语音", "查看视频", "打开拍摄")
         CallRingtoneBlockFeature.ID -> listOf("屏蔽通话铃声", "呼入铃声", "呼出铃声", "来电铃声", "等待铃声", "语音通话", "视频通话")
@@ -4788,6 +4792,16 @@ internal fun FeatureSettingsPage(
         WeChatKeepAliveFeature.ID -> WeChatKeepAliveMiuixPage(context, provider, onBack)
         QuoteDeleteClearFeature.ID -> QuoteDeleteClearMiuixPage(context, provider, onBack)
         EmojiSaveFeature.ID -> EmojiSaveMiuixPage(context, provider, onBack)
+        AddEmojiFeature.ID -> HchatExtraToggleMiuixPage(
+            context = context,
+            provider = provider,
+            key = AddEmojiSettings.KEY_ENABLED,
+            defaultValue = AddEmojiSettings.DEFAULT_ENABLED,
+            summary = "长按聊天里的图片或朋友圈的图片，菜单里多一项「添加到表情」，点一下就把这张图" +
+                "加入微信自定义表情。图片需要先在本地缓存过（打开看过即可）。",
+            onBack = onBack,
+            useFeaturePrefs = true
+        )
         EmojiCollectionLimitFeature.ID -> HchatExtraToggleMiuixPage(
             context = context,
             provider = provider,

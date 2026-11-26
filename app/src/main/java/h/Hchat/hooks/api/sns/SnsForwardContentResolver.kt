@@ -131,6 +131,28 @@ internal class SnsForwardContentResolver(
         }.getOrNull()
     }
 
+    /**
+     * 取单张朋友圈图片的本地可读路径（本地有就直接用，没有就按需下载）。
+     *
+     * 供「图片添加到表情」这类只需要一张图的调用方使用，比 [prepare] 轻：
+     * 不解析实况视频、不拼多张图。
+     */
+    fun imagePath(media: SnsForwardMedia): String? {
+        val canceled = AtomicBoolean(false)
+        resolveLocalImage(media, 0, canceled)?.takeIf(::isUsableImage)?.let { return it }
+        val downloaded = downloadMedia(
+            urls = listOf(media.url),
+            cacheKey = "${media.id}_emoji",
+            extension = "jpg",
+            maxBytes = MAX_IMAGE_BYTES,
+            canceled = canceled
+        )
+        return downloaded?.takeIf(::isUsableImage) ?: run {
+            downloaded?.let { runCatching { File(it).delete() } }
+            null
+        }
+    }
+
     fun prepare(snapshot: SnsForwardSnapshot, canceled: AtomicBoolean): PreparedSnsForward {
         if (canceled.get()) throw InterruptedException("已取消")
         return when {

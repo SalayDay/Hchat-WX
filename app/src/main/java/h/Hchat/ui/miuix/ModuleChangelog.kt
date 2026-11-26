@@ -42,6 +42,12 @@ internal object ModuleChangelog {
     /** 新的在上。版本号按发布顺序倒序排列。 */
     val entries: List<ModuleChangelogEntry> = listOf(
         ModuleChangelogEntry(
+            "6.7.7.16",
+            listOf(
+                "新增「图片添加到表情」：长按聊天图片或朋友圈图片，直接把图片加入微信自定义表情（实用 - 聊天，默认关闭）"
+            )
+        ),
+        ModuleChangelogEntry(
             "6.7.7.15",
             listOf(
                 "快捷已读：修复滑动时卡顿 —— 按下不再触发全树遍历，拖拽目标推迟到确认上滑后解析并缓存底栏",

@@ -1,0 +1,360 @@
+package h.Hchat.hooks.items.addemoji
+
+import android.app.Activity
+import android.view.MenuItem
+import android.view.View
+import de.robv.android.xposed.XC_MethodHook
+import h.Hchat.event.Events
+import h.Hchat.hooks.api.core.WeChatApis
+import h.Hchat.hooks.api.message.SingleMessageMenuLocator
+import h.Hchat.hooks.api.sns.SnsContentTypes
+import h.Hchat.hooks.api.sns.SnsContextMenuDispatcher
+import h.Hchat.hooks.api.sns.SnsContextMenuTarget
+import h.Hchat.hooks.api.sns.SnsForwardContentResolver
+import h.Hchat.hooks.core.BaseFeature
+import h.Hchat.hooks.core.DexInstallScheduler
+import h.Hchat.hooks.core.FeatureContext
+import h.Hchat.hooks.core.HookRegistry
+import h.Hchat.preferences.HotConfig
+import h.Hchat.utils.KavaReflector
+import java.lang.reflect.Method
+import java.lang.reflect.Modifier
+import java.util.Collections
+import java.util.IdentityHashMap
+import java.util.WeakHashMap
+import java.util.concurrent.ConcurrentHashMap
+
+/**
+ * 图片「添加到表情」。
+ *
+ * 长按聊天里的图片、或朋友圈的图片，菜单里多一项「添加到表情[H]」，点了就把这张图
+ * 写进微信「自定义表情」库。落库方式见 [EmojiCollectionWriter]：完全照微信自己
+ * `EmojiAddCustomDialogUI.save` 的序列走（catalog=0x51 + 排序位 + `EmojiInfoStorage` 落库）。
+ *
+ * 两处入口各用现成的共享链路，不新增 DexKit 定位：
+ * - 聊天：`SingleMessageMenuLocator`（和「保存表情」「转发」同一套创建/点击 Hook）
+ * - 朋友圈：`SnsContextMenuDispatcher`（和「转发[H]」同一套菜单注册表）
+ */
+class AddEmojiFeature : BaseFeature() {
+    private var runtime: AddEmojiRuntime? = null
+
+    override fun featureId(): String = ID
+
+    override fun name(): String = "图片添加到表情"
+
+    override fun onFeatureInit(context: FeatureContext) {
+        registerSettingsProvider(AddEmojiSettingsProvider())
+    }
+
+    override fun onFeatureInstall(context: FeatureContext) {
+        runtime = AddEmojiRuntime(context, ::logFeatureError)
+        scheduleInstall()
+        subscribe(Events.DexReady::class.java) { scheduleInstall() }
+    }
+
+    override fun onFeatureDestroy(context: FeatureContext) {
+        runtime?.destroy()
+        runtime = null
+    }
+
+    private fun scheduleInstall() {
+        DexInstallScheduler.schedule(ID, name()) { runtime?.install() == true }
+    }
+
+    private fun logFeatureError(message: String, throwable: Throwable?) {
+        logError(message, throwable)
+    }
+
+    companion object {
+        const val ID = "add_emoji_from_image"
+        internal const val MENU_ITEM_ID = 0x4841454d
+        internal const val MENU_TITLE = "添加到表情[H]"
+    }
+}
+
+private class AddEmojiRuntime(
+    private val context: FeatureContext,
+    private val logger: (String, Throwable?) -> Unit
+) {
+    private val writer = EmojiCollectionWriter(context, logger)
+    private val hookedMethods = Collections.newSetFromMap(ConcurrentHashMap<Method, Boolean>())
+    private val bindings = Collections.synchronizedMap(WeakHashMap<MenuItem, Any>())
+    private val enabled = HotConfig.flag(
+        AddEmojiFeature.ID,
+        AddEmojiSettings.KEY_ENABLED,
+        AddEmojiSettings.DEFAULT_ENABLED
+    ) {
+        context.configStore().getBoolean(
+            AddEmojiFeature.ID,
+            AddEmojiSettings.KEY_ENABLED,
+            AddEmojiSettings.DEFAULT_ENABLED
+        )
+    }
+    private val snsResolver by lazy { SnsForwardContentResolver(context, logger) }
+    private var snsRegistered = false
+
+    @Synchronized
+    fun install(): Boolean {
+        // 返回 false 会让 DexInstallScheduler 在 DexKit 还没就绪时重试（最多 3 次）；
+        // 已经 hook 过的方法由 hookedMethods 去重，重试不会重复挂。
+        val chatHooked = installChatMenu()
+        val snsHooked = installSnsMenu()
+        return chatHooked || snsHooked
+    }
+
+    fun destroy() {
+        bindings.clear()
+        if (snsRegistered) {
+            SnsContextMenuDispatcher.unregister(OWNER_SNS)
+            snsRegistered = false
+        }
+    }
+
+    // ------------------------------------------------------------------ 聊天
+
+    private fun installChatMenu(): Boolean {
+        val createHooked = SingleMessageMenuLocator.menuCreateMethods(context, logger).count { method ->
+            hook(method, object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    addChatMenu(param)
+                }
+            })
+        }
+        val clickHooked = SingleMessageMenuLocator.menuClickMethods(context, logger).count { method ->
+            hook(method, object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    handleChatClick(param)
+                }
+            })
+        }
+        if (createHooked <= 0) logger("图片添加到表情菜单创建 Hook 未安装", null)
+        if (clickHooked <= 0) logger("图片添加到表情菜单点击 Hook 未安装", null)
+        return createHooked > 0 && clickHooked > 0
+    }
+
+    private fun addChatMenu(param: XC_MethodHook.MethodHookParam) {
+        if (!enabled()) return
+        val args = param.args
+        val menu = args.getOrNull(0) ?: return
+        val view = args.getOrNull(1) as? View ?: return
+        val message = resolveNativeMessage(view.tag) ?: resolveNativeMessage(args) ?: return
+        if (!isImageMessage(message)) return
+        val item = addMenuItem(menu, view) ?: return
+        bindings[item] = message
+    }
+
+    private fun handleChatClick(param: XC_MethodHook.MethodHookParam) {
+        if (!enabled()) return
+        val item = param.args.firstNotNullOfOrNull { it as? MenuItem } ?: return
+        if (item.itemId != AddEmojiFeature.MENU_ITEM_ID) return
+        val message = bindings.remove(item) ?: resolveNativeMessage(param.args) ?: return
+        val path = resolveChatImagePath(message)
+        val activity = WeChatApis.currentActivity()?.currentActivity()
+        if (path.isBlank()) {
+            toast(activity, "图片还没下载好，先打开看一下再长按")
+            return
+        }
+        writer.addImage(path, activity)
+    }
+
+    private fun resolveChatImagePath(message: Any): String {
+        val images = WeChatApis.media()?.images() ?: return ""
+        val direct = runCatching { images.resolveBestAvailablePath(message) }.getOrNull().orEmpty()
+        if (direct.isNotBlank()) return direct
+        // 退一步：消息里带的 imgPath 可能只是一个路径标识，按标识再解析一次。
+        val token = readString(message, "getImgPath", "field_imgPath", "imgPath")
+        if (token.isBlank()) return ""
+        return runCatching { images.resolvePathToken(token) }.getOrNull().orEmpty()
+    }
+
+    private fun isImageMessage(message: Any): Boolean {
+        val type = readNumber(message, "getType", "field_type", "type")?.toInt() ?: return false
+        return (type and 0xffff) == MESSAGE_TYPE_IMAGE
+    }
+
+    // ---------------------------------------------------------------- 朋友圈
+
+    private fun installSnsMenu(): Boolean {
+        if (snsRegistered) return true
+        SnsContextMenuDispatcher.register(
+            SnsContextMenuDispatcher.Entry(
+                owner = OWNER_SNS,
+                itemId = AddEmojiFeature.MENU_ITEM_ID,
+                title = AddEmojiFeature.MENU_TITLE,
+                order = 12,
+                iconName = "icons_filled_emoticon",
+                isEnabled = { enabled() },
+                isApplicable = { target -> target.snapshot.isImage && imageMedia(target) != null },
+                onClick = { activity, target -> handleSnsClick(activity, target) }
+            )
+        )
+        snsRegistered = true
+        val installed = SnsContextMenuDispatcher.install(context, snsResolver, logger)
+        if (!installed) logger("朋友圈图片添加到表情 Hook 未安装", null)
+        return installed
+    }
+
+    private fun handleSnsClick(activity: Activity, target: SnsContextMenuTarget) {
+        val media = imageMedia(target) ?: return
+        Thread({
+            val path = runCatching { snsResolver.imagePath(media) }.getOrNull()
+            if (path.isNullOrBlank()) {
+                toast(activity, "朋友圈图片还没下载好，先点开看一下再长按")
+                return@Thread
+            }
+            // writer 自己起线程处理落库；这里只负责把本地路径拿到手。
+            writer.addImage(path, activity)
+        }, "Hchat-AddEmoji-Sns").start()
+    }
+
+    private fun imageMedia(target: SnsContextMenuTarget) =
+        target.snapshot.media.firstOrNull { SnsContentTypes.isImageMedia(it.type) }
+
+    // ------------------------------------------------------------------ 公共
+
+    private fun hook(method: Method, callback: XC_MethodHook): Boolean {
+        if (Modifier.isAbstract(method.modifiers) || method.declaringClass.isInterface) return false
+        if (!hookedMethods.add(method)) return true
+        return runCatching {
+            HookRegistry.get().hook(KavaReflector.accessible(method) ?: method, callback)
+            true
+        }.getOrElse {
+            hookedMethods.remove(method)
+            logger("图片添加到表情 Hook 安装失败: ${method.toGenericString()}", it)
+            false
+        }
+    }
+
+    private fun addMenuItem(menu: Any, view: View): MenuItem? {
+        (KavaReflector.invokeMethod(menu, "findItem", AddEmojiFeature.MENU_ITEM_ID) as? MenuItem)
+            ?.let { return it }
+        val groupId = readMenuGroupId(menu)
+        val iconRes = menuIconResId(view)
+        if (iconRes != 0) {
+            val method = KavaReflector.declaredMethods(menu.javaClass).firstOrNull { candidate ->
+                val types = candidate.parameterTypes
+                candidate.name == "c" && types.size == 5 &&
+                    types[0] == Integer.TYPE && types[1] == Integer.TYPE && types[2] == Integer.TYPE &&
+                    types[3].isAssignableFrom(String::class.java) && types[4] == Integer.TYPE
+            }
+            if (KavaReflector.invokeSuccessfully(
+                    method, menu, groupId, AddEmojiFeature.MENU_ITEM_ID, 0,
+                    AddEmojiFeature.MENU_TITLE, iconRes
+                )
+            ) {
+                return KavaReflector.invokeMethod(menu, "findItem", AddEmojiFeature.MENU_ITEM_ID)
+                    as? MenuItem
+            }
+        }
+        val added = KavaReflector.invokeMethod(
+            menu, "add", groupId, AddEmojiFeature.MENU_ITEM_ID, 0, AddEmojiFeature.MENU_TITLE
+        ) ?: KavaReflector.invokeMethod(
+            menu, "add", groupId, AddEmojiFeature.MENU_ITEM_ID, 0,
+            AddEmojiFeature.MENU_TITLE as CharSequence
+        )
+        if (added is MenuItem) {
+            if (iconRes != 0) runCatching { added.setIcon(iconRes) }
+            return added
+        }
+        val fallback = KavaReflector.invokeMethod(
+            menu, "f", AddEmojiFeature.MENU_ITEM_ID, AddEmojiFeature.MENU_TITLE
+        ) ?: KavaReflector.invokeMethod(
+            menu, "f", AddEmojiFeature.MENU_ITEM_ID, AddEmojiFeature.MENU_TITLE as CharSequence
+        )
+        return (fallback as? MenuItem)
+            ?: KavaReflector.invokeMethod(menu, "findItem", AddEmojiFeature.MENU_ITEM_ID) as? MenuItem
+    }
+
+    private fun readMenuGroupId(menu: Any): Int {
+        val size = (KavaReflector.invokeMethod(menu, "size") as? Number)?.toInt() ?: 0
+        for (index in 0 until size) {
+            val item = KavaReflector.invokeMethod(menu, "getItem", index) as? MenuItem ?: continue
+            return item.groupId
+        }
+        return 0
+    }
+
+    private fun menuIconResId(view: View): Int {
+        val resources = view.context.resources
+        val packageName = view.context.packageName
+        for (name in ICON_NAMES) {
+            for (type in arrayOf("raw", "drawable")) {
+                val id = resources.getIdentifier(name, type, packageName)
+                if (id != 0) return id
+            }
+        }
+        return 0
+    }
+
+    private fun readString(source: Any, getter: String, field: String, fallback: String): String {
+        return KavaReflector.invokeMethod(source, getter)?.toString()
+            ?: KavaReflector.readField(source, field)?.toString()
+            ?: KavaReflector.readField(source, fallback)?.toString()
+            ?: ""
+    }
+
+    private fun readNumber(source: Any, getter: String, field: String, fallback: String): Number? {
+        return KavaReflector.invokeMethod(source, getter) as? Number
+            ?: KavaReflector.readField(source, field) as? Number
+            ?: KavaReflector.readField(source, fallback) as? Number
+    }
+
+    /**
+     * 从长按上下文里挖出原生消息对象。
+     *
+     * 长按菜单拿不到消息本身，只能顺着 `view.tag`、参数数组和对象字段往下找，
+     * 直到命中 `com.tencent.mm.storage.*` 且带有效 msgId 的实例。
+     */
+    private fun resolveNativeMessage(source: Any?): Any? {
+        val visited = Collections.newSetFromMap(IdentityHashMap<Any, Boolean>())
+        return resolveNativeMessage(source, visited, 0)
+    }
+
+    private fun resolveNativeMessage(source: Any?, visited: MutableSet<Any>, depth: Int): Any? {
+        if (source == null || depth > MAX_RESOLVE_DEPTH || !visited.add(source)) return null
+        val messageId = readNumber(source, "getMsgId", "field_msgId", "msgId")
+            ?: KavaReflector.invokeMethod(source, "getMsgID") as? Number
+        if (source.javaClass.name.startsWith(MESSAGE_PACKAGE) &&
+            messageId?.toLong()?.let { it > 0L } == true
+        ) {
+            return source
+        }
+        if (source is View) return resolveNativeMessage(source.tag, visited, depth + 1)
+        if (source is Array<*>) {
+            source.forEach { resolveNativeMessage(it, visited, depth + 1)?.let { found -> return found } }
+            return null
+        }
+        if (source is Collection<*>) {
+            source.forEach { resolveNativeMessage(it, visited, depth + 1)?.let { found -> return found } }
+            return null
+        }
+        val className = source.javaClass.name
+        if (className.startsWith("java.") || className.startsWith("android.")) return null
+        var current: Class<*>? = source.javaClass
+        while (current != null && current != Any::class.java) {
+            for (field in KavaReflector.declaredFields(current)) {
+                if (field.type.isPrimitive || field.type == String::class.java) continue
+                val value = KavaReflector.readField(field, source) ?: continue
+                resolveNativeMessage(value, visited, depth + 1)?.let { return it }
+            }
+            current = current.superclass
+        }
+        return null
+    }
+
+    private fun toast(activity: Activity?, message: String) {
+        android.os.Handler(android.os.Looper.getMainLooper()).post {
+            if (activity != null && !activity.isFinishing && !activity.isDestroyed) {
+                android.widget.Toast.makeText(activity, message, android.widget.Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
+    private companion object {
+        const val OWNER_SNS = "add_emoji_from_image"
+        const val MESSAGE_TYPE_IMAGE = 3
+        const val MESSAGE_PACKAGE = "com.tencent.mm.storage."
+        const val MAX_RESOLVE_DEPTH = 5
+        val ICON_NAMES = listOf("icons_filled_emoticon", "icons_filled_emoji", "icons_filled_sticker")
+    }
+}
