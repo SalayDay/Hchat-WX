@@ -50,7 +50,10 @@ class AddEmojiFeature : BaseFeature() {
     override fun onFeatureInstall(context: FeatureContext) {
         runtime = AddEmojiRuntime(context, ::logFeatureError)
         scheduleInstall()
-        subscribe(Events.DexReady::class.java) { scheduleInstall() }
+        subscribe(Events.DexReady::class.java) {
+            scheduleInstall()
+            runtime?.retrySnsMenu()
+        }
     }
 
     override fun onFeatureDestroy(context: FeatureContext) {
@@ -93,14 +96,23 @@ private class AddEmojiRuntime(
     }
     private val snsResolver by lazy { SnsForwardContentResolver(context, logger) }
     private var snsRegistered = false
+    @Volatile private var snsHooked = false
 
     @Synchronized
     fun install(): Boolean {
         // 返回 false 会让 DexInstallScheduler 在 DexKit 还没就绪时重试（最多 3 次）；
         // 已经 hook 过的方法由 hookedMethods 去重，重试不会重复挂。
         val chatHooked = installChatMenu()
-        val snsHooked = installSnsMenu()
-        return chatHooked || snsHooked
+        val snsInstalled = installSnsMenu()
+        return chatHooked || snsInstalled
+    }
+
+    /** DexReady 之后补装朋友圈菜单：调度器标记成功后不会再调 install()。 */
+    @Synchronized
+    fun retrySnsMenu() {
+        if (snsHooked) return
+        snsRegistered = false
+        installSnsMenu()
     }
 
     fun destroy() {
@@ -109,6 +121,7 @@ private class AddEmojiRuntime(
             SnsContextMenuDispatcher.unregister(OWNER_SNS)
             snsRegistered = false
         }
+        snsHooked = false
     }
 
     // ------------------------------------------------------------------ 聊天
@@ -149,13 +162,10 @@ private class AddEmojiRuntime(
         val item = param.args.firstNotNullOfOrNull { it as? MenuItem } ?: return
         if (item.itemId != AddEmojiFeature.MENU_ITEM_ID) return
         val message = bindings.remove(item) ?: resolveNativeMessage(param.args) ?: return
-        val path = resolveChatImagePath(message)
-        val activity = WeChatApis.currentActivity()?.currentActivity()
-        if (path.isBlank()) {
-            toast(activity, "图片还没下载好，先打开看一下再长按")
-            return
+        // 解析原图路径可能要把 VFS 内容落到缓存文件，属于 IO，不能留在主线程。
+        writer.addImageLazy(WeChatApis.currentActivity()?.currentActivity()) {
+            resolveChatImagePath(message)
         }
-        writer.addImage(path, activity)
     }
 
     private fun resolveChatImagePath(message: Any): String {
@@ -199,21 +209,14 @@ private class AddEmojiRuntime(
         )
         snsRegistered = true
         val installed = SnsContextMenuDispatcher.install(context, snsResolver, logger)
+        snsHooked = installed
         if (!installed) logger("朋友圈图片保存为表情 Hook 未安装", null)
         return installed
     }
 
     private fun handleSnsClick(activity: Activity, target: SnsContextMenuTarget) {
         val media = imageMedia(target) ?: return
-        Thread({
-            val path = runCatching { snsResolver.imagePath(media) }.getOrNull()
-            if (path.isNullOrBlank()) {
-                toast(activity, "朋友圈图片还没下载好，先点开看一下再长按")
-                return@Thread
-            }
-            // writer 自己起线程处理落库；这里只负责把本地路径拿到手。
-            writer.addImage(path, activity)
-        }, "Hchat-AddEmoji-Sns").start()
+        writer.addImageLazy(activity) { runCatching { snsResolver.imagePath(media) }.getOrNull() }
     }
 
     private fun imageMedia(target: SnsContextMenuTarget) =
@@ -351,13 +354,6 @@ private class AddEmojiRuntime(
         return null
     }
 
-    private fun toast(activity: Activity?, message: String) {
-        android.os.Handler(android.os.Looper.getMainLooper()).post {
-            if (activity != null && !activity.isFinishing && !activity.isDestroyed) {
-                android.widget.Toast.makeText(activity, message, android.widget.Toast.LENGTH_SHORT).show()
-            }
-        }
-    }
 
     private companion object {
         const val OWNER_SNS = "add_emoji_from_image"

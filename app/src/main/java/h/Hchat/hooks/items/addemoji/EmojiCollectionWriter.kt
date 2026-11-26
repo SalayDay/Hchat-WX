@@ -2,6 +2,7 @@ package h.Hchat.hooks.items.addemoji
 
 import android.app.Activity
 import android.content.Context
+import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Bundle
@@ -62,60 +63,77 @@ internal class EmojiCollectionWriter(
         data class AlreadyExists(val md5: String) : Result
         data class Failed(val reason: String) : Result
     }
-
-    /**
-     * 后台线程处理图片；结束后在主线程 toast（`showToast=false` 时静默）。
-     *
-     * 必须在后台调用：要读图片文件、算 md5、写表情目录、再落库，都是 IO。
-     */
+    /** 已有本地路径时直接提交（内部起后台线程，可在主线程调用）。 */
     fun addImage(imagePath: String, activity: Activity?, showToast: Boolean = true) {
+        submit(activity, showToast) { imagePath }
+    }
+
+    /** 路径需要现算时用这个（朋友圈图片可能要现下载），避免调用方再套一层线程。 */
+    fun addImageLazy(activity: Activity?, showToast: Boolean = true, pathProvider: () -> String?) {
+        submit(activity, showToast, pathProvider)
+    }
+
+    private fun submit(activity: Activity?, showToast: Boolean, pathProvider: () -> String?) {
         Thread({
-            val result = runCatching { addImageSync(imagePath) }.getOrElse { error ->
-                logger("添加表情失败: ${error.message}", error)
-                Result.Failed(error.message ?: "添加表情失败")
-            }
-            if (showToast) {
-                val message = when (result) {
-                    is Result.Added -> "已存为表情"
-                    is Result.AlreadyExists -> "该图片已在表情库"
-                    is Result.Failed -> result.reason
+            val path = runCatching { pathProvider() }.getOrNull()
+            val result = if (path.isNullOrBlank()) {
+                Result.Failed("图片还没下载好，先打开看一下再长按")
+            } else {
+                runCatching { addImageSync(path) }.getOrElse { error ->
+                    logger("保存表情失败: ${error.message}", error)
+                    Result.Failed(error.message ?: "保存表情失败")
                 }
-                toast(activity, message)
             }
+            if (showToast) toast(activity, result.toMessage())
         }, "Hchat-AddEmoji").start()
+    }
+
+    private fun Result.toMessage(): String = when (this) {
+        is Result.Added -> "已存为表情"
+        is Result.AlreadyExists -> "该图片已在表情库"
+        is Result.Failed -> reason
     }
 
     private fun addImageSync(imagePath: String): Result {
         val source = File(imagePath)
         if (!source.isFile || source.length() <= 0L) return Result.Failed("图片文件不存在")
         val data = runCatching { source.readBytes() }.getOrElse { return Result.Failed("读取图片失败") }
-        val md5 = md5Of(data) ?: return Result.Failed("计算图片指纹失败")
+        // 必须先缩放/重编码，再按**最终字节**算 md5：表情文件名就是 md5，
+        // 若先算原图 md5 再写入缩过的内容，文件名和内容就对不上了。
+        val payload = preparePayload(data)
+        val md5 = md5Of(payload.bytes) ?: return Result.Failed("计算图片指纹失败")
         val located = targets() ?: return Result.Failed("表情库接口未就绪")
 
         // 已经在库里（catalog=81 即自定义表情）就不用重复插入。
-        existingCatalog(located.infoClass, md5)?.let { catalog ->
-            if (catalog == CUSTOM_CATALOG) return Result.AlreadyExists(md5)
+        // md5 是 EmojiInfo 表的主键，同一张图不可能存在两行。已经存在时必须**复用那一行**
+        // 再改 catalog —— 微信自己的「添加表情」也是这么做的（按 md5 重新取 EmojiInfo 后
+        // 把 catalog 改成 0x51），否则插入会撞主键。
+        val existing = queryEmojiByMd5(located.infoClass, md5)
+        if (existing != null && catalogOf(existing) == CUSTOM_CATALOG) {
+            return Result.AlreadyExists(md5)
         }
 
         val basePath = accPath() ?: return Result.Failed("获取表情目录失败")
-        val type = if (isGif(data)) TYPE_GIF else TYPE_STATIC
-        val emojiInfo = createEmojiInfo(md5, CUSTOM_CATALOG, type, data.size, located.infoClass)
+        val type = if (isGif(payload.bytes)) TYPE_GIF else TYPE_STATIC
+        val emojiInfo = existing
+            ?: createEmojiInfo(md5, CUSTOM_CATALOG, type, payload.bytes.size, located.infoClass)
             ?: return Result.Failed("创建表情信息失败")
 
         val targetPath = basePath + md5
-        if (!writeFile(data, File(targetPath))) return Result.Failed("写入表情文件失败")
+        if (!writeFile(payload.bytes, File(targetPath))) return Result.Failed("写入表情文件失败")
 
-        val width = imageWidth(data)
-        val height = imageHeight(data)
         val maxIndex = located.maxIndex?.let {
             (KavaReflector.invoke(it, located.storage) as? Number)?.toInt()
         } ?: 0
 
-        applyCustomFields(emojiInfo, md5, type, data.size, width, height, maxIndex + 1)
+        applyCustomFields(
+            emojiInfo, md5, type, payload.bytes.size, payload.width, payload.height, maxIndex + 1
+        )
 
-        val inserted = insertEmoji(located, emojiInfo)
+        val inserted = writeEmoji(located, emojiInfo, existing != null)
         if (!inserted) {
-            File(targetPath).delete()
+            // 复用已有行时不能删文件：那可能是别的表情/消息正在引用的同一份内容。
+            if (existing == null) File(targetPath).delete()
             return Result.Failed("写入表情库失败")
         }
 
@@ -126,13 +144,59 @@ internal class EmojiCollectionWriter(
                 val official = File(officialPath)
                 if (!official.isFile) {
                     official.parentFile?.mkdirs()
-                    official.writeBytes(data)
+                    official.writeBytes(payload.bytes)
                 }
             }
         }
         notifyPanel()
         return Result.Added(md5)
     }
+
+    /**
+     * 表情文件有尺寸和体积上限，微信自己添加超限时会直接拒绝（日志 `over max size`）。
+     *
+     * 过大或过肥的图片等比缩到 [MAX_SIDE] 并重新编码成 PNG；GIF 不重编码（会丢动画），
+     * 只保留原始字节。
+     */
+    private fun preparePayload(data: ByteArray): PreparedPayload {
+        val size = bounds(data)
+        val width = size?.first ?: DEFAULT_SIDE
+        val height = size?.second ?: DEFAULT_SIDE
+        if (isGif(data)) return PreparedPayload(data, width, height)
+        if (data.size <= MAX_BYTES && maxOf(width, height) <= MAX_SIDE) {
+            return PreparedPayload(data, width, height)
+        }
+        return downscale(data) ?: PreparedPayload(data, width, height)
+    }
+
+    private fun downscale(data: ByteArray): PreparedPayload? = runCatching {
+        val probe = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(data, 0, data.size, probe)
+        if (probe.outWidth <= 0 || probe.outHeight <= 0) return@runCatching null
+        var sample = 1
+        while (probe.outWidth / (sample * 2) >= MAX_SIDE &&
+            probe.outHeight / (sample * 2) >= MAX_SIDE
+        ) {
+            sample *= 2
+        }
+        val decoded = BitmapFactory.decodeByteArray(
+            data, 0, data.size, BitmapFactory.Options().apply { inSampleSize = sample }
+        ) ?: return@runCatching null
+        val longest = maxOf(decoded.width, decoded.height)
+        val bitmap = if (longest > MAX_SIDE) {
+            val ratio = MAX_SIDE.toFloat() / longest
+            val w = (decoded.width * ratio).toInt().coerceAtLeast(1)
+            val h = (decoded.height * ratio).toInt().coerceAtLeast(1)
+            Bitmap.createScaledBitmap(decoded, w, h, true)
+        } else {
+            decoded
+        }
+        val out = java.io.ByteArrayOutputStream()
+        bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
+        PreparedPayload(out.toByteArray(), bitmap.width, bitmap.height)
+    }.getOrNull()
+
+    private data class PreparedPayload(val bytes: ByteArray, val width: Int, val height: Int)
 
     private fun applyCustomFields(
         emojiInfo: Any,
@@ -159,17 +223,28 @@ internal class EmojiCollectionWriter(
         setField(emojiInfo, "field_reserved3", order)
     }
 
-    private fun insertEmoji(targets: Targets, emojiInfo: Any): Boolean {
-        // 优先 saveEmojiInfo(emoji, false)：它自带 "create_emoji_info_notify"，
-        // 落库的同时通知观察者，比裸 insert 更接近微信自己的行为。
-        targets.save?.let { save ->
-            val saved = KavaReflector.invoke(save, targets.storage, emojiInfo, false)
-            if (saved != null) return true
+    /**
+     * 落库。
+     *
+     * 已存在的行必须走 update，否则插入会撞 md5 主键；新行优先 create
+     * （自带 `create_emoji_info_notify`，与微信自己添加表情的路径一致）。
+     */
+    private fun writeEmoji(targets: Targets, emojiInfo: Any, existing: Boolean): Boolean {
+        if (existing) {
+            targets.update?.let { method ->
+                if (KavaReflector.invoke(method, targets.storage, emojiInfo) as? Boolean == true) {
+                    return true
+                }
+            }
         }
-        val inserted = KavaReflector.invoke(targets.insert, targets.storage, emojiInfo)
-        return inserted as? Boolean == true
+        targets.create?.let { method ->
+            if (KavaReflector.invoke(method, targets.storage, emojiInfo, false) != null) return true
+        }
+        targets.insert?.let { method ->
+            if (KavaReflector.invoke(method, targets.storage, emojiInfo) as? Boolean == true) return true
+        }
+        return false
     }
-
     /** 表情面板刷新事件；拿不到就跳过（下次打开表情面板仍会读库）。 */
     private fun notifyPanel() {
         runCatching {
@@ -203,11 +278,10 @@ internal class EmojiCollectionWriter(
         return null
     }
 
-    private fun existingCatalog(infoClass: Class<*>, md5: String): Int? {
-        val existing = queryEmojiByMd5(infoClass, md5) ?: return null
-        val field = KavaReflector.declaredFields(existing.javaClass)
+    private fun catalogOf(emojiInfo: Any): Int? {
+        val field = KavaReflector.declaredFields(emojiInfo.javaClass)
             .firstOrNull { it.name == "field_catalog" } ?: return null
-        return (KavaReflector.readField(field, existing) as? Number)?.toInt()
+        return (KavaReflector.readField(field, emojiInfo) as? Number)?.toInt()
     }
 
     private fun createEmojiInfo(
@@ -259,8 +333,12 @@ internal class EmojiCollectionWriter(
         val infoClass: Class<*>,
         val storageClass: Class<*>,
         val storage: Any,
-        val insert: Method,
-        val save: Method?,
+        /** `createEmojiInfo(emoji, temp)`：新增，自带 `create_emoji_info_notify`。 */
+        val create: Method?,
+        /** `updateEmojiInfo(emoji)`：更新已有行，带 `event_update_emoji` 通知。 */
+        val update: Method?,
+        /** 纯 `insert(emoji)`：create 不可用时的兜底。 */
+        val insert: Method?,
         val maxIndex: Method?
     )
 
@@ -284,26 +362,47 @@ internal class EmojiCollectionWriter(
         }
     }
 
+    /**
+     * 定位表情库写入接口。
+     *
+     * 三个方法签名几乎一样（都是 `(EmojiInfo) → boolean` 或 `(EmojiInfo, boolean) → EmojiInfo`），
+     * 只按签名筛会选错 —— 8.0.80 上带 `insert assertion!, invalid emojiInfo` 的方法有三份
+     * （update / updateNoNotify / insert）。所以统一按**方法体内语义字符串**锚定：
+     *
+     * - create：`create_emoji_info_notify`
+     * - update：`event_update_emoji`
+     * - insert：`insert: %s, %s`
+     */
     private fun locateTargets(): Targets? {
         val prefs = DexMethodCache.prefs(hostContext, CACHE_PREFS)
         val cacheKey = DexMethodCache.runtimeKey(hostContext, context.hostClassLoader())
         val loader = context.hostClassLoader()
 
+        // 先定「存储类」：`insert: %s, %s` 只在 EmojiInfoStorage 里出现。
+        // 同一批语义串在别的类里也有（8.0.76 的 ui/g0、l32/v 同样含 create_emoji_info_notify），
+        // 所以后面每个候选都必须和这个类一致，否则会挂到别的类的同名方法上。
         val insert = DexMethodCache.load(prefs, cacheKey, loader, CACHE_INSERT)
-            ?.takeIf(::isInsertCandidate)
+            ?.takeIf { isInsertCandidate(it, null) }
             ?: dexFind(INSERT_ANCHOR)
-                .firstOrNull(::isInsertCandidate)
+                .firstOrNull { isInsertCandidate(it, null) }
                 ?.also { DexMethodCache.save(prefs, cacheKey, CACHE_INSERT, it) }
+
+        val create = DexMethodCache.load(prefs, cacheKey, loader, CACHE_CREATE)
+            ?.takeIf { isCreateCandidate(it, insert?.declaringClass) }
+            ?: dexFind(CREATE_ANCHOR)
+                .firstOrNull { isCreateCandidate(it, insert?.declaringClass) }
+                ?.also { DexMethodCache.save(prefs, cacheKey, CACHE_CREATE, it) }
+
+        val storageClass = insert?.declaringClass ?: create?.declaringClass ?: return null
+        val infoClass = insert?.parameterTypes?.firstOrNull()
+            ?: create?.parameterTypes?.firstOrNull()
             ?: return null
 
-        val storageClass = insert.declaringClass
-        val infoClass = insert.parameterTypes.first()
-
-        val save = DexMethodCache.load(prefs, cacheKey, loader, CACHE_SAVE)
-            ?.takeIf { isSaveCandidate(it, storageClass, infoClass) }
-            ?: dexFind(SAVE_ANCHOR)
-                .firstOrNull { isSaveCandidate(it, storageClass, infoClass) }
-                ?.also { DexMethodCache.save(prefs, cacheKey, CACHE_SAVE, it) }
+        val update = DexMethodCache.load(prefs, cacheKey, loader, CACHE_UPDATE)
+            ?.takeIf { isUpdateCandidate(it, storageClass, infoClass) }
+            ?: dexFind(UPDATE_ANCHOR)
+                .firstOrNull { isUpdateCandidate(it, storageClass, infoClass) }
+                ?.also { DexMethodCache.save(prefs, cacheKey, CACHE_UPDATE, it) }
 
         val maxIndex = DexMethodCache.load(prefs, cacheKey, loader, CACHE_MAX_INDEX)
             ?.takeIf { isMaxIndexCandidate(it, storageClass) }
@@ -312,9 +411,8 @@ internal class EmojiCollectionWriter(
                 ?.also { DexMethodCache.save(prefs, cacheKey, CACHE_MAX_INDEX, it) }
 
         val storage = storageInstance(storageClass, loader) ?: return null
-        return Targets(infoClass, storageClass, storage, insert, save, maxIndex)
+        return Targets(infoClass, storageClass, storage, create, update, insert, maxIndex)
     }
-
     private fun dexFind(anchor: String): List<Method> = runCatching {
         context.dexKitBridge().findMethod(
             FindMethod().apply {
@@ -348,30 +446,44 @@ internal class EmojiCollectionWriter(
         emptyList()
     }
 
-    private fun isInsertCandidate(method: Method): Boolean {
+    private fun isCreateCandidate(method: Method, storageClass: Class<*>?): Boolean {
         val types = method.parameterTypes
         return !Modifier.isStatic(method.modifiers) &&
-            (method.returnType == Boolean::class.javaPrimitiveType) &&
-            types.size == 1 &&
-            isEmojiInfoClass(types[0])
+            (storageClass == null || method.declaringClass.name == storageClass.name) &&
+            types.size == 2 &&
+            isEmojiInfoClass(types[0]) &&
+            types[1] == Boolean::class.javaPrimitiveType &&
+            isEmojiInfoClass(method.returnType)
     }
 
-    private fun isSaveCandidate(method: Method, storageClass: Class<*>, infoClass: Class<*>): Boolean {
+    private fun isInsertCandidate(method: Method, storageClass: Class<*>?): Boolean {
         val types = method.parameterTypes
         return !Modifier.isStatic(method.modifiers) &&
-            method.declaringClass == storageClass &&
-            types.size == 2 &&
-            types[0] == infoClass &&
-            types[1] == Boolean::class.javaPrimitiveType
+            method.returnType == Boolean::class.javaPrimitiveType &&
+            types.size == 1 &&
+            isEmojiInfoClass(types[0]) &&
+            (storageClass == null || method.declaringClass.name == storageClass.name)
+    }
+
+    private fun isUpdateCandidate(
+        method: Method,
+        storageClass: Class<*>,
+        infoClass: Class<*>
+    ): Boolean {
+        val types = method.parameterTypes
+        return !Modifier.isStatic(method.modifiers) &&
+            method.declaringClass.name == storageClass.name &&
+            method.returnType == Boolean::class.javaPrimitiveType &&
+            types.size == 1 &&
+            types[0] == infoClass
     }
 
     private fun isMaxIndexCandidate(method: Method, storageClass: Class<*>): Boolean {
         return !Modifier.isStatic(method.modifiers) &&
-            method.declaringClass == storageClass &&
+            method.declaringClass.name == storageClass.name &&
             method.parameterTypes.isEmpty() &&
             method.returnType == Integer.TYPE
     }
-
     private fun isEmojiInfoClass(clazz: Class<*>): Boolean =
         clazz.name.endsWith("storage.emotion.EmojiInfo")
 
@@ -436,9 +548,6 @@ internal class EmojiCollectionWriter(
             it == "GIF87a" || it == "GIF89a"
         }
 
-    private fun imageWidth(data: ByteArray): Int = bounds(data)?.first ?: DEFAULT_SIDE
-
-    private fun imageHeight(data: ByteArray): Int = bounds(data)?.second ?: DEFAULT_SIDE
 
     private fun bounds(data: ByteArray): Pair<Int, Int>? = runCatching {
         val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
@@ -478,17 +587,30 @@ internal class EmojiCollectionWriter(
         const val EVENT_PANEL = "com.tencent.mm.autogen.events.EmojiUpdatePanelEvent"
 
         const val CACHE_PREFS = "Hchat_emoji_collection_method_cache"
-        const val CACHE_INSERT = "emoji_insert_v1"
-        const val CACHE_SAVE = "emoji_save_v1"
-        const val CACHE_MAX_INDEX = "emoji_max_index_v1"
+        const val CACHE_CREATE = "emoji_create_v2"
+        const val CACHE_UPDATE = "emoji_update_v2"
+        const val CACHE_INSERT = "emoji_insert_v2"
+        const val CACHE_MAX_INDEX = "emoji_max_index_v2"
 
-        /** EmojiInfoStorage.insert 里的断言串，全 dex 唯一。 */
-        const val INSERT_ANCHOR = "insert assertion!, invalid emojiInfo"
+        /**
+         * 新增表情（insert + 观察者通知），全 dex 唯一。
+         *
+         * 不能用 `insert assertion!, invalid emojiInfo` 去锚 insert —— 8.0.80 上有三份方法
+         * 带这个断言（update / updateNoNotify / insert），只按签名筛会选错。
+         */
+        const val CREATE_ANCHOR = "create_emoji_info_notify"
 
-        /** EmojiInfoStorage.saveEmojiInfo 里的通知串，全 dex 唯一。 */
-        const val SAVE_ANCHOR = "create_emoji_info_notify"
+        /** 更新已有表情行，带 event_update_emoji 通知，全 dex 唯一。 */
+        const val UPDATE_ANCHOR = "event_update_emoji"
 
-        /** EmojiInfoStorage.getCustomEmojiMaxIndex 的日志串，全 dex 唯一。 */
+        /** 纯 insert 的日志串，用来和 update 系列区分。 */
+        const val INSERT_ANCHOR = "insert: %s, %s"
+
+        /** getCustomEmojiMaxIndex 的日志串，全 dex 唯一。 */
         const val MAX_INDEX_ANCHOR = "getCustomEmojiMaxIndex :%s"
+
+        /** 超过这个边长或体积就等比缩小重编码，避免被微信判为超限表情。 */
+        const val MAX_SIDE = 512
+        const val MAX_BYTES = 900 * 1024
     }
 }

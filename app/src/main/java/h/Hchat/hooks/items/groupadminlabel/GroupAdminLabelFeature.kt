@@ -170,13 +170,16 @@ private class GroupAdminLabelRuntime(
 
     private fun renderBadges(tv: TextView, roomId: String, sender: String) {
         val badges = buildBadges(roomId, sender)
-        val row = ChatNameDecorationLayout.ensure(tv)
         if (badges.isEmpty()) {
+            // 没有标签时只在已经建过装饰行的情况下清理，不去主动 ensure：
+            // 否则会给普通昵称 View 平白改掉单行/省略号等原生排版属性。
+            val row = ChatNameDecorationLayout.current(tv) ?: return
             if (ChatNameDecorationLayout.prefixBadgeTexts(row).isNotEmpty()) {
                 ChatNameDecorationLayout.hidePrefixBadges(row)
             }
             return
         }
+        val row = ChatNameDecorationLayout.ensure(tv)
         // 必须每次重设：列表复用时微信会先 setText 把前缀冲掉，但 state 里的标签还在，
         // 只比较标签文本会误判成「没变化」而跳过一次合成，前缀就丢了。
         ChatNameDecorationLayout.showPrefixBadges(row, badges)
