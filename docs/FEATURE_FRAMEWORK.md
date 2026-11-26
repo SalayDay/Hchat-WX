@@ -479,12 +479,12 @@ String avatar = getAvatarUrl("wxid_xxx", true);
 消息入场动效：
 
 - `消息入场动效`（featureId `chat_message_enter_animation`）属于实用功能，设置页放在 `美化` 分组，默认关闭。开启后聊天列表新建的消息 View 以「缩放 0.90 → 1 + 位移 8dp → 0 + alpha 0 → 1」、200ms、`OvershootInterpolator(1.15)` 入场。
-- 只在 `convertView == null`（微信新建 item View）时做动画；列表滚动复用 View 的路径完全不碰，因此不会拖慢滑动，也不改微信的 item 复用逻辑。定位按签名找聊天列表适配器的 `getView(int, View, ViewGroup) → View`：先限定 `ui.chatting.adapter` 包（8.0.80 是 `chatting/adapter/k`），找不到再放宽到 `ui.chatting`，结果写 `Hchat_chat_enter_animation_cache`；不写死混淆类名。
+- 聊天列表是 **RecyclerView 架构**（`ChattingDataAdapterV3`），`getView` 在全 dex 没有调用点，按 `getView` 定位一定失败。定位改为按方法体内字符串 `MicroMsg.ChattingDataAdapterV3` + `_onBindViewHolder[` + `msgInfo` 找 `onBindViewHolder(holder, position)`（与「消息文字颜色」「滑动引用」同一套已验证锚点），结果写 `Hchat_chat_enter_animation_cache`。动画只对**首次绑定**的 item View 执行，用弱表记录已处理过的 View，滚动回流不重复播放，也不改微信的 item 复用逻辑。
 
 悬浮底栏滑动隐藏：
 
 - `悬浮底栏滑动隐藏`（featureId `bottom_bar_auto_hide`）属于实用功能，设置页放在 `美化` 分组，默认关闭。开启后首页会话列表向下滚动时把悬浮底栏平滑下移收起，向上滚动立刻弹回（各 8px 阈值、180ms）。
-- 首页会话列表是 `com.tencent.mm.ui.conversation.recycler.ConversationRecyclerView`，因此 hook `androidx.recyclerview.widget.RecyclerView.onScrolled(int, int)` 即可，但**只处理类名含 `conversation` 的实例**，聊天页/朋友圈的 RecyclerView 不受影响。底栏通过 `CustomBottomBarFeature.FLOATING_BOTTOM_BAR_TAG` 在 decorView 上查找并缓存；用户没开悬浮底栏时整条链路空转。底栏是模块自己 addView 的 View，改它的 `translationY` 不会和微信抢属性。
+- 首页会话列表是 `com.tencent.mm.ui.conversation.recycler.ConversationRecyclerView`。**不能** hook `RecyclerView.onScrolled` —— 那是 `OnScrollListener` 接口的方法，类上不存在，反射必然失败并导致功能静默失效；`scrollBy`/`onScrollChanged` 在触摸滚动时也不可靠。改为 hook `RecyclerView.onTouchEvent(MotionEvent)`，用 `computeVerticalScrollOffset()` 的相邻差值判断方向，且**只处理类名含 `conversation` 的实例**，聊天页/朋友圈的 RecyclerView 不受影响。底栏通过 `CustomBottomBarFeature.FLOATING_BOTTOM_BAR_TAG` 在 decorView 上查找并缓存；用户没开悬浮底栏时整条链路空转。底栏是模块自己 addView 的 View，改它的 `translationY` 不会和微信抢属性。
 全局背景：
 
 - `全局背景`（featureId `global_background`）属于实用功能，设置页放在 `美化` 分组，默认关闭。开启后把用户选的图铺在 `LauncherUI` 的 decorView 上，并把 `android.R.id.content` 的直接子 View 背景清成透明 —— 首页/通讯录/发现/我 都在 LauncherUI 内，一张图贯穿四个 tab。
@@ -515,8 +515,8 @@ String avatar = getAvatarUrl("wxid_xxx", true);
 界面净化：
 
 - `界面净化`（featureId `chat_purify`）属于实用功能，`美化` 分组，两项独立开关，默认关闭。
-- 隐藏首页列表分割线：hook `RecyclerView.addItemDecoration(ItemDecoration)`，只在**类名含 conversation** 的列表上、且装饰类名含 `Divider`/`Separator`/`ItemOffset` 时跳过注册（`param.result = null`），其它 RecyclerView 与装饰不动。
-- 隐藏系统灰字：hook 聊天列表的 `getView(int, View, ViewGroup)`，用 `adapter.getItem(position)` 取消息，**只在该消息类型为 10000（微信系统提示）**时把整行 `GONE` 并把 `layoutParams.height` 压到 0。绝不按文字内容猜，避免误伤正常消息。
+- 隐藏首页列表分割线：`addItemDecoration` 在 8.0.80 被混淆成单字母（实测 `P`），按名字找不到，必须**按签名定位**（唯一参数是 `ItemDecoration`、返回 void）。命中后只在**类名含 conversation** 的列表上、且装饰类名含 `Divider`/`Separator`/`ItemOffset` 时用 `setResult(null)` 跳过这次注册（直接赋 `result` 不会置 `returnEarly`，原方法仍会执行），其它 RecyclerView 与装饰不动。
+- 隐藏系统灰字：同样基于 `onBindViewHolder(holder, position)`，从 holder 上按「带 `getType()` 且返回 int」的对象特征取消息（不按字段名猜），**只在该消息类型为 10000（微信系统提示）**时把整行 `GONE`；只改 `visibility`，不动 `layoutParams.height`（列表项会回收复用，压 0 会连累后续正常消息），并在绑到非系统消息时恢复 `VISIBLE` 做复用自愈。绝不按文字内容猜。
 
 长按菜单磨砂卡片：
 

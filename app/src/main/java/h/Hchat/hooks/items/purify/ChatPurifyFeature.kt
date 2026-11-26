@@ -91,18 +91,19 @@ private class ChatPurifyRuntime(
 
     private fun installDividerHook(): Boolean {
         val recyclerClass = KavaReflector.loadClass(
-            "androidx.recyclerview.widget.RecyclerView",
+            "androidx.recyclerview/widget/RecyclerView",
             context.hostClassLoader()
         ) ?: return false
         val decorationClass = KavaReflector.loadClass(
             "androidx.recyclerview.widget.RecyclerView\$ItemDecoration",
             context.hostClassLoader()
         ) ?: return false
-        val method = KavaReflector.findMethodRecursive(
-            recyclerClass,
-            "addItemDecoration",
-            decorationClass
-        ) ?: return false
+        // 8.0.80 里 addItemDecoration 被混淆成单字母（实测 `P`），按名字找不到。
+        // 但它签名是全类唯一的：唯一参数是 ItemDecoration、返回 void。按签名找才跨版本。
+        val method = findAddItemDecoration(recyclerClass, decorationClass) ?: run {
+            logger("界面净化：找不到 addItemDecoration", null)
+            return false
+        }
         return runCatching {
             HookRegistry.get().hook(method, object : XC_MethodHook() {
                 override fun beforeHookedMethod(param: MethodHookParam) {
@@ -117,12 +118,13 @@ private class ChatPurifyRuntime(
                         name.contains("Separator", ignoreCase = true) ||
                         name.contains("ItemOffset", ignoreCase = true)
                     ) {
-                        // 跳过这次 addItemDecoration：分割线装饰根本不注册。
-                        // 必须走 setResult(null)：直接赋 result 不会置 returnEarly，原方法照样执行。
+                        // 跳过这次注册。必须走 setResult(null)：直接赋 result 不会置
+                        // returnEarly，原方法照样执行。
                         param.setResult(null)
                     }
                 }
             })
+            logger("界面净化：分割线 Hook 已挂载 ${method.name}#${method.declaringClass.simpleName}", null)
             true
         }.getOrElse {
             logger("界面净化：分割线 Hook 安装失败", it)
@@ -130,10 +132,31 @@ private class ChatPurifyRuntime(
         }
     }
 
+    private fun findAddItemDecoration(
+        recyclerClass: Class<*>,
+        decorationClass: Class<*>
+    ): Method? {
+        var current: Class<*>? = recyclerClass
+        while (current != null && current != Any::class.java) {
+            KavaReflector.declaredMethods(current).firstOrNull { candidate ->
+                val types = candidate.parameterTypes
+                types.size == 1 &&
+                    types[0].name == decorationClass.name &&
+                    candidate.returnType == Void.TYPE &&
+                    !Modifier.isStatic(candidate.modifiers)
+            }?.let { return it }
+            current = current.superclass
+        }
+        return null
+    }
+
     // -------------------------------------------------------------- 系统灰字
 
     private fun installSystemTipHook(): Boolean {
-        val method = locateGetView() ?: return false
+        val method = locateBindMethod() ?: run {
+            logger("界面净化：未定位到聊天消息绑定方法", null)
+            return false
+        }
         return runCatching {
             HookRegistry.get().hook(method, object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
@@ -144,10 +167,11 @@ private class ChatPurifyRuntime(
                     ) {
                         return
                     }
-                    val view = param.result as? View ?: return
-                    val position = (param.args?.getOrNull(0) as? Number)?.toInt() ?: return
-                    val adapter = param.thisObject ?: return
-                    val message = KavaReflector.invokeMethod(adapter, "getItem", position) ?: return
+                    // 聊天列表是 RecyclerView 架构，没有 getView；绑定方法的参数是
+                    // (holder, position)。消息对象只能从 holder 上拿。
+                    val holder = param.args?.getOrNull(0) ?: return
+                    val view = holderItemView(holder) ?: return
+                    val message = holderMessage(holder, param) ?: return
                     if (messageType(message) == ChatPurifyFeature.MESSAGE_TYPE_SYSTEM) {
                         hideItem(view)
                     } else if (view.visibility == View.GONE) {
@@ -156,11 +180,43 @@ private class ChatPurifyRuntime(
                     }
                 }
             })
+            logger("界面净化：系统提示 Hook 已挂载 ${method.declaringClass.simpleName}#${method.name}", null)
             true
         }.getOrElse {
             logger("界面净化：系统提示 Hook 安装失败", it)
             false
         }
+    }
+
+    private fun holderItemView(holder: Any): View? {
+        (KavaReflector.readField(holder, "itemView") as? View)?.let { return it }
+        var current: Class<*>? = holder.javaClass
+        while (current != null && current != Any::class.java) {
+            KavaReflector.declaredFields(current).firstOrNull { it.type == View::class.java }
+                ?.let { return KavaReflector.readField(it, holder) as? View }
+            current = current.superclass
+        }
+        return null
+    }
+
+    /**
+     * 从 holder 上读它当前绑定的消息对象。
+     *
+     * holder 通常持有消息字段；字段名逐版本变化，所以按「带 getType 且返回 int」的
+     * 对象特征找，而不是按名字找。找不到就退回用 position 问 adapter 要。
+     */
+    private fun holderMessage(holder: Any, param: XC_MethodHook.MethodHookParam): Any? {
+        var current: Class<*>? = holder.javaClass
+        while (current != null && current != Any::class.java) {
+            for (field in KavaReflector.declaredFields(current)) {
+                if (field.type.isPrimitive || field.type == String::class.java) continue
+                val value = KavaReflector.readField(field, holder) ?: continue
+                if (messageType(value) != null) return value
+            }
+            current = current.superclass
+        }
+        val position = (param.args?.getOrNull(1) as? Number)?.toInt() ?: return null
+        return KavaReflector.invokeMethod(param.thisObject, "getItem", position)
     }
 
     private fun hideItem(view: View) {
@@ -176,13 +232,15 @@ private class ChatPurifyRuntime(
         return null
     }
 
-    private fun locateGetView(): Method? {
+    private fun locateBindMethod(): Method? {
         val cacheKey = DexMethodCache.runtimeKey(context.hostContext(), context.hostClassLoader())
         DexMethodCache.load(cachePrefs, cacheKey, context.hostClassLoader(), CACHE_KEY)
-            ?.takeIf(::isGetViewCandidate)
+            ?.takeIf(::isBindCandidate)
             ?.let { return it }
-        val method = findGetView("com.tencent.mm.ui.chatting.adapter.")
-            ?: findGetView("com.tencent.mm.ui.chatting.")
+        val method = findByStrings("MicroMsg.ChattingDataAdapterV3", "_onBindViewHolder[", "msgInfo")
+            .firstOrNull(::isBindCandidate)
+            ?: findByStrings("MicroMsg.ChattingDataAdapterV3", "holder", "itemView")
+                .firstOrNull(::isBindCandidate)
         if (method == null) {
             DexMethodCache.clear(cachePrefs, cacheKey, CACHE_KEY)
         } else {
@@ -191,27 +249,24 @@ private class ChatPurifyRuntime(
         return method
     }
 
-    private fun findGetView(packageAnchor: String): Method? = runCatching {
+    private fun findByStrings(vararg strings: String): List<Method> = runCatching {
         context.dexKitBridge().findMethod(
             FindMethod().apply {
                 matcher(
                     MethodMatcher().apply {
-                        declaredClass(packageAnchor, StringMatchType.Contains, false)
-                        name("getView")
-                        paramCount(3)
-                        returnType("android.view.View")
+                        usingStrings(strings.toList())
                     }
                 )
             }
         ).mapNotNull { data ->
             runCatching { data.getMethodInstance(context.hostClassLoader()) }.getOrNull()
-        }.firstOrNull(::isGetViewCandidate)
+        }
     }.getOrElse {
-        logger("DexKit 定位聊天 getView 失败: $packageAnchor", it)
-        null
+        logger("DexKit 定位聊天绑定方法失败", it)
+        emptyList()
     }
 
-    private fun isGetViewCandidate(method: Method): Boolean {
+    private fun isBindCandidate(method: Method): Boolean {
         if (Modifier.isStatic(method.modifiers) ||
             Modifier.isAbstract(method.modifiers) ||
             method.declaringClass.isInterface
@@ -219,17 +274,15 @@ private class ChatPurifyRuntime(
             return false
         }
         val types = method.parameterTypes
-        return method.returnType == View::class.java &&
-            types.size == 3 &&
-            types[0] == Integer.TYPE &&
-            types[1] == View::class.java &&
-            types[2] == ViewGroup::class.java
+        return types.size == 2 &&
+            types[1] == Integer.TYPE &&
+            method.returnType == Void.TYPE
     }
 
     private fun enabled(key: String, default: Boolean): Boolean = prefs.getBoolean(key, default)
 
     private companion object {
-        const val CACHE_KEY = "chat_get_view_v1"
+        const val CACHE_KEY = "chat_bind_v2"
     }
 }
 

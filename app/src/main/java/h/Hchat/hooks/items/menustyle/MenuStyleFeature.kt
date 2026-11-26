@@ -114,6 +114,11 @@ private class MenuStyleRuntime(
             }
         }
         installed = hooked > 0
+        if (installed) {
+            logger("菜单美化：已挂载 PopupWindow 显示 ×$hooked", null)
+        } else {
+            logger("菜单美化 Hook 未安装", null)
+        }
         return installed
     }
 

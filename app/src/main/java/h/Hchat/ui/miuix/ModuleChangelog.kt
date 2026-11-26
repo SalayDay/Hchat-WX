@@ -42,6 +42,15 @@ internal object ModuleChangelog {
     /** 新的在上。版本号按发布顺序倒序排列。 */
     val entries: List<ModuleChangelogEntry> = listOf(
         ModuleChangelogEntry(
+            "6.7.7.24",
+            listOf(
+                "修复悬浮底栏滑动隐藏无效：onScrolled 是 OnScrollListener 接口方法、类上不存在，改为拦 onTouchEvent 并用滚动偏移差值判断方向",
+                "修复消息入场动效与隐藏系统灰字无效：聊天列表是 RecyclerView 架构，没有 getView 调用点，改用 ChattingDataAdapterV3 绑定方法",
+                "修复隐藏首页分割线无效：addItemDecoration 在 8.0.80 被混淆成单字母，改按参数类型定位",
+                "全局背景/字体/沉浸式/菜单美化补充安装成功日志，便于从日志直接确认状态"
+            )
+        ),
+        ModuleChangelogEntry(
             "6.7.7.23",
             listOf(
                 "娱乐 - 调试：开关下方新增实时日志面板，可直接查看与「复制日志」，不用再等下次启动"

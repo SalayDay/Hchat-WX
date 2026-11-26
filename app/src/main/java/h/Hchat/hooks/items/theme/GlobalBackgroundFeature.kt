@@ -121,6 +121,7 @@ private class GlobalBackgroundRuntime(
                 }
             })
             installed = true
+            logger("全局背景：已挂载 LauncherUI#onResume", null)
             true
         }.getOrElse {
             logger("全局背景 Hook 安装失败", it)
