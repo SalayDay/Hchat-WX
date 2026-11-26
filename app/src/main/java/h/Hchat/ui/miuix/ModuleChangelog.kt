@@ -42,6 +42,12 @@ internal object ModuleChangelog {
     /** 新的在上。版本号按发布顺序倒序排列。 */
     val entries: List<ModuleChangelogEntry> = listOf(
         ModuleChangelogEntry(
+            "6.7.7.23",
+            listOf(
+                "娱乐 - 调试：开关下方新增实时日志面板，可直接查看与「复制日志」，不用再等下次启动"
+            )
+        ),
+        ModuleChangelogEntry(
             "6.7.7.22",
             listOf(
                 "新增「底栏动效与红点」：Tab 果冻缩放、红点呼吸光晕、红点四档配色（美化，默认关闭）",

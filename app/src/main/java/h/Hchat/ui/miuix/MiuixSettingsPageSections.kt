@@ -496,6 +496,7 @@ import h.Hchat.hooks.items.voicepreview.VoicePreviewFeature
 import h.Hchat.hooks.items.voicepreview.VoicePreviewSettings
 import h.Hchat.media.AudioTransformBridge
 import h.Hchat.preferences.HchatStorage
+import h.Hchat.utils.HLog
 import h.Hchat.preferences.TermsGate
 import h.Hchat.ui.FeatureSettingsProvider
 import h.Hchat.ui.UIRegistry
@@ -12876,8 +12877,61 @@ internal fun CrashReportMiuixPage(
             sp.getBoolean(CrashReportSettings.KEY_ENABLE, CrashReportSettings.DEFAULT_ENABLE)
         )
     }
+    // 运行日志捕获开关走 HLog 自己的偏好，默认关闭时不产生任何采集开销。
+    val logPrefs = remember { HchatStorage.preferences(context, HLog.PREFS_NAME) }
+    var captureEnabled by remember {
+        mutableStateOf(logPrefs.getBoolean(HLog.KEY_CAPTURE_ENABLED, HLog.isCaptureEnabled()))
+    }
+    var logLines by remember { mutableStateOf(listOf<String>()) }
+    var logTotal by remember { mutableStateOf(0) }
+    var lastRefresh by remember { mutableStateOf("--:--:--") }
     val listState = rememberLazyListState()
     val scrollBehavior = MiuixScrollBehavior()
+    val logScroll = rememberScrollState()
+
+    fun reloadLogs() {
+        runCatching { HLog.captureSnapshot() }.getOrDefault(emptyList()).let { lines ->
+            logLines = lines.takeLast(LOG_TAIL_LINES)
+            logTotal = lines.size
+            lastRefresh = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())
+        }
+    }
+
+    fun copyLogs() {
+        val text = runCatching { HLog.captureText() }.getOrDefault("")
+        if (text.isBlank()) {
+            Toast.makeText(context, "暂无日志，先在微信里操作一下再回来", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE)
+            as? android.content.ClipboardManager
+        if (clipboard == null) {
+            Toast.makeText(context, "剪贴板不可用", Toast.LENGTH_SHORT).show()
+            return
+        }
+        clipboard.setPrimaryClip(ClipData.newPlainText("Hchat 日志", text))
+        Toast.makeText(context, "已复制 " + text.length + " 字符", Toast.LENGTH_SHORT).show()
+    }
+
+    // 这个页面就是调试入口：进来先把运行日志捕获打开（开关会同步显示为开，
+    // 用户可随时关掉），之后每秒按 revision 增量刷新。
+    LaunchedEffect(Unit) {
+        if (!HLog.isCaptureEnabled()) {
+            logPrefs.edit().putBoolean(HLog.KEY_CAPTURE_ENABLED, true).apply()
+            HLog.setCaptureEnabled(true)
+        }
+        captureEnabled = HLog.isCaptureEnabled()
+        reloadLogs()
+        var lastRevision = HLog.captureRevision()
+        while (true) {
+            delay(1000L)
+            val revision = HLog.captureRevision()
+            if (revision != lastRevision) {
+                lastRevision = revision
+                reloadLogs()
+            }
+        }
+    }
 
     PageScaffold(
         title = provider.title(),
@@ -12914,9 +12968,94 @@ internal fun CrashReportMiuixPage(
                     }
                 }
             }
+            item { SmallTitle(text = "实时日志") }
+            item {
+                SettingsCard {
+                    SwitchRow(
+                        checked = captureEnabled,
+                        title = "捕获运行日志",
+                        summary = if (captureEnabled) {
+                            "正在记录模块运行日志，可直接在下方查看与复制"
+                        } else {
+                            "关闭时不采集任何日志；打开后立即开始记录"
+                        }
+                    ) { checked ->
+                        logPrefs.edit().putBoolean(HLog.KEY_CAPTURE_ENABLED, checked).apply()
+                        HLog.setCaptureEnabled(checked)
+                        captureEnabled = checked
+                        reloadLogs()
+                    }
+                    InsetDivider()
+                    ActionRow(
+                        "复制日志",
+                        "把当前捕获的日志全文放进剪贴板，不需要重启微信"
+                    ) { copyLogs() }
+                    InsetDivider()
+                    ActionRow(
+                        "刷新",
+                        "共 " + logTotal + " 条 · 最后更新 " + lastRefresh
+                    ) { reloadLogs() }
+                    InsetDivider()
+                    ActionRow(
+                        "清空日志",
+                        "删除已捕获的日志内容（不影响异常上报开关）"
+                    ) {
+                        runCatching { HLog.clearCapture() }
+                        reloadLogs()
+                        Toast.makeText(context, "已清空", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            }
+            item {
+                SettingsCard {
+                    if (logLines.isEmpty()) {
+                        Text(
+                            text = if (captureEnabled) {
+                                "还没有捕获到日志。在微信里操作一下，这里会每秒自动刷新。"
+                            } else {
+                                "运行日志捕获已关闭，打开上方开关即可开始记录。"
+                            },
+                            style = MiuixTheme.textStyles.footnote1,
+                            color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                            modifier = Modifier.padding(horizontal = 18.dp, vertical = 14.dp)
+                        )
+                    } else {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(max = 320.dp)
+                                .verticalScroll(logScroll)
+                                .padding(horizontal = 14.dp, vertical = 12.dp)
+                        ) {
+                            Text(
+                                text = logLines.joinToString("\n"),
+                                fontFamily = FontFamily.Monospace,
+                                fontSize = 10.sp,
+                                lineHeight = 14.sp,
+                                color = MiuixTheme.colorScheme.onSurfaceVariantSummary
+                            )
+                        }
+                    }
+                }
+            }
+            item { SmallTitle(text = "说明") }
+            item {
+                SettingsCard {
+                    Text(
+                        text = "两个开关互相独立：「捕获异常日志」管崩溃弹窗与落盘，「捕获运行日志」管这里" +
+                            "的实时日志。进入本页会自动打开运行日志捕获并每秒刷新，可随时关掉；" +
+                            "「复制日志」复制的就是完整日志全文，可直接粘贴给开发者。",
+                        style = MiuixTheme.textStyles.footnote1,
+                        color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                        modifier = Modifier.padding(horizontal = 18.dp, vertical = 12.dp)
+                    )
+                }
+            }
         }
     }
 }
+
+private const val LOG_TAIL_LINES = 400
 
 @Composable
 internal fun ProtobufPacketMiuixPage(
