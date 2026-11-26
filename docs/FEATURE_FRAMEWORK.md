@@ -483,6 +483,27 @@ String avatar = getAvatarUrl("wxid_xxx", true);
 
 - `悬浮底栏滑动隐藏`（featureId `bottom_bar_auto_hide`）属于实用功能，设置页放在 `美化` 分组，默认关闭。开启后首页会话列表向下滚动时把悬浮底栏平滑下移收起，向上滚动立刻弹回（各 8px 阈值、180ms）。
 - 首页会话列表是 `com.tencent.mm.ui.conversation.recycler.ConversationRecyclerView`，因此 hook `androidx.recyclerview.widget.RecyclerView.onScrolled(int, int)` 即可，但**只处理类名含 `conversation` 的实例**，聊天页/朋友圈的 RecyclerView 不受影响。底栏通过 `CustomBottomBarFeature.FLOATING_BOTTOM_BAR_TAG` 在 decorView 上查找并缓存；用户没开悬浮底栏时整条链路空转。底栏是模块自己 addView 的 View，改它的 `translationY` 不会和微信抢属性。
+全局背景：
+
+- `全局背景`（featureId `global_background`）属于实用功能，设置页放在 `美化` 分组，默认关闭。开启后把用户选的图铺在 `LauncherUI` 的 decorView 上，并把 `android.R.id.content` 的直接子 View 背景清成透明 —— 首页/通讯录/发现/我 都在 LauncherUI 内，一张图贯穿四个 tab。
+- **不做实时高斯模糊**：`RenderEffect` 模糊的是「某个 View 自己的内容」，套在顶栏/底栏上只会把栏里的文字糊掉，达不到 iOS 毛玻璃。这里改成「背景图离线模糊一次」：先按屏幕比例中心裁剪（避免拉伸），再三次方框模糊（横向 + 纵向各一遍，索引统一 `y*width+x`），最后按档位叠黑色蒙版。结果按「路径 + 档位 + 屏幕尺寸」缓存，切 tab、来回 resume 不重复解码。
+- 素材存**相对路径**（相对 `Hchat` 配置目录），这样主题包换机/换目录后依然能对上；解析走 `HchatAssetStore.resolve`。还原时把每个 View 的原背景写回，关闭开关后不留残留。
+
+全局字体：
+
+- `全局字体`（featureId `global_font`）属于实用功能，`美化` 分组，默认关闭。拦 `TextView.setTypeface` 两个重载，把传入 Typeface 换成「导入字体 + 字重」的组合；字重档位为 不调整 / 400 / 500 / 600 / 700。
+- 表情不能花：Android 10+ 用 `FontFamily` + `Typeface.CustomFallbackBuilder(...).setSystemFallback("sans-serif")` 把系统字体挂成回退链，缺字与 emoji 自动回落；低版本只能直接替换。等宽/装饰字体（MONOSPACE、SERIF）不替换，避免代码块类文本异常。
+
+主题包：
+
+- `主题包`（featureId `theme_pack`）属于实用功能，`美化` 分组。导出把**整个 `Hchat` 配置目录**（FastKV 的 .kva/.kvb/.kvc + `beautify_assets` 素材）打包成 `themes/HchatTheme_<时间>.zip`，附带 `manifest.json`；导入按相对路径写回，跳过 `..`、绝对路径与 `themes/` 自身，防越界。
+- 美化开关分散在十几个 feature prefs 里，逐个字段挑出来维护成本太高，整目录打包既不会漏也不需要每加一个开关就改导出逻辑。**导入后必须重启微信**：FastKV 实例已在进程内缓存，覆盖文件不会让已打开的实例读到新值。
+
+聊天沉浸式：
+
+- `聊天沉浸式`（featureId `chat_immersion`）属于实用功能，`美化` 分组，默认关闭。Hook `com.tencent.mm.ui.chatting.ChattingUI#onResume`，把聊天页标题栏（类名含 ActionBar/MMTitle，且位于屏幕顶部 1/5）与输入面板（类名含 ChatFooter，且底边在屏幕 2/3 以下）背景清成透明，**只透明化栏本身**，不动窗口与内容层底色 —— 清了会露出系统窗口色，反而盖掉微信自己的聊天壁纸。
+- 这一版**不动消息列表的 padding**：`clipToPadding=false` + 上下 padding 补偿需要按版本拿列表真实 id 与栏高度，盲改会把消息顶到栏上或留出空洞。当前只做「栏透明 + 窗口透明」，视觉上已是三者同底且不动物流；「消息从栏下穿过」留到能真机调参时再做。
+
 - `保存表情` 属于实用功能，设置页放在 `聊天` 分组，默认关闭。开启后只在 type 47 聊天表情的长按菜单中注入带 `icons_filled_download` 图标的 `保存[H]`，菜单项直接绑定本次长按的原生消息，点击后仍放行微信原菜单收尾，避免残留文字选择态。
 - `发送文本格式` 属于实用功能，设置页放在 `聊天` 分组，默认关闭。文本模板支持以中文名称点击插入 `原消息`、`换行`、`发送时间`、`发送耗时`、`发送总数`、`文字消息数`、`文字字数`、`表情消息数`、`转账消息数`、`红包消息数`、`文件消息数`，底层稳定占位符依次为 `${sendText}`、`${line}`、`${sendTime}`、`${sendDuration}`、`${totalMsg}`、`${textMsg}`、`${textWord}`、`${emojiMsg}`、`${transferMsg}`、`${redBagMsg}`、`${fileMsg}`。发送时间格式可单独配置；发送耗时从当前会话首次点击输入框开始计算，到点击发送按钮为止，发送成功后重置，微信拒绝发送且输入框仍保留文本时继续沿用本次计时；没有输入过程的后台发送显示为 `0秒`。模板必须且只能保留一个原消息变量，空模板回退为仅发送原文，导入的非法模板在运行时直接放行原文。用户点击微信原生发送按钮且模块处理器、脚本 `onClickSendBtn` 均未拦截时，模板前后内容会原位插入 ChatFooter 的 `Editable`，保留艾特等 span 并继续使用微信原生文字发送流程；模块和脚本插件通过公共文本接口调用 `sendText`、`sendTextWithAtList`、`sendAt`、`sendAtAll` 或 `sendRaw(type=1)` 时也会经过同一格式化器，因此自动回复等复用公共接口的文本发送同样生效。七个统计变量与输入框提示共用当前本地自然日的真实发送统计，包含手动、模块和脚本插件实际发送的消息。
 - `自动勾选原图` 属于实用功能，设置页放在 `聊天` 分组，默认关闭。开启后只处理聊天发图入口：在 `AlbumPreviewUI` 和 `ImagePreviewUI` 的 `onCreate(Bundle)` 之前，为 `query_source_type=3` 且存在 `GalleryUI_ToUser` 的 Intent 同时写入 `key_send_raw_image=true` 和 `send_raw_img=true`，由微信原生页面直接显示原图已选状态，不影响朋友圈或其它图库用途。`8.0.49`、`8.0.58`、`8.0.66`、`8.0.68`、`8.0.72`、`8.0.74`、`8.0.76` 均确认两个页面的类名和 `onCreate(Bundle)` 稳定；`AlbumPreviewUI` 初始化读取两个原图参数，`ImagePreviewUI` 初始化读取 `send_raw_img`，运行时不固定混淆类名或方法名。

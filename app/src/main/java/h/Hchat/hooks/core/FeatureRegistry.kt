@@ -99,6 +99,10 @@ import h.Hchat.hooks.items.articleads.RemoveArticleAdsFeature
 import h.Hchat.hooks.items.swipequote.SwipeQuoteFeature
 import h.Hchat.hooks.items.tablet.WeChatTabletFeature
 import h.Hchat.hooks.items.textspeech.TextSpeechFeature
+import h.Hchat.hooks.items.theme.ChatImmersionFeature
+import h.Hchat.hooks.items.theme.GlobalBackgroundFeature
+import h.Hchat.hooks.items.theme.GlobalFontFeature
+import h.Hchat.hooks.items.theme.ThemePackFeature
 import h.Hchat.hooks.items.textvoice.TextVoiceFeature
 import h.Hchat.hooks.items.typingreport.TypingReportBlockFeature
 import h.Hchat.hooks.items.voiceforward.VoiceForwardFeature
@@ -167,6 +171,10 @@ object FeatureRegistry {
             .register(MessageBubbleFeature())
             .register(ChatMessageEnterAnimationFeature())
             .register(BottomBarAutoHideFeature())
+            .register(GlobalBackgroundFeature())
+            .register(GlobalFontFeature())
+            .register(ThemePackFeature())
+            .register(ChatImmersionFeature())
             .register(MessageTextColorFeature())
             .register(HomeTextColorFeature())
             .register(HideChatAvatarFeature())

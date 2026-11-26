@@ -498,6 +498,13 @@ import h.Hchat.hooks.items.swipequote.SwipeQuoteSettings
 import h.Hchat.hooks.items.tablet.WeChatTabletFeature
 import h.Hchat.hooks.items.tablet.WeChatTabletSettings
 import h.Hchat.hooks.items.textspeech.TextSpeechFeature
+import h.Hchat.hooks.items.theme.ActivityResultBridge
+import h.Hchat.hooks.items.theme.ChatImmersionFeature
+import h.Hchat.hooks.items.theme.GlobalBackgroundFeature
+import h.Hchat.hooks.items.theme.GlobalFontFeature
+import h.Hchat.hooks.items.theme.HchatAssetStore
+import h.Hchat.hooks.items.theme.ThemePackFeature
+import h.Hchat.hooks.items.theme.ThemePackManager
 import h.Hchat.hooks.items.textspeech.TextSpeechEngineCatalog
 import h.Hchat.hooks.items.textspeech.TextSpeechSettings
 import h.Hchat.hooks.items.textspeech.TextSpeechVoiceCatalog
@@ -3271,7 +3278,11 @@ internal fun practicalFeatureGroups(
                 CustomBottomBarFeature.ID,
                 FloatingBottomBarSettings.FEATURE_ID,
                 ChatMessageEnterAnimationFeature.ID,
-                BottomBarAutoHideFeature.ID
+                BottomBarAutoHideFeature.ID,
+                GlobalBackgroundFeature.ID,
+                GlobalFontFeature.ID,
+                ThemePackFeature.ID,
+                ChatImmersionFeature.ID
             )
         ),
         FeatureGroupEntry(
@@ -4040,6 +4051,10 @@ internal fun featureSubSearchTerms(featureId: String): List<String> {
         )
         ChatMessageEnterAnimationFeature.ID -> listOf("消息动效", "入场动画", "气泡动画", "飞入", "缩放淡入")
         BottomBarAutoHideFeature.ID -> listOf("底栏滑动隐藏", "悬浮底栏收起", "滑动隐藏底栏", "底栏自动隐藏")
+        GlobalBackgroundFeature.ID -> listOf("全局背景", "背景图", "毛玻璃", "模糊背景", "壁纸")
+        GlobalFontFeature.ID -> listOf("全局字体", "字体", "ttf", "otf", "字重", "字体粗细")
+        ThemePackFeature.ID -> listOf("主题包", "导出主题", "导入主题", "一键美化", "皮肤")
+        ChatImmersionFeature.ID -> listOf("沉浸式", "聊天透明", "顶栏透明", "输入栏透明", "一体化")
         MessageBubbleFeature.ID -> listOf("消息气泡", "聊天气泡", "自定义气泡", "左侧气泡", "右侧气泡", "红包气泡", "转账气泡", "系统消息气泡", "浅色模式", "深色模式", "NinePatch", "九宫格")
         MessageTextColorFeature.ID -> listOf("消息文本颜色", "文字颜色", "聊天气泡文字", "取色器", "浅色模式", "深色模式")
         HomeTextColorFeature.ID -> listOf("首页文字颜色", "标题颜色", "副标题颜色", "渐变文字", "微信首页", "通讯录", "发现", "我")
@@ -4887,6 +4902,19 @@ internal fun FeatureSettingsPage(
         SkipGlobalMiniProgramSplashAdsFeature.ID -> SkipGlobalMiniProgramSplashAdsMiuixPage(context, provider, onBack)
         FakeLocationFeature.ID -> FakeLocationMiuixPage(context, provider, onBack)
         GameEmojiFeature.ID -> GameEmojiMiuixPage(context, provider, onBack)
+        ChatImmersionFeature.ID -> HchatExtraToggleMiuixPage(
+            context = context,
+            provider = provider,
+            key = ChatImmersionFeature.KEY_ENABLED,
+            defaultValue = ChatImmersionFeature.DEFAULT_ENABLED,
+            summary = "聊天页的标题栏与输入面板背景改成透明，让「全局背景」从聊天界面透出来。" +
+                "Android 品牌定制差异较大，如果某版微信的栏识别不到，这一项会安静地不生效。",
+            onBack = onBack,
+            useFeaturePrefs = true
+        )
+        GlobalBackgroundFeature.ID -> GlobalBackgroundMiuixPage(context, provider, onBack)
+        GlobalFontFeature.ID -> GlobalFontMiuixPage(context, provider, onBack)
+        ThemePackFeature.ID -> ThemePackMiuixPage(context, provider, onBack)
         BottomBarAutoHideFeature.ID -> HchatExtraToggleMiuixPage(
             context = context,
             provider = provider,
@@ -16362,5 +16390,365 @@ internal fun ZombieCheckMainPage(
                 }
             }
         )
+    }
+}
+
+private val BLUR_LEVEL_LABELS = arrayOf("关闭", "轻", "中", "强")
+private val DIM_LEVEL_LABELS = arrayOf("无", "轻", "中")
+private val FONT_WEIGHT_LABELS = arrayOf("不调整", "常规 400", "中等 500", "半粗 600", "粗 700")
+
+/**
+ * 全局背景：选图 + 模糊/暗化档位。
+ *
+ * 模糊是「离线模糊背景图」，不是实时高斯模糊 —— `RenderEffect` 模糊的是 View
+ * 自己的内容，套在顶栏上会把栏内文字糊掉，达不到毛玻璃效果。
+ */
+@Composable
+internal fun GlobalBackgroundMiuixPage(
+    context: Context,
+    provider: FeatureSettingsProvider,
+    onBack: () -> Unit
+) {
+    val sp = remember(context, provider.featureId()) {
+        ConfigStore(context).getFeaturePrefs(provider.featureId())
+    }
+    val listState = rememberLazyListState()
+    val scrollBehavior = MiuixScrollBehavior()
+    var imagePath by remember {
+        mutableStateOf(sp.getString(GlobalBackgroundFeature.KEY_IMAGE, "").orEmpty())
+    }
+    var blurLevel by remember {
+        mutableStateOf(sp.getInt(GlobalBackgroundFeature.KEY_BLUR, GlobalBackgroundFeature.DEFAULT_BLUR))
+    }
+    var dimLevel by remember {
+        mutableStateOf(sp.getInt(GlobalBackgroundFeature.KEY_DIM, GlobalBackgroundFeature.DEFAULT_DIM))
+    }
+    val main = remember { Handler(Looper.getMainLooper()) }
+
+    PageScaffold(
+        title = provider.title(),
+        largeTitle = provider.title(),
+        scrollBehavior = scrollBehavior,
+        bottomBar = { BottomActionBar("返回", onBack) }
+    ) { padding ->
+        LazyColumn(
+            modifier = Modifier.fillMaxSize().nestedScroll(scrollBehavior.nestedScrollConnection),
+            state = listState,
+            contentPadding = PaddingValues(
+                top = padding.calculateTopPadding() + 8.dp,
+                bottom = padding.calculateBottomPadding() + 84.dp
+            )
+        ) {
+            item { SmallTitle(text = "背景图") }
+            item {
+                SettingsCard {
+                    SwitchRow(
+                        sp,
+                        GlobalBackgroundFeature.KEY_ENABLED,
+                        "启用全局背景",
+                        "首页 / 通讯录 / 发现 / 我 共用这一张背景图",
+                        GlobalBackgroundFeature.DEFAULT_ENABLED
+                    )
+                    InsetDivider()
+                    ActionRow(
+                        "选择背景图",
+                        if (imagePath.isBlank()) "未选择" else "已选择，切换页面后生效"
+                    ) {
+                        val activity = WeChatApis.currentActivity()?.currentActivity()
+                        if (activity == null) {
+                            Toast.makeText(context, "当前没有可用界面", Toast.LENGTH_SHORT).show()
+                        } else {
+                            val launched = ActivityResultBridge.pickDocument(
+                                activity,
+                                arrayOf("image/*"),
+                                GlobalBackgroundFeature.PICK_REQUEST_CODE
+                            ) { uri ->
+                                if (uri == null) return@pickDocument
+                                Thread {
+                                    val saved = HchatAssetStore.importImage(context, uri)
+                                    main.post {
+                                        if (saved != null) {
+                                            sp.edit()
+                                                .putString(GlobalBackgroundFeature.KEY_IMAGE, saved)
+                                                .putBoolean(GlobalBackgroundFeature.KEY_ENABLED, true)
+                                                .apply()
+                                            imagePath = saved
+                                            Toast.makeText(context, "背景已设置", Toast.LENGTH_SHORT).show()
+                                        } else {
+                                            Toast.makeText(context, "导入失败", Toast.LENGTH_SHORT).show()
+                                        }
+                                    }
+                                }.start()
+                            }
+                            if (!launched) {
+                                Toast.makeText(context, "打不开文件选择器", Toast.LENGTH_SHORT).show()
+                            }
+                        }
+                    }
+                    InsetDivider()
+                    ActionRow("模糊强度", BLUR_LEVEL_LABELS[blurLevel.coerceIn(0, 3)]) {
+                        val next = (blurLevel + 1) % BLUR_LEVEL_LABELS.size
+                        sp.edit().putInt(GlobalBackgroundFeature.KEY_BLUR, next).apply()
+                        blurLevel = next
+                    }
+                    InsetDivider()
+                    ActionRow("暗化程度", DIM_LEVEL_LABELS[dimLevel.coerceIn(0, 2)]) {
+                        val next = (dimLevel + 1) % DIM_LEVEL_LABELS.size
+                        sp.edit().putInt(GlobalBackgroundFeature.KEY_DIM, next).apply()
+                        dimLevel = next
+                    }
+                    InsetDivider()
+                    ActionRow("清除背景图", "删除已导入的背景素材") {
+                        Thread {
+                            HchatAssetStore.delete(context, imagePath)
+                            main.post {
+                                sp.edit()
+                                    .remove(GlobalBackgroundFeature.KEY_IMAGE)
+                                    .putBoolean(GlobalBackgroundFeature.KEY_ENABLED, false)
+                                    .apply()
+                                imagePath = ""
+                                Toast.makeText(context, "已清除", Toast.LENGTH_SHORT).show()
+                            }
+                        }.start()
+                    }
+                }
+            }
+            item { SmallTitle(text = "说明") }
+            item {
+                SettingsCard {
+                    Text(
+                        text = "只会把背景铺在微信主界面窗口上，并让内容层透明；" +
+                            "如果某个页面自带不透明底色，那页会看不到背景，属于微信自身绘制。" +
+                            "模糊是把背景图离线处理一次，不是实时高斯模糊，所以滑动零开销。",
+                        style = MiuixTheme.textStyles.footnote1,
+                        color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                        modifier = Modifier.padding(horizontal = 18.dp, vertical = 12.dp)
+                    )
+                }
+            }
+        }
+    }
+}
+
+/** 全局字体：导入字体文件 + 字重档位。 */
+@Composable
+internal fun GlobalFontMiuixPage(
+    context: Context,
+    provider: FeatureSettingsProvider,
+    onBack: () -> Unit
+) {
+    val sp = remember(context, provider.featureId()) {
+        ConfigStore(context).getFeaturePrefs(provider.featureId())
+    }
+    val listState = rememberLazyListState()
+    val scrollBehavior = MiuixScrollBehavior()
+    var fontPath by remember {
+        mutableStateOf(sp.getString(GlobalFontFeature.KEY_FONT, "").orEmpty())
+    }
+    var weightIndex by remember {
+        mutableStateOf(sp.getInt(GlobalFontFeature.KEY_WEIGHT, GlobalFontFeature.DEFAULT_WEIGHT))
+    }
+    val main = remember { Handler(Looper.getMainLooper()) }
+
+    PageScaffold(
+        title = provider.title(),
+        largeTitle = provider.title(),
+        scrollBehavior = scrollBehavior,
+        bottomBar = { BottomActionBar("返回", onBack) }
+    ) { padding ->
+        LazyColumn(
+            modifier = Modifier.fillMaxSize().nestedScroll(scrollBehavior.nestedScrollConnection),
+            state = listState,
+            contentPadding = PaddingValues(
+                top = padding.calculateTopPadding() + 8.dp,
+                bottom = padding.calculateBottomPadding() + 84.dp
+            )
+        ) {
+            item { SmallTitle(text = "字体") }
+            item {
+                SettingsCard {
+                    SwitchRow(
+                        sp,
+                        GlobalFontFeature.KEY_ENABLED,
+                        "启用全局字体",
+                        "替换微信里所有 TextView 的字体（表情会自动回退系统字体）",
+                        GlobalFontFeature.DEFAULT_ENABLED
+                    )
+                    InsetDivider()
+                    ActionRow(
+                        "选择字体文件",
+                        if (fontPath.isBlank()) "未选择" else "已选择，重启微信后生效"
+                    ) {
+                        val activity = WeChatApis.currentActivity()?.currentActivity()
+                        if (activity == null) {
+                            Toast.makeText(context, "当前没有可用界面", Toast.LENGTH_SHORT).show()
+                        } else {
+                            val launched = ActivityResultBridge.pickDocument(
+                                activity,
+                                arrayOf("font/*", "application/octet-stream", "application/x-font-ttf"),
+                                GlobalFontFeature.PICK_REQUEST_CODE
+                            ) { uri ->
+                                if (uri == null) return@pickDocument
+                                Thread {
+                                    val saved = HchatAssetStore.importFont(context, uri)
+                                    main.post {
+                                        if (saved != null) {
+                                            sp.edit()
+                                                .putString(GlobalFontFeature.KEY_FONT, saved)
+                                                .putBoolean(GlobalFontFeature.KEY_ENABLED, true)
+                                                .apply()
+                                            fontPath = saved
+                                            Toast.makeText(context, "字体已导入，重启微信生效", Toast.LENGTH_LONG).show()
+                                        } else {
+                                            Toast.makeText(context, "导入失败", Toast.LENGTH_SHORT).show()
+                                        }
+                                    }
+                                }.start()
+                            }
+                            if (!launched) {
+                                Toast.makeText(context, "打不开文件选择器", Toast.LENGTH_SHORT).show()
+                            }
+                        }
+                    }
+                    InsetDivider()
+                    ActionRow(
+                        "字重",
+                        FONT_WEIGHT_LABELS[weightIndex.coerceIn(0, FONT_WEIGHT_LABELS.size - 1)]
+                    ) {
+                        val next = (weightIndex + 1) % FONT_WEIGHT_LABELS.size
+                        sp.edit().putInt(GlobalFontFeature.KEY_WEIGHT, next).apply()
+                        weightIndex = next
+                    }
+                    InsetDivider()
+                    ActionRow("清除字体", "删除已导入的字体文件") {
+                        Thread {
+                            HchatAssetStore.delete(context, fontPath)
+                            main.post {
+                                sp.edit()
+                                    .remove(GlobalFontFeature.KEY_FONT)
+                                    .putBoolean(GlobalFontFeature.KEY_ENABLED, false)
+                                    .apply()
+                                fontPath = ""
+                                Toast.makeText(context, "已清除", Toast.LENGTH_SHORT).show()
+                            }
+                        }.start()
+                    }
+                }
+            }
+            item { SmallTitle(text = "说明") }
+            item {
+                SettingsCard {
+                    Text(
+                        text = "字体替换全部 TextView；Android 10 以上会把系统字体挂成回退链，" +
+                            "缺字和 emoji 会自动回落，不会出现方块。字重是叠加在现有字体上的，" +
+                            "不导字体只调字重也可以。",
+                        style = MiuixTheme.textStyles.footnote1,
+                        color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                        modifier = Modifier.padding(horizontal = 18.dp, vertical = 12.dp)
+                    )
+                }
+            }
+        }
+    }
+}
+
+/** 主题包：导出 / 导入。 */
+@Composable
+internal fun ThemePackMiuixPage(
+    context: Context,
+    provider: FeatureSettingsProvider,
+    onBack: () -> Unit
+) {
+    val listState = rememberLazyListState()
+    val scrollBehavior = MiuixScrollBehavior()
+    val main = remember { Handler(Looper.getMainLooper()) }
+
+    PageScaffold(
+        title = provider.title(),
+        largeTitle = provider.title(),
+        scrollBehavior = scrollBehavior,
+        bottomBar = { BottomActionBar("返回", onBack) }
+    ) { padding ->
+        LazyColumn(
+            modifier = Modifier.fillMaxSize().nestedScroll(scrollBehavior.nestedScrollConnection),
+            state = listState,
+            contentPadding = PaddingValues(
+                top = padding.calculateTopPadding() + 8.dp,
+                bottom = padding.calculateBottomPadding() + 84.dp
+            )
+        ) {
+            item { SmallTitle(text = "主题包") }
+            item {
+                SettingsCard {
+                    ActionRow(
+                        "导出主题包",
+                        "把当前全部模块配置与美化素材打包成 zip"
+                    ) {
+                        Thread {
+                            val path = ThemePackManager.export(context)
+                            main.post {
+                                if (path != null) {
+                                    Toast.makeText(
+                                        context,
+                                        "已导出到\n" + path,
+                                        Toast.LENGTH_LONG
+                                    ).show()
+                                } else {
+                                    Toast.makeText(context, "导出失败", Toast.LENGTH_SHORT).show()
+                                }
+                            }
+                        }.start()
+                    }
+                    InsetDivider()
+                    ActionRow(
+                        "导入主题包",
+                        "选择 zip，导入后必须重启微信"
+                    ) {
+                        val activity = WeChatApis.currentActivity()?.currentActivity()
+                        if (activity == null) {
+                            Toast.makeText(context, "当前没有可用界面", Toast.LENGTH_SHORT).show()
+                        } else {
+                            val launched = ActivityResultBridge.pickDocument(
+                                activity,
+                                arrayOf("application/zip", "application/octet-stream"),
+                                ThemePackFeature.PICK_REQUEST_CODE
+                            ) { uri ->
+                                if (uri == null) return@pickDocument
+                                Thread {
+                                    val count = ThemePackManager.import(context, uri)
+                                    main.post {
+                                        if (count > 0) {
+                                            Toast.makeText(
+                                                context,
+                                                "已导入 " + count + " 个配置文件，请重启微信",
+                                                Toast.LENGTH_LONG
+                                            ).show()
+                                        } else {
+                                            Toast.makeText(context, "导入失败或包为空", Toast.LENGTH_SHORT).show()
+                                        }
+                                    }
+                                }.start()
+                            }
+                            if (!launched) {
+                                Toast.makeText(context, "打不开文件选择器", Toast.LENGTH_SHORT).show()
+                            }
+                        }
+                    }
+                }
+            }
+            item { SmallTitle(text = "说明") }
+            item {
+                SettingsCard {
+                    Text(
+                        text = "主题包包含全部模块配置（含美化项）与导入的背景图、字体。" +
+                            "导入会覆盖本机同名配置，必须重启微信才会生效；" +
+                            "素材存相对路径，换设备也能对上。",
+                        style = MiuixTheme.textStyles.footnote1,
+                        color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                        modifier = Modifier.padding(horizontal = 18.dp, vertical = 12.dp)
+                    )
+                }
+            }
+        }
     }
 }

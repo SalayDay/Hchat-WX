@@ -42,6 +42,15 @@ internal object ModuleChangelog {
     /** 新的在上。版本号按发布顺序倒序排列。 */
     val entries: List<ModuleChangelogEntry> = listOf(
         ModuleChangelogEntry(
+            "6.7.7.21",
+            listOf(
+                "新增「全局背景」：首页/通讯录/发现/我 统一背景图，支持离线模糊与暗化档位（美化，默认关闭）",
+                "新增「全局字体」：导入 ttf/otf 替换全局字体并调字重，Android 10+ 自动挂系统回退链保 emoji（美化，默认关闭）",
+                "新增「主题包」：把全部模块配置与素材导出成 zip，或用别人的包一键套用（导入后需重启微信）",
+                "新增「聊天沉浸式」：聊天标题栏与输入面板透明化，和全局背景融为一体（美化，默认关闭）"
+            )
+        ),
+        ModuleChangelogEntry(
             "6.7.7.20",
             listOf(
                 "新增「消息入场动效」：新消息气泡以缩放淡入+轻微回弹出现，只对新建的消息 View 生效，不影响滚动复用（美化，默认关闭）",
