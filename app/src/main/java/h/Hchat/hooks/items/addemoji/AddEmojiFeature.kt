@@ -7,6 +7,7 @@ import de.robv.android.xposed.XC_MethodHook
 import h.Hchat.event.Events
 import h.Hchat.hooks.api.core.WeChatApis
 import h.Hchat.hooks.api.message.SingleMessageMenuLocator
+import h.Hchat.hooks.api.model.WeChatMessageTypes
 import h.Hchat.hooks.api.sns.SnsContentTypes
 import h.Hchat.hooks.api.sns.SnsContextMenuDispatcher
 import h.Hchat.hooks.api.sns.SnsContextMenuTarget
@@ -25,9 +26,9 @@ import java.util.WeakHashMap
 import java.util.concurrent.ConcurrentHashMap
 
 /**
- * 图片「添加到表情」。
+ * 图片「保存为表情」。
  *
- * 长按聊天里的图片、或朋友圈的图片，菜单里多一项「添加到表情[H]」，点了就把这张图
+ * 长按聊天里的普通图片、或朋友圈的图片，菜单里多一项「保存为表情[H]」，点了就把这张图
  * 写进微信「自定义表情」库。落库方式见 [EmojiCollectionWriter]：完全照微信自己
  * `EmojiAddCustomDialogUI.save` 的序列走（catalog=0x51 + 排序位 + `EmojiInfoStorage` 落库）。
  *
@@ -40,7 +41,7 @@ class AddEmojiFeature : BaseFeature() {
 
     override fun featureId(): String = ID
 
-    override fun name(): String = "图片添加到表情"
+    override fun name(): String = "图片保存为表情"
 
     override fun onFeatureInit(context: FeatureContext) {
         registerSettingsProvider(AddEmojiSettingsProvider())
@@ -68,7 +69,7 @@ class AddEmojiFeature : BaseFeature() {
     companion object {
         const val ID = "add_emoji_from_image"
         internal const val MENU_ITEM_ID = 0x4841454d
-        internal const val MENU_TITLE = "添加到表情[H]"
+        internal const val MENU_TITLE = "保存为表情[H]"
     }
 }
 
@@ -127,8 +128,8 @@ private class AddEmojiRuntime(
                 }
             })
         }
-        if (createHooked <= 0) logger("图片添加到表情菜单创建 Hook 未安装", null)
-        if (clickHooked <= 0) logger("图片添加到表情菜单点击 Hook 未安装", null)
+        if (createHooked <= 0) logger("图片保存为表情菜单创建 Hook 未安装", null)
+        if (clickHooked <= 0) logger("图片保存为表情菜单点击 Hook 未安装", null)
         return createHooked > 0 && clickHooked > 0
     }
 
@@ -167,9 +168,17 @@ private class AddEmojiRuntime(
         return runCatching { images.resolvePathToken(token) }.getOrNull().orEmpty()
     }
 
+    /**
+     * 只对**普通图片消息**（type 3）放行。
+     *
+     * 本功能是「把图片存成表情」，所以：
+     * - 表情消息（type 47）不放行 —— 它本来就在表情库里，不需要再存一次；
+     * - 视频、文件、链接、小程序卡片都不放行。
+     * 类型判定走 `WeChatMessageTypes.isImage`，它会先归一化高位标志位。
+     */
     private fun isImageMessage(message: Any): Boolean {
         val type = readNumber(message, "getType", "field_type", "type")?.toInt() ?: return false
-        return (type and 0xffff) == MESSAGE_TYPE_IMAGE
+        return WeChatMessageTypes.isImage(type)
     }
 
     // ---------------------------------------------------------------- 朋友圈
@@ -190,7 +199,7 @@ private class AddEmojiRuntime(
         )
         snsRegistered = true
         val installed = SnsContextMenuDispatcher.install(context, snsResolver, logger)
-        if (!installed) logger("朋友圈图片添加到表情 Hook 未安装", null)
+        if (!installed) logger("朋友圈图片保存为表情 Hook 未安装", null)
         return installed
     }
 
@@ -220,7 +229,7 @@ private class AddEmojiRuntime(
             true
         }.getOrElse {
             hookedMethods.remove(method)
-            logger("图片添加到表情 Hook 安装失败: ${method.toGenericString()}", it)
+            logger("图片保存为表情 Hook 安装失败: ${method.toGenericString()}", it)
             false
         }
     }
@@ -352,7 +361,6 @@ private class AddEmojiRuntime(
 
     private companion object {
         const val OWNER_SNS = "add_emoji_from_image"
-        const val MESSAGE_TYPE_IMAGE = 3
         const val MESSAGE_PACKAGE = "com.tencent.mm.storage."
         const val MAX_RESOLVE_DEPTH = 5
         val ICON_NAMES = listOf("icons_filled_emoticon", "icons_filled_emoji", "icons_filled_sticker")

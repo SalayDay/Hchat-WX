@@ -76,7 +76,7 @@ internal class EmojiCollectionWriter(
             }
             if (showToast) {
                 val message = when (result) {
-                    is Result.Added -> "已添加到表情"
+                    is Result.Added -> "已存为表情"
                     is Result.AlreadyExists -> "该图片已在表情库"
                     is Result.Failed -> result.reason
                 }
@@ -276,7 +276,7 @@ internal class EmojiCollectionWriter(
             }
             if (resolved == null) {
                 locateFailed = true
-                logger("表情库接口定位失败，图片添加到表情不可用", null)
+                logger("表情库接口定位失败，图片保存为表情不可用", null)
                 return null
             }
             targets = resolved

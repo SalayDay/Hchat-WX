@@ -42,9 +42,15 @@ internal object ModuleChangelog {
     /** 新的在上。版本号按发布顺序倒序排列。 */
     val entries: List<ModuleChangelogEntry> = listOf(
         ModuleChangelogEntry(
+            "6.7.7.17",
+            listOf(
+                "「图片保存为表情」明确只处理普通图片：表情消息（type 47）不再放行，菜单文案改为「保存为表情」"
+            )
+        ),
+        ModuleChangelogEntry(
             "6.7.7.16",
             listOf(
-                "新增「图片添加到表情」：长按聊天图片或朋友圈图片，直接把图片加入微信自定义表情（实用 - 聊天，默认关闭）"
+                "新增「图片保存为表情」：长按聊天图片或朋友圈图片，把普通图片存成微信自定义表情（实用 - 聊天，默认关闭）"
             )
         ),
         ModuleChangelogEntry(

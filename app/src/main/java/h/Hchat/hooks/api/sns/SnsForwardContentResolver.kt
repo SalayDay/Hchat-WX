@@ -134,7 +134,7 @@ internal class SnsForwardContentResolver(
     /**
      * 取单张朋友圈图片的本地可读路径（本地有就直接用，没有就按需下载）。
      *
-     * 供「图片添加到表情」这类只需要一张图的调用方使用，比 [prepare] 轻：
+     * 供「图片保存为表情」这类只需要一张图的调用方使用，比 [prepare] 轻：
      * 不解析实况视频、不拼多张图。
      */
     fun imagePath(media: SnsForwardMedia): String? {
