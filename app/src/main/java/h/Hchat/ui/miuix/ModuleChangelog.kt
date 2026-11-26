@@ -42,6 +42,13 @@ internal object ModuleChangelog {
     /** 新的在上。版本号按发布顺序倒序排列。 */
     val entries: List<ModuleChangelogEntry> = listOf(
         ModuleChangelogEntry(
+            "6.7.7.20",
+            listOf(
+                "新增「消息入场动效」：新消息气泡以缩放淡入+轻微回弹出现，只对新建的消息 View 生效，不影响滚动复用（美化，默认关闭）",
+                "新增「悬浮底栏滑动隐藏」：首页列表下滑收起悬浮底栏、上滑弹回（美化，默认关闭）"
+            )
+        ),
+        ModuleChangelogEntry(
             "6.7.7.19",
             listOf(
                 "图片保存为表情：修复重复 md5 撞主键（已存在的表情改为复用并 update）、修复压缩后 md5 与文件内容不一致、超过 512px/900KB 的图片自动缩放重编码",

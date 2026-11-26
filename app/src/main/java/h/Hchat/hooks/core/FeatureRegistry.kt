@@ -13,6 +13,8 @@ import h.Hchat.hooks.items.autooriginal.AutoOriginalImageFeature
 import h.Hchat.hooks.items.autovieworiginal.AutoViewOriginalFeature
 import h.Hchat.hooks.items.callmedialimit.CallMediaLimitFeature
 import h.Hchat.hooks.items.callmedialimit.CallRingtoneBlockFeature
+import h.Hchat.hooks.items.bottombar.BottomBarAutoHideFeature
+import h.Hchat.hooks.items.chatanimation.ChatMessageEnterAnimationFeature
 import h.Hchat.hooks.items.chattime.ChatTimeStyleFeature
 import h.Hchat.hooks.items.conversationgroup.ConversationGroupFeature
 import h.Hchat.hooks.items.conversationtabs.ConversationTabsFeature
@@ -163,6 +165,8 @@ object FeatureRegistry {
             .register(LegacyChatInputFeature())
             .register(LinkParseFeature())
             .register(MessageBubbleFeature())
+            .register(ChatMessageEnterAnimationFeature())
+            .register(BottomBarAutoHideFeature())
             .register(MessageTextColorFeature())
             .register(HomeTextColorFeature())
             .register(HideChatAvatarFeature())

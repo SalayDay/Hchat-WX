@@ -474,6 +474,15 @@ String avatar = getAvatarUrl("wxid_xxx", true);
 - 渲染复用 `ChatNameDecorationLayout` 新增的 prefix 槽位：前缀标签渲染在「头衔」和昵称本体之前，和「实名尾字」的尾字（昵称之后）、「群昵称颜色」共用同一个装饰行，互不覆盖。每次昵称绑定都必须重设 prefix（不能只比较标签文本跳过）：列表复用时微信会先 `setText` 把前缀冲掉，而 state 里的标签还在，只比较文本会把这一次合成误判成「无变化」。
 - 昵称绑定点按字符串 `fillingUsername:need getKfInfo` 在 DexKit 定位并缓存（`Hchat_chat_username_bind_cache`）。该类名与方法名逐版本变化（8.0.76 是 `viewitems/a0;->o`，8.0.80 是 `viewitems/b0;->p`），日志串不变，所以不写死短名；holder 的昵称控件是 `userTV`（8.0.76 / 8.0.80 均确认存在）。
 - 与「成员头衔」功能去重：若「成员头衔」已启用且该角色配了非空头衔，本功能不再叠同名标签，避免出现「群主 群主 昵称」；部分真名标签不受此限制。
+消息入场动效：
+
+- `消息入场动效`（featureId `chat_message_enter_animation`）属于实用功能，设置页放在 `美化` 分组，默认关闭。开启后聊天列表新建的消息 View 以「缩放 0.90 → 1 + 位移 8dp → 0 + alpha 0 → 1」、200ms、`OvershootInterpolator(1.15)` 入场。
+- 只在 `convertView == null`（微信新建 item View）时做动画；列表滚动复用 View 的路径完全不碰，因此不会拖慢滑动，也不改微信的 item 复用逻辑。定位按签名找聊天列表适配器的 `getView(int, View, ViewGroup) → View`：先限定 `ui.chatting.adapter` 包（8.0.80 是 `chatting/adapter/k`），找不到再放宽到 `ui.chatting`，结果写 `Hchat_chat_enter_animation_cache`；不写死混淆类名。
+
+悬浮底栏滑动隐藏：
+
+- `悬浮底栏滑动隐藏`（featureId `bottom_bar_auto_hide`）属于实用功能，设置页放在 `美化` 分组，默认关闭。开启后首页会话列表向下滚动时把悬浮底栏平滑下移收起，向上滚动立刻弹回（各 8px 阈值、180ms）。
+- 首页会话列表是 `com.tencent.mm.ui.conversation.recycler.ConversationRecyclerView`，因此 hook `androidx.recyclerview.widget.RecyclerView.onScrolled(int, int)` 即可，但**只处理类名含 `conversation` 的实例**，聊天页/朋友圈的 RecyclerView 不受影响。底栏通过 `CustomBottomBarFeature.FLOATING_BOTTOM_BAR_TAG` 在 decorView 上查找并缓存；用户没开悬浮底栏时整条链路空转。底栏是模块自己 addView 的 View，改它的 `translationY` 不会和微信抢属性。
 - `保存表情` 属于实用功能，设置页放在 `聊天` 分组，默认关闭。开启后只在 type 47 聊天表情的长按菜单中注入带 `icons_filled_download` 图标的 `保存[H]`，菜单项直接绑定本次长按的原生消息，点击后仍放行微信原菜单收尾，避免残留文字选择态。
 - `发送文本格式` 属于实用功能，设置页放在 `聊天` 分组，默认关闭。文本模板支持以中文名称点击插入 `原消息`、`换行`、`发送时间`、`发送耗时`、`发送总数`、`文字消息数`、`文字字数`、`表情消息数`、`转账消息数`、`红包消息数`、`文件消息数`，底层稳定占位符依次为 `${sendText}`、`${line}`、`${sendTime}`、`${sendDuration}`、`${totalMsg}`、`${textMsg}`、`${textWord}`、`${emojiMsg}`、`${transferMsg}`、`${redBagMsg}`、`${fileMsg}`。发送时间格式可单独配置；发送耗时从当前会话首次点击输入框开始计算，到点击发送按钮为止，发送成功后重置，微信拒绝发送且输入框仍保留文本时继续沿用本次计时；没有输入过程的后台发送显示为 `0秒`。模板必须且只能保留一个原消息变量，空模板回退为仅发送原文，导入的非法模板在运行时直接放行原文。用户点击微信原生发送按钮且模块处理器、脚本 `onClickSendBtn` 均未拦截时，模板前后内容会原位插入 ChatFooter 的 `Editable`，保留艾特等 span 并继续使用微信原生文字发送流程；模块和脚本插件通过公共文本接口调用 `sendText`、`sendTextWithAtList`、`sendAt`、`sendAtAll` 或 `sendRaw(type=1)` 时也会经过同一格式化器，因此自动回复等复用公共接口的文本发送同样生效。七个统计变量与输入框提示共用当前本地自然日的真实发送统计，包含手动、模块和脚本插件实际发送的消息。
 - `自动勾选原图` 属于实用功能，设置页放在 `聊天` 分组，默认关闭。开启后只处理聊天发图入口：在 `AlbumPreviewUI` 和 `ImagePreviewUI` 的 `onCreate(Bundle)` 之前，为 `query_source_type=3` 且存在 `GalleryUI_ToUser` 的 Intent 同时写入 `key_send_raw_image=true` 和 `send_raw_img=true`，由微信原生页面直接显示原图已选状态，不影响朋友圈或其它图库用途。`8.0.49`、`8.0.58`、`8.0.66`、`8.0.68`、`8.0.72`、`8.0.74`、`8.0.76` 均确认两个页面的类名和 `onCreate(Bundle)` 稳定；`AlbumPreviewUI` 初始化读取两个原图参数，`ImagePreviewUI` 初始化读取 `send_raw_img`，运行时不固定混淆类名或方法名。

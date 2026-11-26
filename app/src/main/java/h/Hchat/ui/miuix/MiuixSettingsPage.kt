@@ -239,6 +239,10 @@ import h.Hchat.hooks.items.automessageforward.AutoMessageForwardSettings
 import h.Hchat.hooks.items.callmedialimit.CallMediaLimitFeature
 import h.Hchat.hooks.items.callmedialimit.CallMediaLimitSettings
 import h.Hchat.hooks.items.callmedialimit.CallRingtoneBlockFeature
+import h.Hchat.hooks.items.bottombar.BottomBarAutoHideFeature
+import h.Hchat.hooks.items.bottombar.BottomBarAutoHideSettings
+import h.Hchat.hooks.items.chatanimation.ChatMessageEnterAnimationFeature
+import h.Hchat.hooks.items.chatanimation.ChatMessageEnterAnimationSettings
 import h.Hchat.hooks.items.chattime.ChatTimeStyleFeature
 import h.Hchat.hooks.items.chattime.ChatTimeStyleSettings
 import h.Hchat.hooks.items.conversationgroup.ConversationGroup
@@ -3265,7 +3269,9 @@ internal fun practicalFeatureGroups(
                 RoundAvatarFeature.ID,
                 CustomFriendAvatarFeature.ID,
                 CustomBottomBarFeature.ID,
-                FloatingBottomBarSettings.FEATURE_ID
+                FloatingBottomBarSettings.FEATURE_ID,
+                ChatMessageEnterAnimationFeature.ID,
+                BottomBarAutoHideFeature.ID
             )
         ),
         FeatureGroupEntry(
@@ -4032,6 +4038,8 @@ internal fun featureSubSearchTerms(featureId: String): List<String> {
         MomentsVideoAutoPlayFeature.ID -> listOf(
             "禁止朋友圈视频自动播放", "朋友圈视频", "自动播放", "视频自动播放", "静音播放", "流量"
         )
+        ChatMessageEnterAnimationFeature.ID -> listOf("消息动效", "入场动画", "气泡动画", "飞入", "缩放淡入")
+        BottomBarAutoHideFeature.ID -> listOf("底栏滑动隐藏", "悬浮底栏收起", "滑动隐藏底栏", "底栏自动隐藏")
         MessageBubbleFeature.ID -> listOf("消息气泡", "聊天气泡", "自定义气泡", "左侧气泡", "右侧气泡", "红包气泡", "转账气泡", "系统消息气泡", "浅色模式", "深色模式", "NinePatch", "九宫格")
         MessageTextColorFeature.ID -> listOf("消息文本颜色", "文字颜色", "聊天气泡文字", "取色器", "浅色模式", "深色模式")
         HomeTextColorFeature.ID -> listOf("首页文字颜色", "标题颜色", "副标题颜色", "渐变文字", "微信首页", "通讯录", "发现", "我")
@@ -4879,6 +4887,26 @@ internal fun FeatureSettingsPage(
         SkipGlobalMiniProgramSplashAdsFeature.ID -> SkipGlobalMiniProgramSplashAdsMiuixPage(context, provider, onBack)
         FakeLocationFeature.ID -> FakeLocationMiuixPage(context, provider, onBack)
         GameEmojiFeature.ID -> GameEmojiMiuixPage(context, provider, onBack)
+        BottomBarAutoHideFeature.ID -> HchatExtraToggleMiuixPage(
+            context = context,
+            provider = provider,
+            key = BottomBarAutoHideSettings.KEY_ENABLED,
+            defaultValue = BottomBarAutoHideSettings.DEFAULT_ENABLED,
+            summary = "首页消息列表向下滑动时把悬浮底栏平滑收起，向上滑立刻弹回。" +
+                "只作用于模块自己的悬浮底栏，需要先开启悬浮底栏；微信原生底栏不受影响。",
+            onBack = onBack,
+            useFeaturePrefs = true
+        )
+        ChatMessageEnterAnimationFeature.ID -> HchatExtraToggleMiuixPage(
+            context = context,
+            provider = provider,
+            key = ChatMessageEnterAnimationSettings.KEY_ENABLED,
+            defaultValue = ChatMessageEnterAnimationSettings.DEFAULT_ENABLED,
+            summary = "新消息气泡以缩放+淡入的方式出现，带轻微回弹。只对聊天列表新建的消息生效，" +
+                "滚动复用的内容不做动画，所以不会拖慢列表。",
+            onBack = onBack,
+            useFeaturePrefs = true
+        )
         MessageBubbleFeature.ID -> MessageBubbleMiuixPage(context, provider, onBack)
         MessageTextColorFeature.ID -> MessageTextColorMiuixPage(context, provider, onBack)
         HomeTextColorFeature.ID -> HomeTextColorMiuixPage(context, provider, onBack)
