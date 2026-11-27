@@ -480,7 +480,7 @@ String avatar = getAvatarUrl("wxid_xxx", true);
 消息入场动效：
 
 - `消息入场动效`（featureId `chat_message_enter_animation`）属于实用功能，设置页放在 `美化` 分组，默认关闭。开启后聊天列表新建的消息 View 以「缩放 0.90 → 1 + 位移 8dp → 0 + alpha 0 → 1」、200ms、`OvershootInterpolator(1.15)` 入场。  安装结果统一走 HLog.boot 缓冲而不是普通日志：功能在启动期安装，用户通常过几秒才打开日志采集，普通日志此时会被丢弃，boot 缓冲会在采集开启后补写，否则永远看不到「挂上了没」。
-- 聊天列表是 **RecyclerView 架构**（`ChattingDataAdapterV3`），`getView` 在全 dex 没有调用点，按 `getView` 定位一定失败。定位改为按方法体内字符串 `MicroMsg.ChattingDataAdapterV3` + `_onBindViewHolder[` + `msgInfo` 找 `onBindViewHolder(holder, position)`（与「消息文字颜色」「滑动引用」同一套已验证锚点），结果写 `Hchat_chat_enter_animation_cache`。动画只对**首次绑定**的 item View 执行，用弱表记录已处理过的 View，滚动回流不重复播放，也不改微信的 item 复用逻辑。  绑定入口必须挂**父类**那个覆写 AndroidX 的 onBindViewHolder(ViewHolder, int)（覆写名不会被混淆）；适配器自己声明的是被混淆的 per-item 回调（实测 k#C0），挂上去不保证被调用。定位见 ChatAdapterBindLocator。
+- 聊天列表是 **RecyclerView 架构**（`ChattingDataAdapterV3`），`getView` 在全 dex 没有调用点，按 `getView` 定位一定失败。定位改为按方法体内字符串 `MicroMsg.ChattingDataAdapterV3` + `_onBindViewHolder[` + `msgInfo` 找 `onBindViewHolder(holder, position)`（与「消息文字颜色」「滑动引用」同一套已验证锚点），结果写 `Hchat_chat_enter_animation_cache`。动画只对**首次绑定**的 item View 执行，用弱表记录已处理过的 View，滚动回流不重复播放，也不改微信的 item 复用逻辑。绑定入口必须挂**父类**那个覆写 AndroidX 的 `onBindViewHolder(ViewHolder, int)`（覆写名不会被混淆）；适配器自己声明的是被混淆的 per-item 回调（实测 `k#C0`），挂上去不保证被调用。定位见 `ChatAdapterBindLocator`。
 
 悬浮底栏滑动隐藏：
 
@@ -516,7 +516,7 @@ String avatar = getAvatarUrl("wxid_xxx", true);
 界面净化：
 
 - `界面净化`（featureId `chat_purify`）属于实用功能，`美化` 分组，两项独立开关，默认关闭。
-- 隐藏首页列表分割线：`addItemDecoration` 与 `ItemDecoration` 在 8.0.80 **都被混淆**（实测方法名 `P`、参数类型 `RecyclerView$a`），按名字和类型都找不到。因此在 `RecyclerView` 上按形状批量挂载候选（返回 void、单个非基本类型参数），运行时再看参数类名是否含 `Divider`/`Separator`/`ItemOffset`，命中才用 `setResult(null)` 跳过注册（直接赋 `result` 不会置 `returnEarly`）。
+- 隐藏首页列表分割线：`addItemDecoration` 与 `ItemDecoration` 在 8.0.80 **都被混淆**（实测方法名 `P`、参数类型 `RecyclerView$a`），按名字和类型都找不到。因此在 `RecyclerView` 上按形状批量挂载候选（返回 void、单个非基本类型参数），运行时再看参数类名是否含 `Divider`/`Separator`/`ItemOffset`，命中才用 `setResult(null)` 跳过注册（直接赋 `result` 不会置 `returnEarly`，原方法仍会执行）。
 - 隐藏系统灰字：同样基于 `onBindViewHolder(holder, position)`，从 holder 上按「带 `getType()` 且返回 int」的对象特征取消息（不按字段名猜），**只在该消息类型为 10000（微信系统提示）**时把整行 `GONE`；只改 `visibility`，不动 `layoutParams.height`（列表项会回收复用，压 0 会连累后续正常消息），并在绑到非系统消息时恢复 `VISIBLE` 做复用自愈。绝不按文字内容猜。
 
 长按菜单磨砂卡片：
