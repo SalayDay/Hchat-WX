@@ -119,7 +119,7 @@ private class GlobalFontRuntime(
         }
         installed = hooked > 0
         if (installed) {
-            logger("全局字体：已挂载 TextView.setTypeface ×$hooked", null)
+            logger("全局字体：已挂载 TextView.setTypeface ×$hooked，开关 ${if (enabled()) "开" else "关"}", null)
         } else {
             logger("全局字体 Hook 未安装", null)
         }

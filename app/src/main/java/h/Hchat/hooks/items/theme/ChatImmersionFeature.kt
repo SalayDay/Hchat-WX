@@ -98,7 +98,7 @@ private class ChatImmersionRuntime(
                 }
             })
             installed = true
-            logger("聊天沉浸式：已挂载 ChattingUI#onResume", null)
+            logger("聊天沉浸式：已挂载 ChattingUI#onResume，开关 ${if (enabled()) "开" else "关"}", null)
             true
         }.getOrElse {
             logger("聊天沉浸式 Hook 安装失败", it)

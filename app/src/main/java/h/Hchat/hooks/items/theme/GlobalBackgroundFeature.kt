@@ -124,7 +124,7 @@ private class GlobalBackgroundRuntime(
                 }
             })
             installed = true
-            logger("全局背景：已挂载 LauncherUI#onResume", null)
+            logger("全局背景：已挂载 LauncherUI#onResume，开关 ${if (enabled()) "开" else "关"}", null)
             true
         }.getOrElse {
             logger("全局背景 Hook 安装失败", it)
@@ -139,6 +139,9 @@ private class GlobalBackgroundRuntime(
         originalWindowBackground.clear()
         originalChildBackgrounds.clear()
     }
+
+    private fun enabled(): Boolean =
+        prefs.getBoolean(GlobalBackgroundFeature.KEY_ENABLED, GlobalBackgroundFeature.DEFAULT_ENABLED)
 
     private fun applyTo(activity: Activity) {
         val decor = activity.window?.decorView ?: return

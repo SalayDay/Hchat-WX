@@ -130,7 +130,7 @@ private class BottomBarAutoHideRuntime(
                 }
             })
             installed = true
-            logger("悬浮底栏滑动隐藏：已挂载 onTouchEvent", null)
+            logger("悬浮底栏滑动隐藏：已挂载 onTouchEvent，开关 ${if (enabled()) "开" else "关"}", null)
             true
         }.getOrElse {
             logger("悬浮底栏滑动隐藏 Hook 安装失败", it)

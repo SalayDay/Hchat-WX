@@ -8,6 +8,7 @@ import h.Hchat.event.Events
 import h.Hchat.hooks.core.BaseFeature
 import h.Hchat.hooks.core.DexInstallScheduler
 import h.Hchat.hooks.core.FeatureContext
+import h.Hchat.hooks.api.message.ChatAdapterBindLocator
 import h.Hchat.hooks.core.HookRegistry
 import h.Hchat.utils.KavaReflector
 import org.luckypray.dexkit.query.FindMethod
@@ -15,6 +16,7 @@ import org.luckypray.dexkit.query.enums.StringMatchType
 import org.luckypray.dexkit.query.matchers.MethodMatcher
 import java.lang.reflect.Method
 import java.lang.reflect.Modifier
+import java.util.Collections
 
 /**
  * 界面净化：隐藏列表分割线、隐藏聊天里的系统灰字提示。
@@ -76,6 +78,8 @@ private class ChatPurifyRuntime(
     private val prefs = context.configStore().getFeaturePrefs(ChatPurifyFeature.ID)
     private val cachePrefs = DexMethodCache.prefs(context.hostContext(), "Hchat_chat_purify_cache")
     private var installed = false
+    /** 诊断结果各记一次，便于从日志定位卡点。 */
+    private val diagnostics = Collections.synchronizedSet(HashSet<String>())
 
     fun install(): Boolean {
         if (installed) return true
@@ -94,70 +98,68 @@ private class ChatPurifyRuntime(
 
     private fun installDividerHook(): Boolean {
         val recyclerClass = KavaReflector.loadClass(
-            "androidx.recyclerview/widget/RecyclerView",
+            "androidx.recyclerview.widget.RecyclerView",
             context.hostClassLoader()
         ) ?: return false
-        val decorationClass = KavaReflector.loadClass(
-            "androidx.recyclerview.widget.RecyclerView\$ItemDecoration",
-            context.hostClassLoader()
-        ) ?: return false
-        // 8.0.80 里 addItemDecoration 被混淆成单字母（实测 `P`），按名字找不到。
-        // 但它签名是全类唯一的：唯一参数是 ItemDecoration、返回 void。按签名找才跨版本。
-        val method = findAddItemDecoration(recyclerClass, decorationClass) ?: run {
-            logger("界面净化：找不到 addItemDecoration", null)
+        // 8.0.80 里 addItemDecoration 与 ItemDecoration 都被混淆（实测方法名 `P`、
+        // 参数类型 `RecyclerView$a`），按名字和类型都找不到。
+        // 但它一定满足「声明在 RecyclerView、返回 void、只有一个非基本类型参数」，
+        // 因此按这个形状把候选全挂上，运行时再看参数类名是不是分割线。
+        val candidates = KavaReflector.declaredMethods(recyclerClass).filter { candidate ->
+            candidate.returnType == Void.TYPE &&
+                !Modifier.isStatic(candidate.modifiers) &&
+                candidate.parameterTypes.size == 1 &&
+                !candidate.parameterTypes[0].isPrimitive
+        }
+        if (candidates.isEmpty()) {
+            logger("界面净化：找不到疑似 addItemDecoration 的方法", null)
             return false
         }
-        return runCatching {
-            HookRegistry.get().hook(method, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    if (!enabled(ChatPurifyFeature.KEY_HIDE_DIVIDER, ChatPurifyFeature.DEFAULT_HIDE_DIVIDER)) {
-                        return
+        var hooked = 0
+        for (method in candidates) {
+            runCatching {
+                HookRegistry.get().hook(method, object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        if (!enabled(
+                                ChatPurifyFeature.KEY_HIDE_DIVIDER,
+                                ChatPurifyFeature.DEFAULT_HIDE_DIVIDER
+                            )
+                        ) {
+                            return
+                        }
+                        val recycler = param.thisObject as? View ?: return
+                        if (!recycler.javaClass.name.contains("conversation", ignoreCase = true)) {
+                            return
+                        }
+                        val decoration = param.args?.getOrNull(0) ?: return
+                        val name = decoration.javaClass.name
+                        if (name.contains("Divider", ignoreCase = true) ||
+                            name.contains("Separator", ignoreCase = true) ||
+                            name.contains("ItemOffset", ignoreCase = true)
+                        ) {
+                            // 跳过这次注册。必须走 setResult：直接赋 result 不会置
+                            // returnEarly，原方法照样执行。
+                            param.setResult(null)
+                            diag("divider", "界面净化：已拦下分割线装饰 $name")
+                        }
                     }
-                    val recycler = param.thisObject as? View ?: return
-                    if (!recycler.javaClass.name.contains("conversation", ignoreCase = true)) return
-                    val decoration = param.args?.getOrNull(0) ?: return
-                    val name = decoration.javaClass.name
-                    if (name.contains("Divider", ignoreCase = true) ||
-                        name.contains("Separator", ignoreCase = true) ||
-                        name.contains("ItemOffset", ignoreCase = true)
-                    ) {
-                        // 跳过这次注册。必须走 setResult(null)：直接赋 result 不会置
-                        // returnEarly，原方法照样执行。
-                        param.setResult(null)
-                    }
-                }
-            })
-            logger("界面净化：分割线 Hook 已挂载 ${method.name}#${method.declaringClass.simpleName}", null)
-            true
-        }.getOrElse {
-            logger("界面净化：分割线 Hook 安装失败", it)
-            false
+                })
+                hooked++
+            }.onFailure { logger("界面净化：分割线候选 Hook 失败 ${method.name}", it) }
         }
+        if (hooked > 0) logger("界面净化：分割线候选已挂载 ×$hooked", null)
+        return hooked > 0
     }
 
-    private fun findAddItemDecoration(
-        recyclerClass: Class<*>,
-        decorationClass: Class<*>
-    ): Method? {
-        var current: Class<*>? = recyclerClass
-        while (current != null && current != Any::class.java) {
-            KavaReflector.declaredMethods(current).firstOrNull { candidate ->
-                val types = candidate.parameterTypes
-                types.size == 1 &&
-                    types[0].name == decorationClass.name &&
-                    candidate.returnType == Void.TYPE &&
-                    !Modifier.isStatic(candidate.modifiers)
-            }?.let { return it }
-            current = current.superclass
-        }
-        return null
+    /** 每种结果只记一次，避免刷屏。 */
+    private fun diag(key: String, message: String) {
+        if (diagnostics.add(key)) logger(message, null)
     }
-
     // -------------------------------------------------------------- 系统灰字
 
     private fun installSystemTipHook(): Boolean {
-        val method = locateBindMethod() ?: run {
-            logger("界面净化：未定位到聊天消息绑定方法", null)
+        val method = ChatAdapterBindLocator.locate(context, logger) ?: run {
+            logger("界面净化：未定位到聊天绑定方法", null)
             return false
         }
         return runCatching {
@@ -183,7 +185,7 @@ private class ChatPurifyRuntime(
                     }
                 }
             })
-            logger("界面净化：系统提示 Hook 已挂载 ${method.declaringClass.simpleName}#${method.name}", null)
+            logger("界面净化：系统提示 Hook 已挂载 ${method.declaringClass.simpleName}#${method.name}，开关 ${if (enabled(ChatPurifyFeature.KEY_HIDE_SYSTEM_TIP, ChatPurifyFeature.DEFAULT_HIDE_SYSTEM_TIP)) "开" else "关"}", null)
             true
         }.getOrElse {
             logger("界面净化：系统提示 Hook 安装失败", it)
@@ -234,58 +236,10 @@ private class ChatPurifyRuntime(
         (KavaReflector.readField(message, "field_type") as? Number)?.let { return it.toInt() }
         return null
     }
-
-    private fun locateBindMethod(): Method? {
-        val cacheKey = DexMethodCache.runtimeKey(context.hostContext(), context.hostClassLoader())
-        DexMethodCache.load(cachePrefs, cacheKey, context.hostClassLoader(), CACHE_KEY)
-            ?.takeIf(::isBindCandidate)
-            ?.let { return it }
-        val method = findByStrings("MicroMsg.ChattingDataAdapterV3", "_onBindViewHolder[", "msgInfo")
-            .firstOrNull(::isBindCandidate)
-            ?: findByStrings("MicroMsg.ChattingDataAdapterV3", "holder", "itemView")
-                .firstOrNull(::isBindCandidate)
-        if (method == null) {
-            DexMethodCache.clear(cachePrefs, cacheKey, CACHE_KEY)
-        } else {
-            DexMethodCache.save(cachePrefs, cacheKey, CACHE_KEY, method)
-        }
-        return method
-    }
-
-    private fun findByStrings(vararg strings: String): List<Method> = runCatching {
-        context.dexKitBridge().findMethod(
-            FindMethod().apply {
-                matcher(
-                    MethodMatcher().apply {
-                        usingStrings(strings.toList())
-                    }
-                )
-            }
-        ).mapNotNull { data ->
-            runCatching { data.getMethodInstance(context.hostClassLoader()) }.getOrNull()
-        }
-    }.getOrElse {
-        logger("DexKit 定位聊天绑定方法失败", it)
-        emptyList()
-    }
-
-    private fun isBindCandidate(method: Method): Boolean {
-        if (Modifier.isStatic(method.modifiers) ||
-            Modifier.isAbstract(method.modifiers) ||
-            method.declaringClass.isInterface
-        ) {
-            return false
-        }
-        val types = method.parameterTypes
-        return types.size == 2 &&
-            types[1] == Integer.TYPE &&
-            method.returnType == Void.TYPE
-    }
-
     private fun enabled(key: String, default: Boolean): Boolean = prefs.getBoolean(key, default)
 
     private companion object {
-        const val CACHE_KEY = "chat_bind_v2"
+        const val CACHE_KEY = "purify_v2"
     }
 }
 

@@ -6,7 +6,7 @@ import android.view.View
 import de.robv.android.xposed.XC_MethodHook
 import h.Hchat.event.Events
 import h.Hchat.hooks.api.core.WeChatApis
-import h.Hchat.hooks.api.message.SingleMessageMenuLocator
+import h.Hchat.hooks.api.message.ChatPresenterMenuLocator
 import h.Hchat.hooks.api.model.WeChatMessageTypes
 import h.Hchat.hooks.api.sns.SnsContentTypes
 import h.Hchat.hooks.api.sns.SnsContextMenuDispatcher
@@ -32,8 +32,8 @@ import java.util.concurrent.ConcurrentHashMap
  * 写进微信「自定义表情」库。落库方式见 [EmojiCollectionWriter]：完全照微信自己
  * `EmojiAddCustomDialogUI.save` 的序列走（catalog=0x51 + 排序位 + `EmojiInfoStorage` 落库）。
  *
- * 两处入口各用现成的共享链路，不新增 DexKit 定位：
- * - 聊天：`SingleMessageMenuLocator`（和「保存表情」「转发」同一套创建/点击 Hook）
+ * 两处入口：
+ * - 聊天：`ChatPresenterMenuLocator`（presenter 的 `onCreateContextMenu`，args[0] 才是菜单本体）
  * - 朋友圈：`SnsContextMenuDispatcher`（和「转发[H]」同一套菜单注册表）
  */
 class AddEmojiFeature : BaseFeature() {
@@ -91,6 +91,8 @@ private class AddEmojiRuntime(
     private val bindings = Collections.synchronizedMap(WeakHashMap<MenuItem, Any>())
     /** 每个 tag 类的「消息 getter」缓存，null 表示这个类没有。 */
     private val messageGetterCache = ConcurrentHashMap<String, Method?>()
+    /** 诊断三类结果各记一次，便于从日志定位卡点。 */
+    private val diagnostics = Collections.synchronizedSet(HashSet<String>())
     private val enabled = HotConfig.flag(
         AddEmojiFeature.ID,
         AddEmojiSettings.KEY_ENABLED,
@@ -140,14 +142,17 @@ private class AddEmojiRuntime(
     // ------------------------------------------------------------------ 聊天
 
     private fun installChatMenu(): Boolean {
-        val createHooked = SingleMessageMenuLocator.menuCreateMethods(context, logger).count { method ->
+        // 8.0.80 上必须用 presenter 的 onCreateContextMenu(ContextMenu, View, Info)：
+        // 它的 args[0] 才是菜单本体。老入口 viewitems#a 的 args[0] 是聊天上下文，
+        // 往它上面 add 菜单项等于什么都没做 —— 这就是菜单项从不出现的原因。
+        val createHooked = ChatPresenterMenuLocator.createMethods(context, logger).count { method ->
             hook(method, object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
                     addChatMenu(param)
                 }
             })
         }
-        val clickHooked = SingleMessageMenuLocator.menuClickMethods(context, logger).count { method ->
+        val clickHooked = ChatPresenterMenuLocator.clickMethods(context, logger).count { method ->
             hook(method, object : XC_MethodHook() {
                 override fun beforeHookedMethod(param: MethodHookParam) {
                     handleChatClick(param)
@@ -164,10 +169,24 @@ private class AddEmojiRuntime(
         val args = param.args
         val menu = args.getOrNull(0) ?: return
         val view = args.getOrNull(1) as? View ?: return
-        val message = resolveNativeMessage(view.tag) ?: resolveNativeMessage(args) ?: return
+        val message = resolveNativeMessage(view.tag) ?: resolveNativeMessage(args)
+        if (message == null) {
+            diag("resolved", "菜单已创建但取不到消息对象（tag=${view.tag?.javaClass?.name}）")
+            return
+        }
         if (!isImageMessage(message)) return
-        val item = addMenuItem(menu, view) ?: return
+        val item = addMenuItem(menu, view)
+        if (item == null) {
+            diag("added", "拿到图片消息但注入失败（菜单=${menu.javaClass.name}）")
+            return
+        }
         bindings[item] = message
+        diag("added", "已注入「保存为表情」菜单项，菜单=${menu.javaClass.name}")
+    }
+
+    /** 每种结果只记录一次，避免刷屏；下一次日志就能看出卡在哪一步。 */
+    private fun diag(key: String, message: String) {
+        if (diagnostics.add(key)) bootLog(message)
     }
 
     private fun handleChatClick(param: XC_MethodHook.MethodHookParam) {

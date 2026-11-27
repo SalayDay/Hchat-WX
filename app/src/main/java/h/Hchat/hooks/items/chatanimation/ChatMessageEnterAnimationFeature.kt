@@ -8,6 +8,7 @@ import h.Hchat.event.Events
 import h.Hchat.hooks.core.BaseFeature
 import h.Hchat.hooks.core.DexInstallScheduler
 import h.Hchat.hooks.core.FeatureContext
+import h.Hchat.hooks.api.message.ChatAdapterBindLocator
 import h.Hchat.hooks.core.HookRegistry
 import h.Hchat.preferences.HotConfig
 import h.Hchat.utils.KavaReflector
@@ -93,11 +94,11 @@ private class ChatMessageEnterAnimationRuntime(
     @Synchronized
     fun install(): Boolean {
         if (installed) return true
-        // 聊天列表是 RecyclerView 架构（ChattingDataAdapterV3），**没有 getView 调用点**，
-        // 日志里的「找不到 getView」就是这么来的。改用项目里已验证的定位方式：
-        // 按方法体内 "MicroMsg.ChattingDataAdapterV3" / "_onBindViewHolder[" 找绑定方法。
-        val method = locateBindMethod() ?: run {
-            logger("消息入场动效：未定位到聊天消息绑定方法", null)
+        // 聊天列表是 RecyclerView 架构（ChattingDataAdapterV3），没有 getView 调用点。
+        // 也不能挂适配器自己被混淆的 per-item 回调（实测挂到 k#C0 也没被调用）——
+        // 改挂继承链上那个覆写 AndroidX 的 onBindViewHolder(ViewHolder, int)，名字不会被混淆。
+        val method = ChatAdapterBindLocator.locate(context, logger) ?: run {
+            logger("消息入场动效：未定位到聊天绑定方法", null)
             return false
         }
         return runCatching {
@@ -107,7 +108,7 @@ private class ChatMessageEnterAnimationRuntime(
                 }
             })
             installed = true
-            logger("消息入场动效：已挂载 ${method.declaringClass.simpleName}#${method.name}", null)
+            logger("消息入场动效：已挂载 ${method.declaringClass.simpleName}#${method.name}，开关 ${if (enabled()) "开" else "关"}", null)
             true
         }.getOrElse {
             logger("消息入场动效 Hook 安装失败: ${method.toGenericString()}", it)
@@ -160,60 +161,6 @@ private class ChatMessageEnterAnimationRuntime(
             .setInterpolator(OvershootInterpolator(1.15f))
             .start()
     }
-
-    /**
-     * 找聊天消息的 `onBindViewHolder(holder, position)`。
-     *
-     * 锚点是 `MicroMsg.ChattingDataAdapterV3` + `_onBindViewHolder[`，这两个串在
-     * 项目里已被「消息文字颜色」「滑动引用」验证过，跨版本稳定。
-     */
-    private fun locateBindMethod(): Method? {
-        DexMethodCache.load(prefs, cacheKey, context.hostClassLoader(), CACHE_KEY)
-            ?.takeIf(::isBindCandidate)
-            ?.let { return it }
-
-        val method = findByStrings("MicroMsg.ChattingDataAdapterV3", "_onBindViewHolder[", "msgInfo")
-            .firstOrNull(::isBindCandidate)
-            ?: findByStrings("MicroMsg.ChattingDataAdapterV3", "holder", "itemView")
-                .firstOrNull(::isBindCandidate)
-        if (method == null) {
-            DexMethodCache.clear(prefs, cacheKey, CACHE_KEY)
-        } else {
-            DexMethodCache.save(prefs, cacheKey, CACHE_KEY, method)
-        }
-        return method
-    }
-
-    private fun findByStrings(vararg strings: String): List<Method> = runCatching {
-        context.dexKitBridge().findMethod(
-            FindMethod().apply {
-                matcher(
-                    MethodMatcher().apply {
-                        usingStrings(strings.toList())
-                    }
-                )
-            }
-        ).mapNotNull { data ->
-            runCatching { data.getMethodInstance(context.hostClassLoader()) }.getOrNull()
-        }
-    }.getOrElse {
-        logger("DexKit 定位聊天绑定方法失败", it)
-        emptyList()
-    }
-
-    private fun isBindCandidate(method: Method): Boolean {
-        if (Modifier.isStatic(method.modifiers) ||
-            Modifier.isAbstract(method.modifiers) ||
-            method.declaringClass.isInterface
-        ) {
-            return false
-        }
-        val types = method.parameterTypes
-        return types.size == 2 &&
-            types[1] == Integer.TYPE &&
-            method.returnType == Void.TYPE
-    }
-
     private companion object {
         const val CACHE_KEY = "chat_bind_v2"
         const val DURATION_MS = 200L

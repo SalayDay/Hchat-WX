@@ -42,6 +42,15 @@ internal object ModuleChangelog {
     /** 新的在上。版本号按发布顺序倒序排列。 */
     val entries: List<ModuleChangelogEntry> = listOf(
         ModuleChangelogEntry(
+            "6.7.7.26",
+            listOf(
+                "图片保存为表情：菜单创建改用 presenter 的 onCreateContextMenu —— 老入口的第一个参数是聊天上下文而不是菜单，往它上面加项等于没加",
+                "消息入场动效 / 隐藏系统灰字：改挂父类覆写的 onBindViewHolder，适配器自己的 per-item 回调不保证被调用",
+                "隐藏首页分割线：addItemDecoration 与 ItemDecoration 均被混淆，改为按「RecyclerView 上返回 void、单个非基本类型参数」批量挂载并运行时判断",
+                "所有新功能安装日志补上当前开关状态，便于区分「没挂上」和「开关没开」"
+            )
+        ),
+        ModuleChangelogEntry(
             "6.7.7.25",
             listOf(
                 "修复「图片保存为表情」无效：8.0.80 的消息由长按 tag 对象的方法（ws#c）返回，原来只找字段所以永远取不到消息",
