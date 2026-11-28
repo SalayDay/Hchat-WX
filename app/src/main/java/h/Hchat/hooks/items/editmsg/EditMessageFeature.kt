@@ -6,7 +6,7 @@ import android.content.Context
 import android.view.MenuItem
 import android.view.View
 import android.widget.Toast
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.event.Events
 import h.Hchat.hooks.api.core.WeChatApis
 import h.Hchat.hooks.api.message.SingleMessageMenuLocator
@@ -565,18 +565,25 @@ private class EditMessageHooker(
     }
 
     private fun hookChatMethod(method: Method, menuCreate: Boolean): Boolean {
-        return hookMethod(method, object : XC_MethodHook() {
-            override fun afterHookedMethod(param: MethodHookParam) {
-                if (menuCreate) addEditMenu(param)
-            }
-
-            override fun beforeHookedMethod(param: MethodHookParam) {
-                if (!menuCreate) handleEditClick(param)
-            }
-        })
+        return hookMethod(method, if (menuCreate) MenuCreateHooker(this) else MenuClickHooker(this))
     }
 
-    private fun hookMethod(method: Method, callback: XC_MethodHook): Boolean {
+    private class MenuCreateHooker(private val runtime: EditMessageHooker) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val result = chain.proceed()
+            runtime.addEditMenu(chain.args.toTypedArray())
+            return result
+        }
+    }
+
+    private class MenuClickHooker(private val runtime: EditMessageHooker) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            runtime.handleEditClick(chain.thisObject, chain.args.toTypedArray())
+            return chain.proceed()
+        }
+    }
+
+    private fun hookMethod(method: Method, callback: XposedInterface.Hooker): Boolean {
         if (!isHookableMethod(method)) return false
         if (!hookedMethods.add(method)) return true
         return try {
@@ -589,10 +596,9 @@ private class EditMessageHooker(
         }
     }
 
-    private fun addEditMenu(param: XC_MethodHook.MethodHookParam) {
+    private fun addEditMenu(args: Array<Any?>) {
         clearMenuMessageBinding()
         if (!EditMessageRepository.isEnabled(context.hostContext())) return
-        val args = param.args ?: return
         if (args.size < 3) return
         val menu = args[0] ?: return
         val view = args.getOrNull(1) as? View ?: return
@@ -616,12 +622,11 @@ private class EditMessageHooker(
         }
     }
 
-    private fun handleEditClick(param: XC_MethodHook.MethodHookParam) {
+    private fun handleEditClick(owner: Any?, args: Array<Any?>) {
         if (!EditMessageRepository.isEnabled(context.hostContext())) return
-        val args = param.args ?: return
         val menuItem = findMenuItem(args) ?: return
         if (menuItem.itemId != MENU_EDIT_ID) return
-        val activity = resolveActivity(param.thisObject)
+        val activity = resolveActivity(owner)
         val binding = consumeMenuMessageBinding(menuItem)
         val editable = binding?.msgId?.takeIf { it > 0L }
             ?.let { EditMessageRepository.editableMessage(context.hostContext(), it) }

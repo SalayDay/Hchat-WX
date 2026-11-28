@@ -3,7 +3,7 @@ package h.Hchat.hooks.items.moments
 import android.content.ContentValues
 import android.content.SharedPreferences
 import android.database.Cursor
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.dexkit.DexMethodCache
 import h.Hchat.hooks.core.BaseFeature
 import h.Hchat.hooks.core.FeatureContext
@@ -84,21 +84,7 @@ private class SnsAntiRecallHooker(
         for (method in KavaReflector.declaredMethods(dbClass)) {
             if (!isSnsWriteMethod(method) && !isSnsRawQueryMethod(method)) continue
             if (!hookedMethods.add(method)) continue
-            HookRegistry.get().hook(method, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    try {
-                        if (isSnsWriteMethod(method)) {
-                            handleSnsWrite(param.thisObject, param.args, isSnsUpdateMethod(method))
-                        } else if (isSnsRawQueryMethod(method)) {
-                            if (internalQuery.get() == true) return
-                            if (!isMomentAntiRecallEnabled()) return
-                            handleSnsQuery(param.args)
-                        }
-                    } catch (e: Throwable) {
-                        HLog.e("[Hchat:SnsAntiRecall] Hook处理失败", e)
-                    }
-                }
-            })
+            HookRegistry.get().hook(method, SnsDatabaseHooker(this, method))
             count++
         }
         return count
@@ -191,13 +177,7 @@ private class SnsAntiRecallHooker(
         val method = findEnableFlutterSnsPageMethod() ?: return 0
         if (!hookedMethods.add(method)) return 0
         return try {
-            HookRegistry.get().hook(method, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    if (isMomentAntiRecallEnabled() && isForceLegacyProfileEnabled()) {
-                        param.setResult(false)
-                    }
-                }
-            })
+            HookRegistry.get().hook(method, SnsProfileSwitchHooker(this))
             1
         } catch (e: Throwable) {
             HLog.e("[Hchat:SnsAntiRecall] Hook旧版朋友圈主页开关失败: ${e.message}", e)
@@ -733,4 +713,43 @@ private class SnsAntiRecallHooker(
             setOf(RegexOption.IGNORE_CASE)
         )
     }
+
+    private class SnsDatabaseHooker(private val owner: SnsAntiRecallHooker, private val method: Method) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val args = chain.args.toTypedArray()
+            val receiver = chain.thisObject
+            with(owner) {
+            run patch@{
+                try {
+                    if (isSnsWriteMethod(method)) {
+                        handleSnsWrite(receiver, args, isSnsUpdateMethod(method))
+                    } else if (isSnsRawQueryMethod(method)) {
+                        if (internalQuery.get() == true) return@patch
+                        if (!isMomentAntiRecallEnabled()) return@patch
+                        handleSnsQuery(args)
+                    }
+                } catch (e: Throwable) {
+                    HLog.e("[Hchat:SnsAntiRecall] Hook处理失败", e)
+                }
+            }
+            return chain.proceed(args)
+            }
+        }
+    }
+
+    private class SnsProfileSwitchHooker(private val owner: SnsAntiRecallHooker) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val args = chain.args.toTypedArray()
+            val receiver = chain.thisObject
+            with(owner) {
+            run patch@{
+                if (isMomentAntiRecallEnabled() && isForceLegacyProfileEnabled()) {
+                    return false
+                }
+            }
+            return chain.proceed(args)
+            }
+        }
+    }
+
 }

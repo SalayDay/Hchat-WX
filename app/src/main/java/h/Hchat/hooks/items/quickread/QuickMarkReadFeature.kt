@@ -11,7 +11,7 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.widget.TextView
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.hooks.core.BaseFeature
 import h.Hchat.hooks.core.FeatureContext
 import h.Hchat.hooks.core.HookRegistry
@@ -84,15 +84,7 @@ private class QuickMarkReadDragController(
         if (installed) return true
         val methods = collectDispatchMethods()
         if (methods.isEmpty()) return false
-        val callback = object : XC_MethodHook() {
-            override fun beforeHookedMethod(param: MethodHookParam) {
-                val activity = param.thisObject as? Activity ?: return
-                val event = param.args?.getOrNull(0) as? MotionEvent ?: return
-                if (handleTouch(activity, event)) {
-                    param.setResult(true)
-                }
-            }
-        }
+        val callback = DragTouchHook(this)
         var hookedCount = 0
         var lastError: Throwable? = null
         for (method in methods) {
@@ -703,6 +695,17 @@ private class QuickMarkReadDragController(
                 right = minOf(right, other.right),
                 bottom = minOf(bottom, other.bottom)
             )
+        }
+    }
+
+    private class DragTouchHook(private val owner: QuickMarkReadDragController) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            return with(owner) {
+                val activity = chain.thisObject as? Activity ?: return chain.proceed()
+                val event = chain.args.getOrNull(0) as? MotionEvent ?: return chain.proceed()
+                if (handleTouch(activity, event)) return true
+                return chain.proceed()
+            }
         }
     }
 }

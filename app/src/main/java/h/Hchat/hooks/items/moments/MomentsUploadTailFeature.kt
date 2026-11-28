@@ -1,6 +1,6 @@
 package h.Hchat.hooks.items.moments
 
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.event.Events
 import h.Hchat.hooks.core.BaseFeature
 import h.Hchat.hooks.core.DexInstallScheduler
@@ -69,30 +69,40 @@ private class MomentsUploadTailHooker(
         val sdkAppName = finder.snsSetSdkAppNameMethod ?: return false
         if (Modifier.isAbstract(commit.modifiers) || commit.declaringClass.isInterface) return false
         return runCatching {
-            HookRegistry.get().hook(commit, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    if (!prefs.getBoolean(
-                            MomentsUploadTailSettings.KEY_ENABLE,
-                            MomentsUploadTailSettings.DEFAULT_ENABLE
-                        )
-                    ) return
-                    val id = prefs.getString(
-                        MomentsUploadTailSettings.KEY_SDK_ID,
-                        MomentsUploadTailSettings.DEFAULT_SDK_ID
-                    ).orEmpty().trim()
-                    val name = prefs.getString(
-                        MomentsUploadTailSettings.KEY_SDK_APP_NAME,
-                        MomentsUploadTailSettings.DEFAULT_SDK_APP_NAME
-                    ).orEmpty().trim()
-                    if (id.isBlank() || name.isBlank()) return
-                    KavaReflector.invoke(sdkId, param.thisObject, id)
-                    KavaReflector.invoke(sdkAppName, param.thisObject, name)
-                }
-            })
+            HookRegistry.get().hook(commit, UploadTailHooker(this, sdkId, sdkAppName))
             installed = true
             true
         }.onFailure {
             logger("朋友圈上传尾巴Hook安装失败: ${commit.toGenericString()}", it)
         }.getOrDefault(false)
     }
+
+    private class UploadTailHooker(private val owner: MomentsUploadTailHooker, private val sdkId: java.lang.reflect.Method, private val sdkAppName: java.lang.reflect.Method) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val args = chain.args.toTypedArray()
+            val receiver = chain.thisObject
+            with(owner) {
+            run patch@{
+                if (!prefs.getBoolean(
+                        MomentsUploadTailSettings.KEY_ENABLE,
+                        MomentsUploadTailSettings.DEFAULT_ENABLE
+                    )
+                ) return@patch
+                val id = prefs.getString(
+                    MomentsUploadTailSettings.KEY_SDK_ID,
+                    MomentsUploadTailSettings.DEFAULT_SDK_ID
+                ).orEmpty().trim()
+                val name = prefs.getString(
+                    MomentsUploadTailSettings.KEY_SDK_APP_NAME,
+                    MomentsUploadTailSettings.DEFAULT_SDK_APP_NAME
+                ).orEmpty().trim()
+                if (id.isBlank() || name.isBlank()) return@patch
+                KavaReflector.invoke(sdkId, receiver, id)
+                KavaReflector.invoke(sdkAppName, receiver, name)
+            }
+            return chain.proceed(args)
+            }
+        }
+    }
+
 }

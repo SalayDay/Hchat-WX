@@ -2,7 +2,7 @@ package h.Hchat.hooks.items.textspeech
 
 import android.app.Activity
 import android.view.KeyEvent
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.event.Events
 import h.Hchat.hooks.api.core.WeChatApis
 import h.Hchat.hooks.core.BaseFeature
@@ -31,7 +31,7 @@ class TextSpeechFeature : BaseFeature() {
                 HLog.e("$TAG 消息观察 API 未就绪")
                 return@subscribe
             }
-            trackSubscription(observe.subscribe { message -> runtime?.handleMessage(message) })
+            trackSubscription(observe.subscribe(ID) { message -> runtime?.handleMessage(message) })
         }
     }
 
@@ -51,14 +51,17 @@ class TextSpeechFeature : BaseFeature() {
             return
         }
         runCatching {
-            HookRegistry.get().hook(method, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    val event = param.args.getOrNull(0) as? KeyEvent ?: return
-                    if (runtime?.handleVolumeKey(event) == true) param.setResult(true)
-                }
-            })
+            HookRegistry.get().hook(method, VolumeKeyHooker(this))
         }.onFailure {
             HLog.e("$TAG 音量键 Hook 安装失败: ${it.message}", it)
+        }
+    }
+
+    private class VolumeKeyHooker(private val feature: TextSpeechFeature) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val event = chain.args.getOrNull(0) as? KeyEvent
+            if (event != null && feature.runtime?.handleVolumeKey(event) == true) return true
+            return chain.proceed()
         }
     }
 

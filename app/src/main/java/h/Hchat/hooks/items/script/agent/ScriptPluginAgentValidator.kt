@@ -134,7 +134,7 @@ object ScriptPluginAgentValidator {
         Regex("Runtime\\.getRuntime\\(\\)\\.exec|ProcessBuilder") to "包含执行系统进程的代码，保存前请确认来源和用途",
         Regex("ClassLoader|DexClassLoader|createPackageContext") to "包含 ClassLoader 或跨包加载代码，保存前请确认来源和用途",
         Regex("System\\.load(?:Library)?|\\bloadSo\\s*\\(") to "包含Native库加载代码，保存前请确认来源和用途",
-        Regex("java\\.lang\\.reflect|XposedBridge|XposedHelpers|hookBefore|hookAfter|hookReplace") to "包含反射或 Hook 代码，保存前请确认来源和用途",
+        Regex("java\\.lang\\.reflect|\\bhook\\s*\\(|ScriptHookChain|de\\.robv|XC_MethodHook|MethodHookParam|XposedBridge|XposedHelpers|hookBefore|hookAfter|hookReplace") to "包含反射或 Hook 代码，保存前请确认来源和用途",
         Regex("\\.delete\\s*\\(") to "包含删除文件的代码，保存前请确认来源和用途",
         Regex("OkHttpClient|new\\s+URL\\s*\\(|Socket|https?://|\\b(?:get|post|download)\\s*\\(\\s*\"https?://") to "包含网络访问代码，保存前请确认请求目标和数据范围"
     )

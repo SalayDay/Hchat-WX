@@ -12,7 +12,7 @@ import android.view.ViewGroup
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.hooks.core.BaseFeature
 import h.Hchat.hooks.core.FeatureContext
 import h.Hchat.hooks.core.HookRegistry
@@ -76,9 +76,9 @@ class ProfileIdFeature : BaseFeature() {
                 h.Hchat.utils.HLog.e("$TAG 未找到好友资料页类")
                 return
             }
-            hookAfter(clazz, "initView") { param ->
-                injectProfileId(context, param.thisObject as? Activity, ProfileKind.CONTACT)
-            }
+            val method = KavaReflector.findMethodRecursive(clazz, "initView")
+            if (method != null) HookRegistry.get().hook(method, ContactProfileInitHook(context))
+            else h.Hchat.utils.HLog.e("$TAG 未找到 ${clazz.name}#initView")
             hookPreferenceTreeClick(clazz, ProfileKind.CONTACT)
         }
 
@@ -88,9 +88,9 @@ class ProfileIdFeature : BaseFeature() {
                 h.Hchat.utils.HLog.e("$TAG 未找到群聊资料页类")
                 return
             }
-            hookAfter(clazz, "initView") { param ->
-                injectChatroomProfileId(context, param.thisObject as? Activity)
-            }
+            val method = KavaReflector.findMethodRecursive(clazz, "initView")
+            if (method != null) HookRegistry.get().hook(method, ChatroomProfileInitHook(context))
+            else h.Hchat.utils.HLog.e("$TAG 未找到 ${clazz.name}#initView")
             hookPreferenceTreeClick(clazz, ProfileKind.CHATROOM)
         }
 
@@ -103,16 +103,7 @@ class ProfileIdFeature : BaseFeature() {
             methodsOf(clazz)
                 .firstOrNull { it.name == "onPreferenceTreeClick" && it.parameterTypes.size >= 2 }
                 ?.let { method ->
-                    HookRegistry.get().hook(method, object : XC_MethodHook() {
-                        override fun beforeHookedMethod(param: MethodHookParam) {
-                            val activity = param.thisObject as? Activity ?: return
-                            val preference = param.args.getOrNull(1) ?: return
-                            if (preferenceKey(preference) != CHATROOM_PREF_KEY) return
-                            val profileId = resolveProfileId(activity, kind) ?: return
-                            copyProfileId(activity, profileId)
-                            param.setResult(true)
-                        }
-                    })
+                    HookRegistry.get().hook(method, ProfilePreferenceClickHook(kind))
                 }
                 ?: h.Hchat.utils.HLog.e("$TAG 未找到资料页 Preference 点击方法: ${clazz.name}")
         }
@@ -125,25 +116,6 @@ class ProfileIdFeature : BaseFeature() {
             }
         }
 
-        private fun hookAfter(
-            clazz: Class<*>,
-            methodName: String,
-            vararg parameterTypes: Class<*>,
-            block: (XC_MethodHook.MethodHookParam) -> Unit
-        ) {
-            val method = KavaReflector.findMethodRecursive(clazz, methodName, *parameterTypes)
-            if (method == null) {
-                h.Hchat.utils.HLog.e("$TAG 未找到 ${clazz.name}#$methodName")
-                return
-            }
-            HookRegistry.get().hook(method, object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    runCatching { block(param) }.onFailure {
-                        h.Hchat.utils.HLog.e("$TAG 注入资料页 ID 失败: ${it.message}", it)
-                    }
-                }
-            })
-        }
 
         private fun injectProfileId(context: Context, activity: Activity?, kind: ProfileKind, post: Boolean = true) {
             if (activity == null || !isEnabled(context)) return
@@ -759,6 +731,37 @@ class ProfileIdFeature : BaseFeature() {
             return null
         }
 
+
+        private class ProfilePreferenceClickHook(private val kind: ProfileKind) : XposedInterface.Hooker {
+            override fun intercept(chain: XposedInterface.Chain): Any? {
+                val activity = chain.thisObject as? Activity ?: return chain.proceed()
+                val preference = chain.args.getOrNull(1) ?: return chain.proceed()
+                if (preferenceKey(preference) != CHATROOM_PREF_KEY) return chain.proceed()
+                val profileId = resolveProfileId(activity, kind) ?: return chain.proceed()
+                copyProfileId(activity, profileId)
+                return true
+            }
+        }
+
+        private class ContactProfileInitHook(private val context: Context) : XposedInterface.Hooker {
+            override fun intercept(chain: XposedInterface.Chain): Any? {
+                val outcome = chain.proceed()
+                runCatching { injectProfileId(context, chain.thisObject as? Activity, ProfileKind.CONTACT) }.onFailure {
+                    h.Hchat.utils.HLog.e("$TAG 注入资料页 ID 失败: ${it.message}", it)
+                }
+                return outcome
+            }
+        }
+
+        private class ChatroomProfileInitHook(private val context: Context) : XposedInterface.Hooker {
+            override fun intercept(chain: XposedInterface.Chain): Any? {
+                val outcome = chain.proceed()
+                runCatching { injectChatroomProfileId(context, chain.thisObject as? Activity) }.onFailure {
+                    h.Hchat.utils.HLog.e("$TAG 注入资料页 ID 失败: ${it.message}", it)
+                }
+                return outcome
+            }
+        }
     }
 
     private enum class ProfileKind {

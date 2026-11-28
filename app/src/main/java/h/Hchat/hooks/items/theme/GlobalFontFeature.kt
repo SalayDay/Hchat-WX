@@ -5,7 +5,7 @@ import android.graphics.fonts.Font
 import android.graphics.fonts.FontFamily
 import android.os.Build
 import android.widget.TextView
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.event.Events
 import h.Hchat.hooks.core.BaseFeature
 import h.Hchat.hooks.core.DexInstallScheduler
@@ -99,23 +99,10 @@ private class GlobalFontRuntime(
         }
         var hooked = 0
         plain?.let { method ->
-            if (hook(method) { param ->
-                    val original = param.args?.getOrNull(0) as? Typeface
-                    resolve(original, Typeface.NORMAL)?.let { param.args[0] = it }
-                }
-            ) {
-                hooked++
-            }
+            if (hook(method, PlainTypefaceHooker(this))) hooked++
         }
         styled?.let { method ->
-            if (hook(method) { param ->
-                    val original = param.args?.getOrNull(0) as? Typeface
-                    val style = (param.args?.getOrNull(1) as? Number)?.toInt() ?: Typeface.NORMAL
-                    resolve(original, style)?.let { param.args[0] = it }
-                }
-            ) {
-                hooked++
-            }
+            if (hook(method, StyledTypefaceHooker(this))) hooked++
         }
         installed = hooked > 0
         if (installed) {
@@ -126,18 +113,38 @@ private class GlobalFontRuntime(
         return installed
     }
 
-    private fun hook(method: java.lang.reflect.Method, body: (XC_MethodHook.MethodHookParam) -> Unit): Boolean {
+    private fun hook(method: java.lang.reflect.Method, hooker: XposedInterface.Hooker): Boolean {
         return runCatching {
-            HookRegistry.get().hook(method, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    if (!enabled()) return
-                    runCatching { body(param) }
-                }
-            })
+            HookRegistry.get().hook(method, hooker)
             true
         }.getOrElse {
             logger("全局字体 Hook 安装失败: ${method.toGenericString()}", it)
             false
+        }
+    }
+
+    private class PlainTypefaceHooker(private val runtime: GlobalFontRuntime) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            if (!runtime.enabled()) return chain.proceed()
+            val original = chain.args.getOrNull(0) as? Typeface
+            val replacement = runCatching { runtime.resolve(original, Typeface.NORMAL) }.getOrNull()
+                ?: return chain.proceed()
+            val args = chain.args.toTypedArray()
+            args[0] = replacement
+            return chain.proceed(args)
+        }
+    }
+
+    private class StyledTypefaceHooker(private val runtime: GlobalFontRuntime) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            if (!runtime.enabled()) return chain.proceed()
+            val original = chain.args.getOrNull(0) as? Typeface
+            val style = (chain.args.getOrNull(1) as? Number)?.toInt() ?: Typeface.NORMAL
+            val replacement = runCatching { runtime.resolve(original, style) }.getOrNull()
+                ?: return chain.proceed()
+            val args = chain.args.toTypedArray()
+            args[0] = replacement
+            return chain.proceed(args)
         }
     }
 

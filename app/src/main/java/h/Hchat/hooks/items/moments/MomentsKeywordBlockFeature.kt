@@ -10,7 +10,7 @@ import android.os.SystemClock
 import android.view.View
 import android.view.ViewGroup
 import android.widget.Adapter
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.dexkit.DexMethodCache
 import h.Hchat.event.Events
 import h.Hchat.hooks.api.core.WeChatApis
@@ -261,13 +261,7 @@ private class MomentsKeywordBlockRuntime(
         if (snsTimelineQueryHookInstalled) return true
         val method = locateSnsTimelineQueryMethod() ?: return false
         return runCatching {
-            HookRegistry.get().hook(KavaReflector.accessible(method) ?: method, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    val sql = param.args.getOrNull(0) as? String ?: return
-                    val rewritten = rewriteTimelineQuery(sql)
-                    if (rewritten != sql) param.args[0] = rewritten
-                }
-            })
+            HookRegistry.get().hook(KavaReflector.accessible(method) ?: method, TimelineSqlHooker(this))
             snsTimelineQueryHookInstalled = true
             true
         }.getOrElse {
@@ -285,36 +279,7 @@ private class MomentsKeywordBlockRuntime(
             return true
         }
         return runCatching {
-            HookRegistry.get().hook(KavaReflector.accessible(method) ?: method, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    val view = param.args.getOrNull(3) as? View
-                    if (!filterSnapshot.isActive(filterByAuthor = true)) {
-                        view?.let(::clearViewBinding)
-                        return
-                    }
-                    val info = param.args.getOrNull(0) ?: run {
-                        view?.let(::clearViewBinding)
-                        return
-                    }
-                    param.setObjectExtra(BIND_INFO_EXTRA, info)
-                    view?.let { view ->
-                        prepareViewBinding(view, info, filterByAuthor = true)
-                    }
-                }
-
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    val view = param.result as? View ?: return
-                    if (!filterSnapshot.isActive(filterByAuthor = true)) {
-                        clearViewBinding(view)
-                        return
-                    }
-                    val info = param.getObjectExtra(BIND_INFO_EXTRA) ?: param.args.getOrNull(0) ?: run {
-                        clearViewBinding(view)
-                        return
-                    }
-                    bindView(view, info, filterByAuthor = true)
-                }
-            })
+            HookRegistry.get().hook(KavaReflector.accessible(method) ?: method, LegacyTimelineBindHooker(this))
             legacyTimelineHookInstalled = true
             true
         }.getOrElse {
@@ -328,38 +293,7 @@ private class MomentsKeywordBlockRuntime(
         if (improveTimelineHookInstalled) return true
         val method = locateImproveTimelineBindMethod() ?: return false
         return runCatching {
-            HookRegistry.get().hook(KavaReflector.accessible(method) ?: method, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    val view = param.thisObject as? View
-                    if (!filterSnapshot.isActive(filterByAuthor = true)) {
-                        view?.let(::clearViewBinding)
-                        return
-                    }
-                    val info = resolveImproveSnsInfo(param.args.getOrNull(1)) ?: run {
-                        view?.let(::clearViewBinding)
-                        return
-                    }
-                    param.setObjectExtra(BIND_INFO_EXTRA, info)
-                    view?.let { view ->
-                        prepareViewBinding(view, info, filterByAuthor = true)
-                    }
-                }
-
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    val view = param.thisObject as? View ?: return
-                    if (!filterSnapshot.isActive(filterByAuthor = true)) {
-                        clearViewBinding(view)
-                        return
-                    }
-                    val info = param.getObjectExtra(BIND_INFO_EXTRA)
-                        ?: resolveImproveSnsInfo(param.args.getOrNull(1))
-                        ?: run {
-                            clearViewBinding(view)
-                            return
-                        }
-                    bindView(view, info, filterByAuthor = true)
-                }
-            })
+            HookRegistry.get().hook(KavaReflector.accessible(method) ?: method, ImproveTimelineBindHooker(this))
             improveTimelineHookInstalled = true
             true
         }.getOrElse {
@@ -373,36 +307,7 @@ private class MomentsKeywordBlockRuntime(
         if (profileListHookInstalled) return true
         val method = locateProfileListBindMethod() ?: return false
         return runCatching {
-            HookRegistry.get().hook(KavaReflector.accessible(method) ?: method, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    val view = param.args.getOrNull(1) as? View
-                    if (!filterSnapshot.isActive(filterByAuthor = false)) {
-                        view?.let(::clearViewBinding)
-                        return
-                    }
-                    val info = profileListInfo(param) ?: run {
-                        view?.let(::clearViewBinding)
-                        return
-                    }
-                    param.setObjectExtra(BIND_INFO_EXTRA, info)
-                    view?.let { view ->
-                        prepareViewBinding(view, info, filterByAuthor = false)
-                    }
-                }
-
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    val view = param.result as? View ?: return
-                    if (!filterSnapshot.isActive(filterByAuthor = false)) {
-                        clearViewBinding(view)
-                        return
-                    }
-                    val info = param.getObjectExtra(BIND_INFO_EXTRA) ?: profileListInfo(param) ?: run {
-                        clearViewBinding(view)
-                        return
-                    }
-                    bindView(view, info, filterByAuthor = false)
-                }
-            })
+            HookRegistry.get().hook(KavaReflector.accessible(method) ?: method, ProfileListBindHooker(this))
             profileListHookInstalled = true
             true
         }.getOrElse {
@@ -420,11 +325,7 @@ private class MomentsKeywordBlockRuntime(
         }
         val method = locateFlutterProfileSwitchMethod() ?: return false
         return runCatching {
-            HookRegistry.get().hook(KavaReflector.accessible(method) ?: method, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    if (activeKeywords().isNotEmpty()) param.setResult(false)
-                }
-            })
+            HookRegistry.get().hook(KavaReflector.accessible(method) ?: method, KeywordProfileSwitchHooker(this))
             profileSwitchHookInstalled = true
             true
         }.getOrElse {
@@ -655,9 +556,9 @@ private class MomentsKeywordBlockRuntime(
         )
     }
 
-    private fun profileListInfo(param: XC_MethodHook.MethodHookParam): Any? {
-        val adapter = param.thisObject as? Adapter ?: return null
-        val position = (param.args.getOrNull(0) as? Number)?.toInt() ?: return null
+    private fun profileListInfo(receiver: Any?, args: Array<Any?>): Any? {
+        val adapter = receiver as? Adapter ?: return null
+        val position = (args.getOrNull(0) as? Number)?.toInt() ?: return null
         return runCatching { adapter.getItem(position) }.getOrNull()
     }
 
@@ -1179,7 +1080,7 @@ private class MomentsKeywordBlockRuntime(
     }
 
     companion object {
-        private const val BIND_INFO_EXTRA = "hchat_moments_filter_bind_info"
+
         private const val SELF_RESOLVE_RETRY_MS = 2_000L
         private const val CACHE_PREFS = "Hchat_moments_keyword_block_method_cache"
         private const val CACHE_LEGACY_TIMELINE_CREATE_VIEW = "legacy_timeline_create_view"
@@ -1227,4 +1128,138 @@ private class MomentsKeywordBlockRuntime(
             types[1].componentType == String::class.java &&
             method.declaringClass.name.startsWith(SNS_STORAGE_PACKAGE)
     }
+
+    private class TimelineSqlHooker(private val owner: MomentsKeywordBlockRuntime) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val args = chain.args.toTypedArray()
+            val receiver = chain.thisObject
+            with(owner) {
+            run patch@{
+                val sql = args.getOrNull(0) as? String ?: return@patch
+                val rewritten = rewriteTimelineQuery(sql)
+                if (rewritten != sql) args[0] = rewritten
+            }
+            return chain.proceed(args)
+            }
+        }
+    }
+
+    private class LegacyTimelineBindHooker(private val owner: MomentsKeywordBlockRuntime) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val args = chain.args.toTypedArray()
+            val receiver = chain.thisObject
+            with(owner) {
+                var preparedInfo: Any? = null
+                run prepare@{
+                    val view = args.getOrNull(3) as? View
+                    if (!filterSnapshot.isActive(filterByAuthor = true)) {
+                        view?.let(::clearViewBinding)
+                        return@prepare
+                    }
+                    val info = args.getOrNull(0) ?: run {
+                        view?.let(::clearViewBinding)
+                        return@prepare
+                    }
+                    preparedInfo = info
+                    view?.let { prepareViewBinding(it, info, filterByAuthor = true) }
+                }
+                val result = chain.proceed()
+                val view = result as? View ?: return result
+                if (!filterSnapshot.isActive(filterByAuthor = true)) {
+                    clearViewBinding(view)
+                    return result
+                }
+                val info = preparedInfo ?: args.getOrNull(0) ?: run {
+                    clearViewBinding(view)
+                    return result
+                }
+                bindView(view, info, filterByAuthor = true)
+                return result
+            }
+        }
+    }
+
+    private class ImproveTimelineBindHooker(private val owner: MomentsKeywordBlockRuntime) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val args = chain.args.toTypedArray()
+            val receiver = chain.thisObject
+            with(owner) {
+                var preparedInfo: Any? = null
+                run prepare@{
+                    val view = receiver as? View
+                    if (!filterSnapshot.isActive(filterByAuthor = true)) {
+                        view?.let(::clearViewBinding)
+                        return@prepare
+                    }
+                    val info = resolveImproveSnsInfo(args.getOrNull(1)) ?: run {
+                        view?.let(::clearViewBinding)
+                        return@prepare
+                    }
+                    preparedInfo = info
+                    view?.let { prepareViewBinding(it, info, filterByAuthor = true) }
+                }
+                val result = chain.proceed()
+                val view = receiver as? View ?: return result
+                if (!filterSnapshot.isActive(filterByAuthor = true)) {
+                    clearViewBinding(view)
+                    return result
+                }
+                val info = preparedInfo ?: resolveImproveSnsInfo(args.getOrNull(1)) ?: run {
+                    clearViewBinding(view)
+                    return result
+                }
+                bindView(view, info, filterByAuthor = true)
+                return result
+            }
+        }
+    }
+
+    private class ProfileListBindHooker(private val owner: MomentsKeywordBlockRuntime) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val args = chain.args.toTypedArray()
+            val receiver = chain.thisObject
+            with(owner) {
+                var preparedInfo: Any? = null
+                run prepare@{
+                    val view = args.getOrNull(1) as? View
+                    if (!filterSnapshot.isActive(filterByAuthor = false)) {
+                        view?.let(::clearViewBinding)
+                        return@prepare
+                    }
+                    val info = profileListInfo(receiver, args) ?: run {
+                        view?.let(::clearViewBinding)
+                        return@prepare
+                    }
+                    preparedInfo = info
+                    view?.let { prepareViewBinding(it, info, filterByAuthor = false) }
+                }
+                val result = chain.proceed()
+                val view = result as? View ?: return result
+                if (!filterSnapshot.isActive(filterByAuthor = false)) {
+                    clearViewBinding(view)
+                    return result
+                }
+                val info = preparedInfo ?: profileListInfo(receiver, args) ?: run {
+                    clearViewBinding(view)
+                    return result
+                }
+                bindView(view, info, filterByAuthor = false)
+                return result
+            }
+        }
+    }
+
+    private class KeywordProfileSwitchHooker(private val owner: MomentsKeywordBlockRuntime) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val args = chain.args.toTypedArray()
+            val receiver = chain.thisObject
+            with(owner) {
+            run patch@{
+                if (activeKeywords().isNotEmpty()) return false
+            }
+            return chain.proceed(args)
+            }
+        }
+    }
+
 }

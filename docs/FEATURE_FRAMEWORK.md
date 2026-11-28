@@ -1,5 +1,13 @@
 # Hchat 功能框架
 
+## 6.7.7.39 红包领取灰字保护
+
+红包卡片下方的领取灰字由微信原生开包回调读取 SystemMsgContext 后同步插入 type=10000，不是回写卡片 XML。公共 API 现动态验证普通/Union 回调→专用灰字 helper→真实存储插入调用链，登记新提示的账号、会话、完整正文、原始时间和本地 msgId，使界面净化保留它；不补插消息，不改变文案、详情链接、时间或金额回调顺序。手动与静默领取共用入口，不依赖自动抢红包开关；历史未登记行及未证实同一路径的服务端“别人领我的红包”提示不冒称已覆盖。保留 6.7.7.38 表情和防撤回修复。完整证据与设备边界见 [红包领取灰字修复](RED_PACKET_NOTICE_FIX_6_7_7_39.md)。
+
+## 6.7.7.37 日志复核与原生聊天菜单勘误
+
+微信 8.0.76/80 已确认聊天长按菜单直接使用 viewitems 创建/选择回调，创建首参实现 ContextMenu；此前首参为聊天上下文、应改挂 presenter 的判断错误。SingleMessageMenuLocator 已恢复按日志锚点与接口形状定位，AddEmoji 复用同一路径，错误替代定位器已删除。菜单美化在已验证的同步打开入口建立同线程作用域，不再使用全局 performLongClick、两秒时间窗或可点击子项猜测；重复打开从原始宽度和 padding 计算并可恢复。AddMsg 新增 account/parse/message_post/red_packet_post 分段及稳定 owner 慢监听器诊断，保持同步顺序；仅有一次启动慢日志不能证明所有消息都延迟。6.7.7.38 已改为仅豁免通过真实 storage msgId 及账号、会话、原始毫秒时间、完整内容 SHA-256 精确登记的模块防撤回提示；其它 type=10000 仍按开关隐藏。表情收藏改用 EmojiInfo 原生路径、最终 storage update 通知、fresh 回读及 custom payload=1。逆向依据与未验证边界见 [6.7.7.38 修复记录](EMOJI_RECALL_FIX_6_7_7_38.md)。此前菜单与消息耗时细节见 [6.7.7.37 日志复核](LOG_REVIEW_6_7_7_37.md)。
+
 ## 协作与发布规则
 
 - 提交信息、推送说明、Release notes 和工作流说明统一使用中文。
@@ -470,13 +478,6 @@ String avatar = getAvatarUrl("wxid_xxx", true);
 - 表情文件路径是「表情根目录 + md5」（微信 `EmojiInfo.getPath()` 在 groupId 为空时同此拼法）；根目录经 `content://<包名>.storage.provider.emotion/` 的 `getAccPath` 取得，`EmojiInfo` 经同 provider 的 `createEmojiInfo(md5, catalog, type, size)` 创建。`getEmojiByMd5` 显示已存在且 catalog 为 `0x51` 时直接提示已在表情库，不重复插入；落库后再用一次 `EmojiInfo.getPath()` 校正路径，目录不同时补写一份。
 - md5 是 EmojiInfo 表主键，同一张图不可能有两行：落库前先按 md5 查一次，若已存在且 catalog 不是  x51（例如之前当消息表情发过、或属于某个表情包），**复用那一行**改 catalog 再 update，而不是新建插入，否则插入会撞主键、复用失败时也不能删文件（可能被其它表情包或消息引用）。另外必须先做尺寸压缩、再按**最终字节**算 md5 —— 表情文件名就是 md5，先算原图 md5 再写缩过的内容会让文件名和内容对不上。超出 512px 或 900KB 的静态图等比缩放并重编码为 PNG（GIF 不重编码，避免丢动画），否则微信侧会按「over max size」拒绝。
 - `EmojiInfoStorage`、`saveEmojiInfo`、`getCustomEmojiMaxIndex` 的类名与方法名均为混淆，一律按方法体内唯一字符串在 DexKit 定位并写 `Hchat_emoji_collection_method_cache` 缓存；存储实例按结构定位（先找「无参、返回存储类」的 getter 拿到 StorageManager，再在该类里找「静态、无参、返回自身」的实例方法），失败才退回插件服务定位器。读文件、算 md5、写表情目录、落库全部在后台线程完成，结果回主线程 toast。
-群聊管理员标签显示：
-
-- `群聊管理员标签显示`（featureId `group_admin_label`）属于实用功能，设置页放在 `群组` 分组，二级页是三个独立开关：`群主标签`、`管理员标签`、`部分真名标签`，默认全部关闭。标签只出现在**群聊**聊天界面，排在成员昵称之前；单聊和自己发的消息都不加标签。
-- 数据全部来自模块已有能力，不新增逆向：群主取 `WeChatChatroomApi.getOwner(roomId)`（`chatroom.roomowner`）；管理员取 `getMemberRole(roomId, sender) == ROLE_ADMIN`（成员 `roomFlag` 的 `0x800` 位）；部分真名取 `RealNameTailStore.displayTail(sender)`（「实名尾字」已缓存的脱敏真名，如 `张*`）。
-- 渲染复用 `ChatNameDecorationLayout` 新增的 prefix 槽位：前缀标签渲染在「头衔」和昵称本体之前，和「实名尾字」的尾字（昵称之后）、「群昵称颜色」共用同一个装饰行，互不覆盖。每次昵称绑定都必须重设 prefix（不能只比较标签文本跳过）：列表复用时微信会先 `setText` 把前缀冲掉，而 state 里的标签还在，只比较文本会把这一次合成误判成「无变化」。
-- 昵称绑定点按字符串 `fillingUsername:need getKfInfo` 在 DexKit 定位并缓存（`Hchat_chat_username_bind_cache`）。该类名与方法名逐版本变化（8.0.76 是 `viewitems/a0;->o`，8.0.80 是 `viewitems/b0;->p`），日志串不变，所以不写死短名；holder 的昵称控件是 `userTV`（8.0.76 / 8.0.80 均确认存在）。
-- 与「成员头衔」功能去重：若「成员头衔」已启用且该角色配了非空头衔，本功能不再叠同名标签，避免出现「群主 群主 昵称」；部分真名标签不受此限制。
 消息入场动效：
 
 - `消息入场动效`（featureId `chat_message_enter_animation`）属于实用功能，设置页放在 `美化` 分组，默认关闭。开启后聊天列表新建的消息 View 以「缩放 0.90 → 1 + 位移 8dp → 0 + alpha 0 → 1」、200ms、`OvershootInterpolator(1.15)` 入场。  安装结果统一走 HLog.boot 缓冲而不是普通日志：功能在启动期安装，用户通常过几秒才打开日志采集，普通日志此时会被丢弃，boot 缓冲会在采集开启后补写，否则永远看不到「挂上了没」。
@@ -1578,6 +1579,8 @@ sFastMyWxid
 - 微信升级、降级或热更新后的首次启动，`chatroom` 表可能短时间未就绪；字段探测和 `roomdata` 空结果不能永久缓存。头衔不应按消息逐条轮询身份数据，应订阅 `chatroom` 表变更，等 `roomowner` 或 `roomdata` 真正更新后刷新当前群可见头衔。
 
 ## 防撤回
+
+撤回提示位置（6.7.7.35）：只按同一会话和服务端消息 ID 定位原记录，优先使用原表的精确毫秒时间，再以原时间 + 1ms 调用 `insertSystemMessageAt`。系统消息 Listener 会调用另一个类中的 MsgInfoStorageLogic 时间函数；该函数按“会话末条时间 + 1”钳制普通插入时间。定位须用该函数的时间修正日志锚点与 Listener 的直接调用集合交叉验证，不能在 Listener 自身枚举同签名方法。时间定位缓存独立升级为版本 2。指定时间仅在同步插入的线程/会话作用域生效，嵌套和异常后恢复；查不到原消息或覆盖入口时明确记录失败，不再退回会话末尾。两条消息同毫秒或仅差 1ms 的严格相邻次序不由本次修复保证。逆向链与回归范围见 [防撤回提示位置修复](ANTI_RECALL_NOTICE_FIX.md)。
 
 防撤回提示模板支持 `{name}`、`{content}`、`{sendTime}` 和 `{recallTime}`，设置页分别显示为撤回者、文字内容、发送时间和撤回时间。发送时间取被撤回原消息的创建时间；撤回时间优先取微信撤回事件的服务端时间，无法解析时回退到本机收到事件的时间。模板包含任一时间变量时显示共用的时间格式输入，默认 `yyyy-MM-dd HH:mm:ss`；保存前按 `SimpleDateFormat` 校验，运行时遇到旧配置或异常格式则回退默认格式。
 

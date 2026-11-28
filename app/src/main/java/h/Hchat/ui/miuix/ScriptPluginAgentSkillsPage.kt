@@ -32,8 +32,9 @@ import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import de.robv.android.xposed.XC_MethodHook
-import de.robv.android.xposed.XposedBridge
+import h.Hchat.hooks.core.HookRegistry
+import io.github.libxposed.api.XposedInterface.Chain
+import io.github.libxposed.api.XposedInterface.Hooker
 import h.Hchat.hooks.items.script.agent.ScriptPluginAgentSkills
 import h.Hchat.utils.HLog
 import java.lang.ref.WeakReference
@@ -419,25 +420,33 @@ private object SkillDocumentPicker {
         return { synchronized(this) { if (pending === request) pending = null } }
     }
 
+    private class ActivityResultHook : Hooker {
+        override fun intercept(chain: Chain): Any? {
+            val original = chain.proceed()
+            try {
+                if (chain.args.getOrNull(0) != REQUEST_CODE) return original
+                val request = synchronized(SkillDocumentPicker) {
+                    pending?.takeIf { it.owner.get() === chain.thisObject }?.also { pending = null }
+                } ?: return original
+                if (chain.args.getOrNull(1) != Activity.RESULT_OK) {
+                    request.callback(Result.success(null))
+                    return original
+                }
+                val data = chain.args.getOrNull(2) as? Intent
+                val uri = data?.data ?: data?.clipData?.let { if (it.itemCount > 0) it.getItemAt(0).uri else null }
+                request.callback(if (uri == null) Result.failure(IllegalStateException("未取得所选文件")) else Result.success(uri))
+            } catch (error: Throwable) {
+                h.Hchat.utils.HLog.e("[Hchat:SkillDocumentPicker] 处理文件选择结果失败", error)
+            }
+            return original
+        }
+    }
+
     @Synchronized
     private fun hook(clazz: Class<*>): Boolean {
         if (clazz in hookedClasses) return true
         return try {
-            val hooks = XposedBridge.hookAllMethods(clazz, "onActivityResult", object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    if (param.args.getOrNull(0) != REQUEST_CODE) return
-                    val request = synchronized(this@SkillDocumentPicker) {
-                        pending?.takeIf { it.owner.get() === param.thisObject }?.also { pending = null }
-                    } ?: return
-                    if (param.args.getOrNull(1) != Activity.RESULT_OK) {
-                        request.callback(Result.success(null))
-                        return
-                    }
-                    val data = param.args.getOrNull(2) as? Intent
-                    val uri = data?.data ?: data?.clipData?.let { if (it.itemCount > 0) it.getItemAt(0).uri else null }
-                    request.callback(if (uri == null) Result.failure(IllegalStateException("未取得所选文件")) else Result.success(uri))
-                }
-            })
+            val hooks = HookRegistry.get().hookAllMethods(clazz, "onActivityResult", ActivityResultHook())
             if (hooks.isEmpty()) false else {
                 hookedClasses += clazz
                 true

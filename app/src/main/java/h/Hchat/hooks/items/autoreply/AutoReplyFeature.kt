@@ -22,7 +22,7 @@ class AutoReplyFeature : BaseFeature() {
             if (observe == null) {
                 HLog.e("$TAG 消息观察 API 未就绪")
             } else {
-                trackSubscription(observe.subscribe { message ->
+                trackSubscription(observe.subscribe(ID) { message ->
                     AutoReplyRuntime.handleMessage(context.hostContext(), message)
                 })
             }

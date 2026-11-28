@@ -6,8 +6,8 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.view.View
-import de.robv.android.xposed.XC_MethodHook
-import de.robv.android.xposed.XposedBridge
+import io.github.libxposed.api.XposedInterface
+import h.Hchat.utils.HLog
 import h.Hchat.dexkit.DexMethodCache
 import h.Hchat.hooks.api.core.WeChatApis
 import h.Hchat.hooks.api.sns.SnsContextMenuTarget
@@ -282,7 +282,7 @@ internal class MomentsFakeForwardRuntime(
 
     private fun trace(message: String) {
         if (!debugLoggingEnabled()) return
-        XposedBridge.log("$TAG $message")
+        HLog.e("$TAG $message")
     }
 
     private fun debugLoggingEnabled(): Boolean = prefs.getBoolean(
@@ -467,11 +467,7 @@ internal class MomentsFakeForwardRuntime(
         }.onFailure { logger("朋友圈 Improve 分页诊断入口定位失败", it) }.getOrNull() ?: return false
         DexMethodCache.save(cachePrefs, runtimeKey, CACHE_IMPROVE_PAGE_QUERY, method)
         return runCatching {
-            HookRegistry.get().hook(KavaReflector.accessible(method) ?: method, object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    logImprovePageDiagnostic(param)
-                }
-            })
+            HookRegistry.get().hook(KavaReflector.accessible(method) ?: method, ImprovePageDiagnosticHooker(this))
             improvePageDiagnosticInstalled = true
             true
         }.onFailure { logger("朋友圈 Improve 分页诊断安装失败", it) }.getOrDefault(false)
@@ -482,7 +478,7 @@ internal class MomentsFakeForwardRuntime(
             method.parameterTypes.size == 1 && List::class.java.isAssignableFrom(method.returnType)
     }
 
-    private fun logImprovePageDiagnostic(param: XC_MethodHook.MethodHookParam) {
+    private fun logImprovePageDiagnostic(args: Array<Any?>, resultValue: Any?) {
         if (!debugLoggingEnabled()) return
         if (SystemClock.elapsedRealtime() > diagnosticUntilElapsed) return
         val registered = prefs.getStringSet(
@@ -491,8 +487,8 @@ internal class MomentsFakeForwardRuntime(
         ).orEmpty().take(MAX_DIAGNOSTIC_REGISTERED_ITEMS).toSet()
         val watched = registered + recentlyClearedIds
         if (watched.isEmpty()) return
-        val requestStrings = collectNestedStrings(param.args.firstOrNull(), 2)
-        val result = param.result as? List<*> ?: emptyList<Any>()
+        val requestStrings = collectNestedStrings(args.firstOrNull(), 2)
+        val result = resultValue as? List<*> ?: emptyList<Any>()
         var registeredHits = 0
         var clearedHits = 0
         result.take(MAX_DIAGNOSTIC_PAGE_ITEMS).forEach { item ->
@@ -786,14 +782,7 @@ internal class MomentsFakeForwardRuntime(
         if (timelineAdapterTrackerInstalled) return true
         if (!isTimelineLocalReloadMethod(method)) return false
         return runCatching {
-            HookRegistry.get().hook(KavaReflector.accessible(method) ?: method, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    val adapter = param.thisObject ?: return
-                    if (method.declaringClass.isInstance(adapter)) {
-                        timelineAdapterRef = WeakReference(adapter)
-                    }
-                }
-            })
+            HookRegistry.get().hook(KavaReflector.accessible(method) ?: method, TimelineAdapterTrackerHooker(this, method))
             timelineAdapterTrackerInstalled = true
             trace("朋友圈本地 Cursor Adapter 跟踪已安装: ${method.declaringClass.name}#${method.name}")
             true
@@ -814,24 +803,7 @@ internal class MomentsFakeForwardRuntime(
         ) ?: return false
         if (method.returnType != Void.TYPE || Modifier.isStatic(method.modifiers)) return false
         return runCatching {
-            HookRegistry.get().hook(KavaReflector.accessible(method) ?: method, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    val rawId = KavaReflector.readField(param.thisObject, "field_snsId") ?: return
-                    val id = normalizeId(rawId.toString()) ?: return
-                    if (!isFakeId(id)) return
-                    val requested = (param.args.getOrNull(0) as? Number)?.toInt() ?: return
-                    val effective = requested and TIMELINE_SOURCE_TYPE.inv()
-                    trace(
-                        "拦截伪转发 sourceType 清除: requested=$requested effective=$effective " +
-                            "protectedBits=$TIMELINE_SOURCE_TYPE"
-                    )
-                    if (effective == 0) {
-                        param.setResult(null)
-                    } else {
-                        param.args[0] = effective
-                    }
-                }
-            })
+            HookRegistry.get().hook(KavaReflector.accessible(method) ?: method, SourceTypeGuardHooker(this))
             sourceTypeGuardInstalled = true
             true
         }.onFailure { logger("朋友圈伪转发 sourceType 保护安装失败", it) }.getOrDefault(false)
@@ -876,27 +848,7 @@ internal class MomentsFakeForwardRuntime(
         }.getOrNull() ?: return false
         DexMethodCache.save(cachePrefs, runtimeKey, CACHE_DELETE_CALLBACK, method)
         return runCatching {
-            HookRegistry.get().hook(KavaReflector.accessible(method) ?: method, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    val id = findTaggedId(param.thisObject) ?: return
-                    if (!isFakeId(id)) return
-                    val info = WeChatApis.snsApi()?.cachedNativeSnsInfo(id) ?: return
-                    KavaReflector.invokeMethod(info, "setItemDie")
-                    if (WeChatApis.snsApi()?.updateCachedNativeSnsInfo(info) == true) {
-                        removeFakeId(id)
-                        return
-                    }
-                    // Never let a failed local mark fall through to WeChat's server-delete branch.
-                    param.setResult(null)
-                    val numericId = runCatching { java.lang.Long.parseUnsignedLong(id) }.getOrNull()
-                    if (numericId != null && WeChatApis.snsApi()?.deleteCachedNativeSnsInfo(numericId) == true) {
-                        removeFakeId(id)
-                        WeChatApis.snsApi()?.refreshTimeline()
-                    } else {
-                        logger("朋友圈伪转发本地删除失败，已阻止服务端删除", null)
-                    }
-                }
-            })
+            HookRegistry.get().hook(KavaReflector.accessible(method) ?: method, LocalDeleteGuardHooker(this))
             deleteGuardInstalled = true
             true
         }.onFailure { logger("朋友圈伪转发本地删除保护安装失败", it) }.getOrDefault(false)
@@ -951,21 +903,13 @@ internal class MomentsFakeForwardRuntime(
         queryPredicateMethod = predicate
         if (!userQueryDiagnosticInstalled) {
             userQueryDiagnosticInstalled = runCatching {
-                HookRegistry.get().hook(KavaReflector.accessible(method) ?: method, object : XC_MethodHook() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        logUserQueryDiagnostic(param)
-                    }
-                })
+                HookRegistry.get().hook(KavaReflector.accessible(method) ?: method, UserQueryDiagnosticHooker(this))
                 true
             }.onFailure { logger("朋友圈伪转发个人页查询诊断安装失败", it) }.getOrDefault(false)
         }
         if (!timelineQueryDiagnosticInstalled) {
             timelineQueryDiagnosticInstalled = runCatching {
-                HookRegistry.get().hook(KavaReflector.accessible(timeline) ?: timeline, object : XC_MethodHook() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        logTimelineQueryDiagnostic(param)
-                    }
-                })
+                HookRegistry.get().hook(KavaReflector.accessible(timeline) ?: timeline, TimelineQueryDiagnosticHooker(this))
                 true
             }.onFailure { logger("朋友圈伪转发发现页查询诊断安装失败", it) }.getOrDefault(false)
         }
@@ -1001,26 +945,26 @@ internal class MomentsFakeForwardRuntime(
             method.parameterTypes[0].name == "com.tencent.mm.sdk.event.IEvent"
     }
 
-    private fun logUserQueryDiagnostic(param: XC_MethodHook.MethodHookParam) {
+    private fun logUserQueryDiagnostic(receiver: Any?, args: Array<Any?>, resultValue: Any?) {
         if (!debugLoggingEnabled()) return
-        val limit = (param.args.getOrNull(2) as? Number)?.toInt() ?: return
+        val limit = (args.getOrNull(2) as? Number)?.toInt() ?: return
         if (limit == VERIFY_QUERY_LIMIT) return
-        val boundary = (param.args.getOrNull(4) as? String).orEmpty()
+        val boundary = (args.getOrNull(4) as? String).orEmpty()
         val ids = prefs.getStringSet(
             MomentsFakeInteractionSettings.KEY_FAKE_FORWARD_IDS,
             emptySet()
         ).orEmpty()
         if (ids.isEmpty()) return
-        val userName = (param.args.getOrNull(1) as? String).orEmpty()
+        val userName = (args.getOrNull(1) as? String).orEmpty()
         val self = WeChatApis.users()?.selfWxId().orEmpty()
         val page = when {
-            param.args.getOrNull(3) == true -> "self"
+            args.getOrNull(3) == true -> "self"
             userName.isBlank() -> "discover"
             self.isNotBlank() && userName == self -> "self-nonflag"
             else -> "other"
         }
-        val firstFlag = param.args.getOrNull(0) == true
-        val selfFlag = param.args.getOrNull(3) == true
+        val firstFlag = args.getOrNull(0) == true
+        val selfFlag = args.getOrNull(3) == true
         val selfUser = self.isNotBlank() && userName == self
         val caller = diagnosticCaller()
         val queryKey = listOf(
@@ -1031,19 +975,19 @@ internal class MomentsFakeForwardRuntime(
             caller,
             boundary.hashCode(),
             limit,
-            param.args.getOrNull(5),
-            param.args.getOrNull(6),
+            args.getOrNull(5),
+            args.getOrNull(6),
             ids.hashCode()
         ).joinToString(":")
         if (!loggedQueryDiagnostics.add(queryKey)) return
         val predicateMethod = queryPredicateMethod
         val predicate = if (boundary.isBlank() || predicateMethod == null ||
-            !predicateMethod.declaringClass.isInstance(param.thisObject)
+            !predicateMethod.declaringClass.isInstance(receiver)
         ) {
             ""
         } else {
             runCatching {
-                KavaReflector.invokeOrThrow(predicateMethod, param.thisObject, boundary) as? String
+                KavaReflector.invokeOrThrow(predicateMethod, receiver, boundary) as? String
             }.getOrNull().orEmpty()
         }
         val stringMode = predicate.contains("stringSeq >=")
@@ -1070,12 +1014,12 @@ internal class MomentsFakeForwardRuntime(
             }
             if (matches) passed++
         }
-        val cursorResult = scanDiagnosticCursor(param.result as? Cursor, ids)
+        val cursorResult = scanDiagnosticCursor(resultValue as? Cursor, ids)
         trace(
             "真实列表查询: page=$page firstFlag=$firstFlag selfFlag=$selfFlag selfUser=$selfUser caller=$caller " +
                 "mode=${if (boundary.isBlank()) "none" else if (stringMode) "stringSeq" else "snsId"} " +
                 "boundaryLen=${boundary.length} limit=$limit " +
-                "timeRange=${param.args.getOrNull(5)}..${param.args.getOrNull(6)} " +
+                "timeRange=${args.getOrNull(5)}..${args.getOrNull(6)} " +
                 "registered=${ids.size} readable=$readable predicatePassed=$passed " +
                 "cursorCount=${cursorResult.count} cursorScanned=${cursorResult.scanned} cursorHits=${cursorResult.hits} " +
                 "cursorTruncated=${cursorResult.count > cursorResult.scanned && cursorResult.scanned >= 0} " +
@@ -1084,14 +1028,14 @@ internal class MomentsFakeForwardRuntime(
         logRegisteredState("query:$page:$caller")
     }
 
-    private fun logTimelineQueryDiagnostic(param: XC_MethodHook.MethodHookParam) {
+    private fun logTimelineQueryDiagnostic(args: Array<Any?>) {
         if (!debugLoggingEnabled()) return
         val ids = prefs.getStringSet(
             MomentsFakeInteractionSettings.KEY_FAKE_FORWARD_IDS,
             emptySet()
         ).orEmpty()
         if (ids.isEmpty()) return
-        val event = param.args.firstOrNull() ?: return
+        val event = args.firstOrNull() ?: return
         val boundary = findNestedDiagnosticValue(event, String::class.java).orEmpty()
         val cursor = findNestedDiagnosticValue(event, Cursor::class.java)
         val queryKey = "discover:${boundary.hashCode()}:${ids.hashCode()}"
@@ -1223,4 +1167,96 @@ internal class MomentsFakeForwardRuntime(
         private const val CACHE_IMPROVE_PAGE_QUERY = "fake_forward_improve_page_query_v1"
         private const val IMPROVE_MVVM_LIST_CLASS = "com.tencent.mm.plugin.mvvmlist.MvvmList"
     }
+
+    private class ImprovePageDiagnosticHooker(private val owner: MomentsFakeForwardRuntime) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val result = chain.proceed()
+            owner.logImprovePageDiagnostic(chain.args.toTypedArray(), result)
+            return result
+        }
+    }
+
+    private class TimelineAdapterTrackerHooker(private val owner: MomentsFakeForwardRuntime, private val method: Method) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val args = chain.args.toTypedArray()
+            val receiver = chain.thisObject
+            with(owner) {
+            run patch@{
+                val adapter = receiver ?: return@patch
+                if (method.declaringClass.isInstance(adapter)) {
+                    timelineAdapterRef = WeakReference(adapter)
+                }
+            }
+            return chain.proceed(args)
+            }
+        }
+    }
+
+    private class SourceTypeGuardHooker(private val owner: MomentsFakeForwardRuntime) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val args = chain.args.toTypedArray()
+            val receiver = chain.thisObject
+            with(owner) {
+            run patch@{
+                val rawId = KavaReflector.readField(receiver, "field_snsId") ?: return@patch
+                val id = normalizeId(rawId.toString()) ?: return@patch
+                if (!isFakeId(id)) return@patch
+                val requested = (args.getOrNull(0) as? Number)?.toInt() ?: return@patch
+                val effective = requested and TIMELINE_SOURCE_TYPE.inv()
+                trace(
+                    "拦截伪转发 sourceType 清除: requested=$requested effective=$effective " +
+                        "protectedBits=$TIMELINE_SOURCE_TYPE"
+                )
+                if (effective == 0) {
+                    return null
+                } else {
+                    args[0] = effective
+                }
+            }
+            return chain.proceed(args)
+            }
+        }
+    }
+
+    private class LocalDeleteGuardHooker(private val owner: MomentsFakeForwardRuntime) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val receiver = chain.thisObject
+            with(owner) {
+                val id = findTaggedId(receiver) ?: return chain.proceed()
+                if (!isFakeId(id)) return chain.proceed()
+                val info = WeChatApis.snsApi()?.cachedNativeSnsInfo(id) ?: return chain.proceed()
+                KavaReflector.invokeMethod(info, "setItemDie")
+                if (WeChatApis.snsApi()?.updateCachedNativeSnsInfo(info) == true) {
+                    removeFakeId(id)
+                    return chain.proceed()
+                }
+                // A failed local mark must not enter WeChat's server-delete branch.
+                val numericId = runCatching { java.lang.Long.parseUnsignedLong(id) }.getOrNull()
+                if (numericId != null && WeChatApis.snsApi()?.deleteCachedNativeSnsInfo(numericId) == true) {
+                    removeFakeId(id)
+                    WeChatApis.snsApi()?.refreshTimeline()
+                } else {
+                    logger("朋友圈伪转发本地删除失败，已阻止服务端删除", null)
+                }
+                return null
+            }
+        }
+    }
+
+    private class UserQueryDiagnosticHooker(private val owner: MomentsFakeForwardRuntime) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val result = chain.proceed()
+            owner.logUserQueryDiagnostic(chain.thisObject, chain.args.toTypedArray(), result)
+            return result
+        }
+    }
+
+    private class TimelineQueryDiagnosticHooker(private val owner: MomentsFakeForwardRuntime) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val result = chain.proceed()
+            owner.logTimelineQueryDiagnostic(chain.args.toTypedArray())
+            return result
+        }
+    }
+
 }

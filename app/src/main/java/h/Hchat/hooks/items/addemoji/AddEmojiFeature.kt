@@ -3,10 +3,10 @@ package h.Hchat.hooks.items.addemoji
 import android.app.Activity
 import android.view.MenuItem
 import android.view.View
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.event.Events
 import h.Hchat.hooks.api.core.WeChatApis
-import h.Hchat.hooks.api.message.ChatPresenterMenuLocator
+import h.Hchat.hooks.api.message.SingleMessageMenuLocator
 import h.Hchat.hooks.api.model.WeChatMessageTypes
 import h.Hchat.hooks.api.sns.SnsContentTypes
 import h.Hchat.hooks.api.sns.SnsContextMenuDispatcher
@@ -33,7 +33,7 @@ import java.util.concurrent.ConcurrentHashMap
  * `EmojiAddCustomDialogUI.save` 的序列走（catalog=0x51 + 排序位 + `EmojiInfoStorage` 落库）。
  *
  * 两处入口：
- * - 聊天：`ChatPresenterMenuLocator`（presenter 的 `onCreateContextMenu`，args[0] 才是菜单本体）
+ * - 聊天：`SingleMessageMenuLocator`（微信原生 viewitems 创建/点击回调，首参实现 ContextMenu）
  * - 朋友圈：`SnsContextMenuDispatcher`（和「转发[H]」同一套菜单注册表）
  */
 class AddEmojiFeature : BaseFeature() {
@@ -89,8 +89,8 @@ private class AddEmojiRuntime(
     private val writer = EmojiCollectionWriter(context, logger)
     private val hookedMethods = Collections.newSetFromMap(ConcurrentHashMap<Method, Boolean>())
     private val bindings = Collections.synchronizedMap(WeakHashMap<MenuItem, Any>())
-    /** 每个 tag 类的「消息 getter」缓存，null 表示这个类没有。 */
-    private val messageGetterCache = ConcurrentHashMap<String, Method?>()
+    /** 每个 tag 类的消息 getter 缓存；同步 HashMap 允许保存 null 负结果。 */
+    private val messageGetterCache = Collections.synchronizedMap(HashMap<String, Method?>())
     /** 诊断三类结果各记一次，便于从日志定位卡点。 */
     private val diagnostics = Collections.synchronizedSet(HashSet<String>())
     private val enabled = HotConfig.flag(
@@ -142,31 +142,21 @@ private class AddEmojiRuntime(
     // ------------------------------------------------------------------ 聊天
 
     private fun installChatMenu(): Boolean {
-        // 8.0.80 上必须用 presenter 的 onCreateContextMenu(ContextMenu, View, Info)：
-        // 它的 args[0] 才是菜单本体。老入口 viewitems#a 的 args[0] 是聊天上下文，
-        // 往它上面 add 菜单项等于什么都没做 —— 这就是菜单项从不出现的原因。
-        val createHooked = ChatPresenterMenuLocator.createMethods(context, logger).count { method ->
-            hook(method, object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    addChatMenu(param)
-                }
-            })
+        // 8.0.76/80 已验证 MMPopupMenu 同步调用 viewitems 的原生创建/选择回调。
+        // 首参是 ContextMenu 的具体实现，不能因为其类名混淆就绕开该入口。
+        val createHooked = SingleMessageMenuLocator.menuCreateMethods(context, logger).count { method ->
+            hook(method, MenuCreateHooker(this))
         }
-        val clickHooked = ChatPresenterMenuLocator.clickMethods(context, logger).count { method ->
-            hook(method, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    handleChatClick(param)
-                }
-            })
+        val clickHooked = SingleMessageMenuLocator.menuClickMethods(context, logger).count { method ->
+            hook(method, MenuClickHooker(this))
         }
         if (createHooked <= 0) logger("图片保存为表情菜单创建 Hook 未安装", null)
         if (clickHooked <= 0) logger("图片保存为表情菜单点击 Hook 未安装", null)
         return createHooked > 0 && clickHooked > 0
     }
 
-    private fun addChatMenu(param: XC_MethodHook.MethodHookParam) {
+    private fun addChatMenu(args: Array<Any?>) {
         if (!enabled()) return
-        val args = param.args
         val menu = args.getOrNull(0) ?: return
         val view = args.getOrNull(1) as? View ?: return
         val message = resolveNativeMessage(view.tag) ?: resolveNativeMessage(args)
@@ -189,11 +179,11 @@ private class AddEmojiRuntime(
         if (diagnostics.add(key)) bootLog(message)
     }
 
-    private fun handleChatClick(param: XC_MethodHook.MethodHookParam) {
+    private fun handleChatClick(args: Array<Any?>) {
         if (!enabled()) return
-        val item = param.args.firstNotNullOfOrNull { it as? MenuItem } ?: return
+        val item = args.firstNotNullOfOrNull { it as? MenuItem } ?: return
         if (item.itemId != AddEmojiFeature.MENU_ITEM_ID) return
-        val message = bindings.remove(item) ?: resolveNativeMessage(param.args) ?: return
+        val message = bindings.remove(item) ?: resolveNativeMessage(args) ?: return
         // 解析原图路径可能要把 VFS 内容落到缓存文件，属于 IO，不能留在主线程。
         writer.addImageLazy(WeChatApis.currentActivity()?.currentActivity()) {
             resolveChatImagePath(message)
@@ -256,7 +246,22 @@ private class AddEmojiRuntime(
 
     // ------------------------------------------------------------------ 公共
 
-    private fun hook(method: Method, callback: XC_MethodHook): Boolean {
+    private class MenuCreateHooker(private val runtime: AddEmojiRuntime) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val result = chain.proceed()
+            runtime.addChatMenu(chain.args.toTypedArray())
+            return result
+        }
+    }
+
+    private class MenuClickHooker(private val runtime: AddEmojiRuntime) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            runtime.handleChatClick(chain.args.toTypedArray())
+            return chain.proceed()
+        }
+    }
+
+    private fun hook(method: Method, callback: XposedInterface.Hooker): Boolean {
         if (Modifier.isAbstract(method.modifiers) || method.declaringClass.isInterface) return false
         if (!hookedMethods.add(method)) return true
         return runCatching {
@@ -400,7 +405,7 @@ private class AddEmojiRuntime(
      */
     private fun messageGetter(className: String): Method? {
         if (messageGetterCache.containsKey(className)) return messageGetterCache[className]
-        val clazz = runCatching { Class.forName(className) }.getOrNull() ?: run {
+        val clazz = KavaReflector.loadClass(className, context.hostClassLoader()) ?: run {
             messageGetterCache[className] = null
             return null
         }

@@ -1,7 +1,7 @@
 package h.Hchat.hooks.items.subscribe
 
 import android.content.Context
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.hooks.core.BaseFeature
 import h.Hchat.hooks.core.FeatureContext
 import h.Hchat.hooks.core.HookRegistry
@@ -91,10 +91,8 @@ import java.util.concurrent.atomic.AtomicInteger
  *
  * ## 一个踩过的坑（所有门都必须遵守）
  *
- * XposedBridge 判断"要不要跳过原方法"看的是 `param.returnEarly`，
- * 只有 `param.setResult(x)` 会把它置位；直接写 `param.result = x` 只改了字段，
- * 原方法照样执行、结果被覆盖。上一版全部用的是字段赋值，**日志打了但一点没拦住**，
- * 这正是"每次都有日志、广告一直在"的直接原因。本文件已全部改为 `setResult`。
+ * API 102 中直接返回拦截结果才会跳过后续调用；只有放行时调用 chain.proceed。
+ * 广告门命中后返回 false、空列表或 null，与目标返回类型保持一致。
  *
  * ## 边界
  * - 只丢广告事件，不碰正常消息、feeds 数据、常读账号、朋友圈、小程序。
@@ -380,18 +378,7 @@ class RemoveSubscribeAdsFeature : BaseFeature() {
             var installed = 0
             for (method in methods) {
                 val ok = runCatching {
-                    HookRegistry.get().hook(method, object : XC_MethodHook() {
-                        override fun beforeHookedMethod(param: MethodHookParam) {
-                            if (!enabled()) return
-                            hits.incrementAndGet()
-                            if (pullLogged.compareAndSet(false, true)) {
-                                HLog.boot("$TAG 拦下广告拉取 ${method.name}")
-                            } else {
-                                HLog.event("$TAG 拦下广告拉取 ${method.name}")
-                            }
-                            param.setResult(false)
-                        }
-                    })
+                    HookRegistry.get().hook(method, AdPullGateHooker(enabled, method))
                     true
                 }.onFailure {
                     HLog.e("$TAG hook ${method.name} 失败: ${it.message}", it)
@@ -425,35 +412,7 @@ class RemoveSubscribeAdsFeature : BaseFeature() {
                 return false
             }
             return runCatching {
-                HookRegistry.get().hook(method, object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        if (!enabled()) return
-                        val type = (param.args.getOrNull(0) as? Int) ?: return
-                        if (type != AD_CARD_TYPE) return
-                        // 不能在这里反调原方法做统计：反射 invoke 会再次进入本 Hook 造成
-                        // 无限递归；而且原方法是一次同步 ZIDL 调用，跳过它反而省一次跨语言开销。
-                        dropped.incrementAndGet()
-                        if (cardGateLogged.compareAndSet(false, true)) {
-                            // 首次命中一并带出：①各门挂载结果 ②是谁在要 cardType=1。
-                            // 只有这道门出现在日志里时，这两条信息才决定下一步往哪修：
-                            // 栈里出现 wx.p0 / wx.g2 → 广告卡服务；只有 cy.b / px.b → 纯卡片列表；
-                            // 全是 proto/m1 → 数据来自 native 缓存。
-                            HLog.boot(
-                                "$TAG 丢弃广告卡片列表 cardType=$type，微信 ${wechatVersion()}，" +
-                                    "挂载：$mountSummary"
-                            )
-                            HLog.boot(
-                                "$TAG Fj($type) 调用方（${param.method.declaringClass.name}#${param.method.name}）" +
-                                    "：${callerTrace(param.method)}"
-                            )
-                        } else {
-                            HLog.event("$TAG 丢弃广告卡片列表 cardType=$type")
-                        }
-                        // 每次返回新列表：调用方（Flutter 桥）可能对返回值做 add/clear，
-                        // 共享同一个实例会把状态带到下一次请求。
-                        param.setResult(java.util.LinkedList<Any?>())
-                    }
-                })
+                HookRegistry.get().hook(method, AdCardListHooker(enabled, method))
                 true
             }.onFailure {
                 HLog.e("$TAG hook $CARD_LIST_CLASS#$CARD_LIST_METHOD 失败: ${it.message}", it)
@@ -481,7 +440,7 @@ class RemoveSubscribeAdsFeature : BaseFeature() {
                 HLog.event("$TAG 广告卡拉取任务 ${resolvedAdFetchTaskClass}#run 签名不匹配")
                 return false
             }
-            // void 方法：setResult(null) 即"整个 run() 不执行"。
+            // void 方法命中后直接返回 null，整个 run() 不执行。
             return hookFirstHit(
                 method,
                 enabled,
@@ -521,20 +480,7 @@ class RemoveSubscribeAdsFeature : BaseFeature() {
             }
             val frameLogged = AtomicBoolean(false)
             return runCatching {
-                HookRegistry.get().hook(method, object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        if (!enabled()) return
-                        val owner = runCatching { serviceField.get(param.thisObject) }.getOrNull() ?: return
-                        if (!adServiceType.isInstance(owner)) return
-                        dropped.incrementAndGet()
-                        if (frameLogged.compareAndSet(false, true)) {
-                            HLog.boot(
-                                "$TAG 丢弃广告卡帧任务 ${resolvedAdFrameTaskClass}#run（服务 $resolvedAdServiceClass）"
-                            )
-                        }
-                        param.setResult(null)
-                    }
-                })
+                HookRegistry.get().hook(method, AdFrameTaskHooker(enabled, serviceField, adServiceType, frameLogged))
                 true
             }.onFailure {
                 HLog.e("$TAG hook ${resolvedAdFrameTaskClass}#run 失败: ${it.message}", it)
@@ -574,16 +520,7 @@ class RemoveSubscribeAdsFeature : BaseFeature() {
                 masterSwitch.returnType == java.lang.Boolean.TYPE
             ) {
                 val ok = runCatching {
-                    HookRegistry.get().hook(masterSwitch, object : XC_MethodHook() {
-                        override fun beforeHookedMethod(param: MethodHookParam) {
-                            if (!enabled()) return
-                            dropped.incrementAndGet()
-                            if (switchLogged.compareAndSet(false, true)) {
-                                HLog.boot("$TAG 关闭广告卡服务总开关 ${resolvedAdBaseClass}#Oj")
-                            }
-                            param.setResult(false)
-                        }
-                    })
+                    HookRegistry.get().hook(masterSwitch, AdServiceSwitchHooker(enabled))
                     true
                 }.onFailure {
                     HLog.e("$TAG hook ${resolvedAdBaseClass}#Oj 失败: ${it.message}", it)
@@ -635,17 +572,7 @@ class RemoveSubscribeAdsFeature : BaseFeature() {
             if (dispatch != null && adServiceClass != null) {
                 val ejLogged = AtomicBoolean(false)
                 val ok = runCatching {
-                    HookRegistry.get().hook(dispatch, object : XC_MethodHook() {
-                        override fun beforeHookedMethod(param: MethodHookParam) {
-                            if (!enabled()) return
-                            if (!adServiceClass.isInstance(param.args.getOrNull(0))) return
-                            dropped.incrementAndGet()
-                            if (ejLogged.compareAndSet(false, true)) {
-                                HLog.boot("$TAG 拦下广告帧 Ej（实例 ${service}）")
-                            }
-                            param.setResult(null)
-                        }
-                    })
+                    HookRegistry.get().hook(dispatch, AdFrameDispatchHooker(enabled, adServiceClass, service, ejLogged))
                     true
                 }.onFailure {
                     HLog.e("$TAG hook ${resolvedAdBaseClass}#Ej 失败: ${it.message}", it)
@@ -691,20 +618,7 @@ class RemoveSubscribeAdsFeature : BaseFeature() {
             }
             if (method.returnType != java.lang.Void.TYPE) return false
             return runCatching {
-                HookRegistry.get().hook(method, object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        if (!enabled()) return
-                        val type = (param.args.getOrNull(0) as? Int) ?: return
-                        if (type != AD_CARD_TYPE) return
-                        dropped.incrementAndGet()
-                        if (frameSubmitLogged.compareAndSet(false, true)) {
-                            HLog.boot("$TAG 拦下广告帧提交 cardType=$type")
-                        } else {
-                            HLog.event("$TAG 拦下广告帧提交 cardType=$type")
-                        }
-                        param.setResult(null)
-                    }
-                })
+                HookRegistry.get().hook(method, AdFrameSubmitHooker(enabled))
                 true
             }.onFailure {
                 HLog.e("$TAG hook $JNI_CLASS#d 失败: ${it.message}", it)
@@ -720,10 +634,7 @@ class RemoveSubscribeAdsFeature : BaseFeature() {
          * 于是"这一门到底有没有命中"永远看不到，只能靠猜。`boot` 会先暂存，
          * 采集一打开就补写进缓冲，一定看得到。
          *
-         * 注意**必须用 `setResult`**：XposedBridge 判断是否跳过原方法看的是
-         * `returnEarly` 标志，而 `returnEarly` 只有 `setResult` 会置位。
-         * 直接写 `param.result = x` 只改了字段，原方法照跑、结果被覆盖，
-         * 表现就是"日志打了、广告还在"。
+         * 命中后直接返回对应结果，只有放行时才继续原生调用链。
          */
         /**
          * 当前调用栈中"谁在要 cardType=1"的部分，保留**全限定类名**。
@@ -737,7 +648,7 @@ class RemoveSubscribeAdsFeature : BaseFeature() {
          * 3. 所以要**只按方法名**找锚点（`Fj` 在一条栈里只出现一次），并把实际帧类名
          *    一起打出来 —— 它和 `px.b` 不一致本身就说明"有人代理了这个方法"。
          */
-        // Xposed 的 MethodHookParam.method 声明成 Member（兼容构造函数 Hook），这里跟着放宽。
+        // 使用 Member 描述目标，兼容方法与构造函数。
         private fun callerTrace(target: Member): String = runCatching {
             val frames = Throwable().stackTrace
             val anchoredAt = frames.indexOfLast { it.methodName == target.name }
@@ -780,14 +691,7 @@ class RemoveSubscribeAdsFeature : BaseFeature() {
         ): Boolean {
             val logged = AtomicBoolean(false)
             return runCatching {
-                HookRegistry.get().hook(method, object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        if (!enabled()) return
-                        dropped.incrementAndGet()
-                        if (logged.compareAndSet(false, true)) HLog.boot("$TAG $logText $label")
-                        param.setResult(result)
-                    }
-                })
+                HookRegistry.get().hook(method, AdFirstHitHooker(enabled, logged, logText, label, result))
                 true
             }.onFailure {
                 HLog.e("$TAG hook $label 失败: ${it.message}", it)
@@ -824,20 +728,7 @@ class RemoveSubscribeAdsFeature : BaseFeature() {
                 // 丢弃却拦不住的原因。
                 val dropAll = className in AD_CARD_EVENT_CANDIDATES
                 val ok = runCatching {
-                    HookRegistry.get().hook(method, object : XC_MethodHook() {
-                        override fun beforeHookedMethod(param: MethodHookParam) {
-                            if (!enabled()) return
-                            val key = param.args.getOrNull(0) as? String ?: return
-                            if (!dropAll && key !in AD_EVENTS) return
-                            dropped.incrementAndGet()
-                            val payload = param.args.getOrNull(1) as? String
-                            val line = "$TAG 丢弃广告事件 $key len=${payload?.length ?: 0}"
-                            if (eventGateLogged.compareAndSet(false, true)) HLog.boot(line)
-                            else HLog.event(line)
-                            // setResult(null) 才会置 returnEarly，原方法不执行，事件不进 JS 队列。
-                            param.setResult(null)
-                        }
-                    })
+                    HookRegistry.get().hook(method, AdEventGateHooker(enabled, dropAll))
                     true
                 }.onFailure {
                     HLog.e("$TAG hook $className#H1 失败: ${it.message}", it)
@@ -885,18 +776,7 @@ class RemoveSubscribeAdsFeature : BaseFeature() {
                     ) ?: continue
                     if (method.returnType != java.lang.Void.TYPE) continue
                     val ok = runCatching {
-                        HookRegistry.get().hook(method, object : XC_MethodHook() {
-                            override fun beforeHookedMethod(param: MethodHookParam) {
-                                if (!enabled()) return
-                                dropped.incrementAndGet()
-                                if (nativeGateLogged.compareAndSet(false, true)) {
-                                    HLog.boot("$TAG 拦下 native 广告事件 $className#$name")
-                                } else {
-                                    HLog.event("$TAG 拦下 native 广告事件 $className#$name")
-                                }
-                                param.setResult(null)
-                            }
-                        })
+                        HookRegistry.get().hook(method, NativeAdEventHooker(enabled, className, name))
                         true
                     }.onFailure {
                         HLog.e("$TAG hook $className#$name 失败: ${it.message}", it)
@@ -1006,4 +886,201 @@ class RemoveSubscribeAdsFeature : BaseFeature() {
             }.getOrDefault("未知")
         }
     }
+
+    private class AdPullGateHooker(private val enabled: () -> Boolean, private val method: Method) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val args = chain.args.toTypedArray()
+            val receiver = chain.thisObject
+            run {
+            run patch@{
+                if (!enabled()) return@patch
+                hits.incrementAndGet()
+                if (pullLogged.compareAndSet(false, true)) {
+                    HLog.boot("$TAG 拦下广告拉取 ${method.name}")
+                } else {
+                    HLog.event("$TAG 拦下广告拉取 ${method.name}")
+                }
+                return false
+            }
+            return chain.proceed(args)
+            }
+        }
+    }
+
+    private class AdCardListHooker(private val enabled: () -> Boolean, private val method: Method) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val args = chain.args.toTypedArray()
+            val receiver = chain.thisObject
+            run {
+            run patch@{
+                if (!enabled()) return@patch
+                val type = (args.getOrNull(0) as? Int) ?: return@patch
+                if (type != AD_CARD_TYPE) return@patch
+                // 不能在这里反调原方法做统计：反射 invoke 会再次进入本 Hook 造成
+                // 无限递归；而且原方法是一次同步 ZIDL 调用，跳过它反而省一次跨语言开销。
+                dropped.incrementAndGet()
+                if (cardGateLogged.compareAndSet(false, true)) {
+                    // 首次命中一并带出：①各门挂载结果 ②是谁在要 cardType=1。
+                    // 只有这道门出现在日志里时，这两条信息才决定下一步往哪修：
+                    // 栈里出现 wx.p0 / wx.g2 → 广告卡服务；只有 cy.b / px.b → 纯卡片列表；
+                    // 全是 proto/m1 → 数据来自 native 缓存。
+                    HLog.boot(
+                        "$TAG 丢弃广告卡片列表 cardType=$type，微信 ${wechatVersion()}，" +
+                            "挂载：$mountSummary"
+                    )
+                    HLog.boot(
+                        "$TAG Fj($type) 调用方（${method.declaringClass.name}#${method.name}）" +
+                            "：${callerTrace(method)}"
+                    )
+                } else {
+                    HLog.event("$TAG 丢弃广告卡片列表 cardType=$type")
+                }
+                // 每次返回新列表：调用方（Flutter 桥）可能对返回值做 add/clear，
+                // 共享同一个实例会把状态带到下一次请求。
+                return java.util.LinkedList<Any?>()
+            }
+            return chain.proceed(args)
+            }
+        }
+    }
+
+    private class AdFrameTaskHooker(private val enabled: () -> Boolean, private val serviceField: java.lang.reflect.Field, private val adServiceType: Class<*>, private val frameLogged: AtomicBoolean) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val args = chain.args.toTypedArray()
+            val receiver = chain.thisObject
+            run {
+            run patch@{
+                if (!enabled()) return@patch
+                val owner = runCatching { serviceField.get(receiver) }.getOrNull() ?: return@patch
+                if (!adServiceType.isInstance(owner)) return@patch
+                dropped.incrementAndGet()
+                if (frameLogged.compareAndSet(false, true)) {
+                    HLog.boot(
+                        "$TAG 丢弃广告卡帧任务 ${resolvedAdFrameTaskClass}#run（服务 $resolvedAdServiceClass）"
+                    )
+                }
+                return null
+            }
+            return chain.proceed(args)
+            }
+        }
+    }
+
+    private class AdServiceSwitchHooker(private val enabled: () -> Boolean) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val args = chain.args.toTypedArray()
+            val receiver = chain.thisObject
+            run {
+            run patch@{
+                if (!enabled()) return@patch
+                dropped.incrementAndGet()
+                if (switchLogged.compareAndSet(false, true)) {
+                    HLog.boot("$TAG 关闭广告卡服务总开关 ${resolvedAdBaseClass}#Oj")
+                }
+                return false
+            }
+            return chain.proceed(args)
+            }
+        }
+    }
+
+    private class AdFrameDispatchHooker(private val enabled: () -> Boolean, private val adServiceClass: Class<*>, private val service: String, private val ejLogged: AtomicBoolean) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val args = chain.args.toTypedArray()
+            val receiver = chain.thisObject
+            run {
+            run patch@{
+                if (!enabled()) return@patch
+                if (!adServiceClass.isInstance(args.getOrNull(0))) return@patch
+                dropped.incrementAndGet()
+                if (ejLogged.compareAndSet(false, true)) {
+                    HLog.boot("$TAG 拦下广告帧 Ej（实例 ${service}）")
+                }
+                return null
+            }
+            return chain.proceed(args)
+            }
+        }
+    }
+
+    private class AdFrameSubmitHooker(private val enabled: () -> Boolean) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val args = chain.args.toTypedArray()
+            val receiver = chain.thisObject
+            run {
+            run patch@{
+                if (!enabled()) return@patch
+                val type = (args.getOrNull(0) as? Int) ?: return@patch
+                if (type != AD_CARD_TYPE) return@patch
+                dropped.incrementAndGet()
+                if (frameSubmitLogged.compareAndSet(false, true)) {
+                    HLog.boot("$TAG 拦下广告帧提交 cardType=$type")
+                } else {
+                    HLog.event("$TAG 拦下广告帧提交 cardType=$type")
+                }
+                return null
+            }
+            return chain.proceed(args)
+            }
+        }
+    }
+
+    private class AdFirstHitHooker(private val enabled: () -> Boolean, private val logged: AtomicBoolean, private val logText: String, private val label: String, private val result: Any?) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val args = chain.args.toTypedArray()
+            val receiver = chain.thisObject
+            run {
+            run patch@{
+                if (!enabled()) return@patch
+                dropped.incrementAndGet()
+                if (logged.compareAndSet(false, true)) HLog.boot("$TAG $logText $label")
+                return result
+            }
+            return chain.proceed(args)
+            }
+        }
+    }
+
+    private class AdEventGateHooker(private val enabled: () -> Boolean, private val dropAll: Boolean) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val args = chain.args.toTypedArray()
+            val receiver = chain.thisObject
+            run {
+            run patch@{
+                if (!enabled()) return@patch
+                val key = args.getOrNull(0) as? String ?: return@patch
+                if (!dropAll && key !in AD_EVENTS) return@patch
+                dropped.incrementAndGet()
+                val payload = args.getOrNull(1) as? String
+                val line = "$TAG 丢弃广告事件 $key len=${payload?.length ?: 0}"
+                if (eventGateLogged.compareAndSet(false, true)) HLog.boot(line)
+                else HLog.event(line)
+                // 直接返回 null，原方法不执行，事件不进 JS 队列。
+                return null
+            }
+            return chain.proceed(args)
+            }
+        }
+    }
+
+    private class NativeAdEventHooker(private val enabled: () -> Boolean, private val className: String, private val name: String) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val args = chain.args.toTypedArray()
+            val receiver = chain.thisObject
+            run {
+            run patch@{
+                if (!enabled()) return@patch
+                dropped.incrementAndGet()
+                if (nativeGateLogged.compareAndSet(false, true)) {
+                    HLog.boot("$TAG 拦下 native 广告事件 $className#$name")
+                } else {
+                    HLog.event("$TAG 拦下 native 广告事件 $className#$name")
+                }
+                return null
+            }
+            return chain.proceed(args)
+            }
+        }
+    }
+
 }

@@ -30,7 +30,7 @@ object ScriptMemberChangeHook {
         val observeApi = runCatching { WeChatApis.messageObserve() }.getOrNull()
         if (observeApi != null && observeApi.isAvailable()) {
             runCatching { observeApi.install() }
-            observeApi.subscribe { message ->
+            observeApi.subscribe("script_member_change") { message ->
                 handleObservedMessage(ScriptMessageBean(message))
             }
         }

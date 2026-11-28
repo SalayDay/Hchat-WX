@@ -1,6 +1,6 @@
 package h.Hchat.hooks.items.legacychatinput
 
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.hooks.api.core.WeChatApis
 import h.Hchat.hooks.api.model.WeChatVersionMatch
 import h.Hchat.hooks.core.BaseFeature
@@ -18,10 +18,10 @@ class LegacyChatInputFeature : BaseFeature() {
     }
 
     override fun onFeatureInstall(context: FeatureContext) {
-        val loadPackageParam = context.loadPackageParam()
-        val packageName = loadPackageParam.packageName ?: return
+        val hostRuntime = context.hostRuntime()
+        val packageName = hostRuntime.packageName
         if (!packageName.startsWith(WECHAT_PACKAGE_PREFIX)) return
-        if (loadPackageParam.processName != null && loadPackageParam.processName != packageName) return
+        if (hostRuntime.processName != packageName) return
 
         // 版本判定改用 versionName 归一化比较。
         // 原实现拿 PackageInfo.versionCode 直接比 3220，但 3220 是 versionName 里的
@@ -70,24 +70,23 @@ class LegacyChatInputFeature : BaseFeature() {
         val preferences = LegacyChatInputSettings.preferences(context.hostContext())
 
         runCatching {
-            HookRegistry.get().hook(readMethod, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    val config = param.args?.firstOrNull() ?: return
-                    val enabled = preferences.getBoolean(
-                        LegacyChatInputSettings.KEY_ENABLE,
-                        LegacyChatInputSettings.DEFAULT_ENABLE
-                    )
-                    if (LegacyChatInputPolicy.shouldForceLegacy(
-                            enabled = enabled,
-                            configClassName = config.javaClass.name
-                        )
-                    ) {
-                        param.setResult(0)
-                    }
-                }
-            })
+            HookRegistry.get().hook(readMethod, LegacyInputConfigHooker(preferences))
         }.onFailure {
             logError("安装微信原生旧版输入栏配置 Hook 失败", it)
+        }
+    }
+
+    private class LegacyInputConfigHooker(
+        private val preferences: android.content.SharedPreferences
+    ) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val config = chain.args.firstOrNull() ?: return chain.proceed()
+            val enabled = preferences.getBoolean(
+                LegacyChatInputSettings.KEY_ENABLE,
+                LegacyChatInputSettings.DEFAULT_ENABLE
+            )
+            if (LegacyChatInputPolicy.shouldForceLegacy(enabled, config.javaClass.name)) return 0
+            return chain.proceed()
         }
     }
 

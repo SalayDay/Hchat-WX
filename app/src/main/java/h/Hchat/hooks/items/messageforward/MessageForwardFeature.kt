@@ -8,7 +8,7 @@ import android.os.SystemClock
 import android.view.MenuItem
 import android.view.View
 import android.widget.Toast
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.event.Events
 import h.Hchat.hooks.api.core.WeChatApis
 import h.Hchat.hooks.api.sns.PreparedSnsForward
@@ -140,18 +140,10 @@ private class MessageForwardHooker(
         val createMethods = SingleMessageMenuLocator.menuCreateMethods(context, logger)
         val clickMethods = SingleMessageMenuLocator.menuClickMethods(context, logger)
         val createHooked = createMethods.count { method ->
-            hook(method, object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    addForwardMenu(param)
-                }
-            })
+            hook(method, ForwardMenuHook(this))
         }
         val clickHooked = clickMethods.count { method ->
-            hook(method, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    handleForwardClick(param)
-                }
-            })
+            hook(method, ForwardClickHook(this))
         }
         if (createHooked <= 0) logger("转发菜单创建Hook未安装", null)
         if (clickHooked <= 0) logger("转发菜单点击Hook未安装", null)
@@ -162,17 +154,9 @@ private class MessageForwardHooker(
             MultiSelectMessageMenuLocator.multiSelectExitMethod(context, it, logger)
         }
         val multiCreateHooked = multiCreateMethod != null && multiExitMethod != null &&
-            hook(multiCreateMethod, object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    addMultiMomentsMenu(param)
-                }
-            })
+            hook(multiCreateMethod, MultiMomentsMenuHook(this))
         val multiClickHooked = multiClickMethod != null && multiExitMethod != null &&
-            hook(multiClickMethod, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    handleMultiMomentsClick(param, multiExitMethod)
-                }
-            })
+            hook(multiClickMethod, MultiMomentsClickHook(this, multiExitMethod))
         if (!multiCreateHooked) logger("多选转发朋友圈菜单创建Hook未安装", null)
         if (!multiClickHooked) logger("多选转发朋友圈菜单点击Hook未安装", null)
 
@@ -181,22 +165,14 @@ private class MessageForwardHooker(
             includeDetails = false,
             logger = logger
         ).count { method ->
-            hook(method, object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    addFavoriteForwardMenu(param)
-                }
-            })
+            hook(method, FavoriteForwardMenuHook(this))
         }
         val favoriteClickHooked = FavoriteMenuLocator.menuClickMethods(
             context,
             includeDetails = false,
             logger = logger
         ).count { method ->
-            hook(method, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    handleFavoriteForwardClick(param)
-                }
-            })
+            hook(method, FavoriteForwardClickHook(this))
         }
         if (favoriteCreateHooked <= 0) logger("收藏转发菜单创建Hook未安装", null)
         if (favoriteClickHooked <= 0) logger("收藏转发菜单点击Hook未安装", null)
@@ -215,7 +191,52 @@ private class MessageForwardHooker(
         executor.shutdownNow()
     }
 
-    private fun hook(method: Method, callback: XC_MethodHook): Boolean {
+    private class ForwardMenuHook(private val owner: MessageForwardHooker) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val result = chain.proceed()
+            owner.addForwardMenu(chain.thisObject, chain.args.toTypedArray())
+            return result
+        }
+    }
+
+    private class ForwardClickHook(private val owner: MessageForwardHooker) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            owner.handleForwardClick(chain.thisObject, chain.args.toTypedArray())
+            return chain.proceed()
+        }
+    }
+
+    private class MultiMomentsMenuHook(private val owner: MessageForwardHooker) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val result = chain.proceed()
+            owner.addMultiMomentsMenu(chain.thisObject, chain.args.toTypedArray())
+            return result
+        }
+    }
+
+    private class MultiMomentsClickHook(private val owner: MessageForwardHooker, private val exitMethod: Method) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            if (owner.handleMultiMomentsClick(chain.thisObject, chain.args.toTypedArray(), exitMethod)) return null
+            return chain.proceed()
+        }
+    }
+
+    private class FavoriteForwardMenuHook(private val owner: MessageForwardHooker) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val result = chain.proceed()
+            owner.addFavoriteForwardMenu(chain.thisObject, chain.args.toTypedArray())
+            return result
+        }
+    }
+
+    private class FavoriteForwardClickHook(private val owner: MessageForwardHooker) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            if (owner.handleFavoriteForwardClick(chain.thisObject, chain.args.toTypedArray())) return null
+            return chain.proceed()
+        }
+    }
+
+    private fun hook(method: Method, callback: XposedInterface.Hooker): Boolean {
         if (Modifier.isAbstract(method.modifiers) || method.declaringClass.isInterface) return false
         if (!hookedMethods.add(method)) return true
         return runCatching {
@@ -228,10 +249,9 @@ private class MessageForwardHooker(
         }
     }
 
-    private fun addForwardMenu(param: XC_MethodHook.MethodHookParam) {
+    private fun addForwardMenu(receiver: Any?, args: Array<Any?>) {
         clearBindings()
         if (!singleForwardEnabled()) return
-        val args = param.args ?: return
         val menu = args.getOrNull(0) ?: return
         val view = args.getOrNull(1) as? View ?: return
         val nativeMessage = resolveNativeMessage(view.tag) ?: return
@@ -243,9 +263,9 @@ private class MessageForwardHooker(
         moveAfterRepeat(menu, item)
     }
 
-    private fun handleForwardClick(param: XC_MethodHook.MethodHookParam) {
+    private fun handleForwardClick(receiver: Any?, args: Array<Any?>) {
         if (!singleForwardEnabled()) return
-        val item = param.args?.firstNotNullOfOrNull { it as? MenuItem } ?: return
+        val item = args?.firstNotNullOfOrNull { it as? MenuItem } ?: return
         if (item.itemId != SingleMessageMenuLocator.HCHAT_FORWARD_MENU_ITEM_ID) return
         val binding = consumeBinding(item)
         val activity = currentActivity()
@@ -266,42 +286,41 @@ private class MessageForwardHooker(
         }
     }
 
-    private fun addMultiMomentsMenu(param: XC_MethodHook.MethodHookParam) {
+    private fun addMultiMomentsMenu(receiver: Any?, args: Array<Any?>) {
         if (!multiMomentsEnabled()) return
-        val selected = MultiSelectMessageResolver.resolve(param.thisObject)
+        val selected = MultiSelectMessageResolver.resolve(receiver)
         val types = selected.mapNotNull(::nativeMessageType)
         if (selected.isEmpty() || types.size != selected.size || momentsCombinationError(types) != null) return
-        val menu = param.args?.getOrNull(0) ?: return
+        val menu = args?.getOrNull(0) ?: return
         addPlainMenuItem(menu, MULTI_MOMENTS_MENU_ITEM_ID, MULTI_MOMENTS_MENU_TITLE)
     }
 
     private fun handleMultiMomentsClick(
-        param: XC_MethodHook.MethodHookParam,
+        receiver: Any?, args: Array<Any?>,
         exitMethod: Method
-    ) {
-        if (!multiMomentsEnabled()) return
-        val item = param.args?.firstNotNullOfOrNull { it as? MenuItem } ?: return
-        if (item.itemId != MULTI_MOMENTS_MENU_ITEM_ID) return
-        param.setResult(null)
+    ): Boolean {
+        if (!multiMomentsEnabled()) return false
+        val item = args?.firstNotNullOfOrNull { it as? MenuItem } ?: return false
+        if (item.itemId != MULTI_MOMENTS_MENU_ITEM_ID) return false
 
-        val activity = currentActivity() ?: return
-        val selected = MultiSelectMessageResolver.resolve(param.thisObject)
+        val activity = currentActivity() ?: return true
+        val selected = MultiSelectMessageResolver.resolve(receiver)
         val snapshots = selected.mapNotNull { SelectedMessageSnapshot.fromNativeForMoments(it) }
             .sortedWith(compareBy<SelectedMessageSnapshot> { it.createTime }.thenBy { it.msgId })
         if (selected.isEmpty() || snapshots.size != selected.size) {
             toast(activity, "部分选中消息无法读取")
-            return
+            return true
         }
         val preparation = prepareMomentsIntent(activity, snapshots)
         val intent = preparation.intent
         if (intent == null) {
             toast(activity, preparation.error)
-            return
+            return true
         }
-        val exitTarget = MultiSelectMessageUi.resolveExitTarget(param.thisObject, exitMethod, logger)
+        val exitTarget = MultiSelectMessageUi.resolveExitTarget(receiver, exitMethod, logger)
         if (exitTarget == null) {
             toast(activity, "无法退出多选状态，请稍后重试")
-            return
+            return true
         }
         exitTarget.exit(logger)
         main.post {
@@ -309,15 +328,15 @@ private class MessageForwardHooker(
                 startMomentsEditor(activity, intent)
             }
         }
+        return true
     }
 
-    private fun addFavoriteForwardMenu(param: XC_MethodHook.MethodHookParam) {
+    private fun addFavoriteForwardMenu(receiver: Any?, args: Array<Any?>) {
         if (!favoriteForwardEnabled()) return
-        val args = param.args ?: return
         val favorite = FavoriteMenuItemResolver.resolveMenuItem(args.getOrNull(2))
             ?: FavoriteMenuItemResolver.resolveMenuItem(args.getOrNull(1) as? View)
             ?: FavoriteMenuItemResolver.resolveMenuItem(args)
-            ?: FavoriteMenuItemResolver.resolveMenuItem(param.thisObject)
+            ?: FavoriteMenuItemResolver.resolveMenuItem(receiver)
             ?: FavoriteMenuItemResolver.resolve(args)
             ?: return
         if (KavaReflector.invokeMethod(
@@ -346,25 +365,24 @@ private class MessageForwardHooker(
     }
 
     @Synchronized
-    private fun handleFavoriteForwardClick(param: XC_MethodHook.MethodHookParam) {
-        if (!favoriteForwardEnabled()) return
-        val item = param.args?.firstNotNullOfOrNull { it as? MenuItem } ?: return
-        if (item.itemId != FAVORITE_FORWARD_MENU_ITEM_ID) return
+    private fun handleFavoriteForwardClick(receiver: Any?, args: Array<Any?>): Boolean {
+        if (!favoriteForwardEnabled()) return false
+        val item = args?.firstNotNullOfOrNull { it as? MenuItem } ?: return false
+        if (item.itemId != FAVORITE_FORWARD_MENU_ITEM_ID) return false
         val now = SystemClock.elapsedRealtime()
         if (lastFavoriteHandledItem?.get() === item &&
             now - lastFavoriteHandledAt < FAVORITE_CLICK_DEDUP_MS
-        ) return
-        param.setResult(null)
+        ) return false
 
-        val activity = currentActivity() ?: return
+        val activity = currentActivity() ?: return true
         val localId = favoriteBindingsByItem.remove(item)
             ?: pendingFavoriteLocalId.takeIf { it > 0L }
-            ?: FavoriteMenuItemResolver.localId(FavoriteMenuItemResolver.resolve(param.args))
+            ?: FavoriteMenuItemResolver.localId(FavoriteMenuItemResolver.resolve(args))
         favoriteBindingsByItem.clear()
         pendingFavoriteLocalId = 0L
         if (localId <= 0L) {
             toast(activity, "当前收藏不可用")
-            return
+            return true
         }
         lastFavoriteHandledItem = WeakReference(item)
         lastFavoriteHandledAt = now
@@ -372,6 +390,7 @@ private class MessageForwardHooker(
             if (activity.isFinishing || activity.isDestroyed) return@post
             showFavoriteActions(activity, localId)
         }
+        return true
     }
 
     private fun sendFavorite(

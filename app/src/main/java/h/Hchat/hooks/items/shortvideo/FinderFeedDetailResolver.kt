@@ -1,7 +1,7 @@
 package h.Hchat.hooks.items.shortvideo
 
 import android.os.Looper
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.dexkit.DexMethodCache
 import h.Hchat.hooks.api.core.WeChatApis
 import h.Hchat.hooks.core.FeatureContext
@@ -234,34 +234,7 @@ internal class FinderFeedDetailResolver private constructor(
         private fun installCallbackHook(method: Method): Boolean {
             if (!hookedCallbacks.add(method)) return true
             return runCatching {
-                HookRegistry.get().hook(method, object : XC_MethodHook() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        val scene = param.thisObject ?: return
-                        val request = pending.remove(scene) ?: return
-                        // 参数含义随版本不同：
-                        // 旧 6 参 (scene, errType, errCode, errMsg, resp, raw)
-                        // 8.0.80 5 参 (errType, errCode, errMsg, resp, ctx)
-                        val legacy = (param.method as? Method)?.parameterTypes?.size == 6
-                        val errType = (param.args.getOrNull(if (legacy) 1 else 0) as? Number)?.toInt() ?: -1
-                        val errCode = (param.args.getOrNull(if (legacy) 2 else 1) as? Number)?.toInt() ?: -1
-                        if (errType == 0 && errCode == 0) {
-                            request.finderObject = extractFinderObject(
-                                scene,
-                                param.args.getOrNull(if (legacy) 4 else 3),
-                                param.args.getOrNull(if (legacy) 5 else 4) as? ByteArray,
-                                request.feedId
-                            )
-                            if (request.finderObject == null) {
-                                request.failure = IllegalStateException("Finder detail response has no FinderObject")
-                            }
-                        } else {
-                            request.failure = IllegalStateException(
-                                "Finder detail request failed: errType=$errType errCode=$errCode"
-                            )
-                        }
-                        request.completed.countDown()
-                    }
-                })
+                HookRegistry.get().hook(method, DetailResponseHooker(method))
                 true
             }.getOrElse {
                 hookedCallbacks.remove(method)
@@ -432,4 +405,42 @@ internal class FinderFeedDetailResolver private constructor(
             @Volatile var failure: Throwable? = null
         }
     }
+
+    private class DetailResponseHooker(private val method: Method) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val args = chain.args.toTypedArray()
+            val receiver = chain.thisObject
+            var result = chain.proceed()
+            run {
+            run update@{
+                val scene = receiver ?: return@update
+                val request = pending.remove(scene) ?: return@update
+                // 参数含义随版本不同：
+                // 旧 6 参 (scene, errType, errCode, errMsg, resp, raw)
+                // 8.0.80 5 参 (errType, errCode, errMsg, resp, ctx)
+                val legacy = (method as? Method)?.parameterTypes?.size == 6
+                val errType = (args.getOrNull(if (legacy) 1 else 0) as? Number)?.toInt() ?: -1
+                val errCode = (args.getOrNull(if (legacy) 2 else 1) as? Number)?.toInt() ?: -1
+                if (errType == 0 && errCode == 0) {
+                    request.finderObject = extractFinderObject(
+                        scene,
+                        args.getOrNull(if (legacy) 4 else 3),
+                        args.getOrNull(if (legacy) 5 else 4) as? ByteArray,
+                        request.feedId
+                    )
+                    if (request.finderObject == null) {
+                        request.failure = IllegalStateException("Finder detail response has no FinderObject")
+                    }
+                } else {
+                    request.failure = IllegalStateException(
+                        "Finder detail request failed: errType=$errType errCode=$errCode"
+                    )
+                }
+                request.completed.countDown()
+            }
+            return result
+            }
+        }
+    }
+
 }

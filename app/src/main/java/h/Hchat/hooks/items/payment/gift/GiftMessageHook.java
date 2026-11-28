@@ -10,7 +10,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
 
-import de.robv.android.xposed.XC_MethodHook;
+import io.github.libxposed.api.XposedInterface;
 
 import h.Hchat.dexkit.DexFinder;
 import h.Hchat.hooks.core.HookRegistry;
@@ -54,20 +54,7 @@ public class GiftMessageHook {
                 }
                 if (indexes.isEmpty()) continue;
 
-                XC_MethodHook.Unhook unhook = HookRegistry.get().hook(method, new XC_MethodHook() {
-                    @Override
-                    public void beforeHookedMethod(MethodHookParam param) {
-                        Object[] args = param.args;
-                        if (args == null) return;
-                        for (Integer index : indexes) {
-                            if (index == null || index >= args.length) continue;
-                            try {
-                                onMessage(args[index]);
-                            } catch (Throwable ignored) {
-                            }
-                        }
-                    }
-                });
+                XposedInterface.HookHandle unhook = HookRegistry.get().hook(method, new GiftIncomingMessageHooker(this, indexes));
                 if (unhook != null) subscriptions.add(unhook);
             }
         }
@@ -129,4 +116,34 @@ public class GiftMessageHook {
     private void log(String message) {
         if (logger != null) logger.log(message);
     }
+
+    private void inspectGiftArguments(Object receiver, Object[] args, List<Integer> indexes) {
+        if (args == null) return;
+        for (Integer index : indexes) {
+            if (index == null || index >= args.length) continue;
+            try {
+                onMessage(args[index]);
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    private static final class GiftIncomingMessageHooker implements XposedInterface.Hooker {
+        private final GiftMessageHook owner;
+        private final List<Integer> indexes;
+
+        GiftIncomingMessageHooker(GiftMessageHook owner, List<Integer> indexes) {
+            this.owner = owner;
+            this.indexes = indexes;
+        }
+
+        @Override
+        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+            Object receiver = chain.getThisObject();
+            Object[] args = chain.getArgs().toArray();
+            owner.inspectGiftArguments(receiver, args, indexes);
+            return chain.proceed(args);
+        }
+    }
+
 }

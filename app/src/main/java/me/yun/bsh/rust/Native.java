@@ -28,6 +28,7 @@ final class Native {
     static native void unsetVariable(long engine, String name);
     static native String scriptMethods(long engine);
     static native Object invokeMethod(long engine, String name, Object[] args);
+    static native Object tryInvokeHook(long engine, String name, Object[] args, boolean[] busy);
     static native void importClass(long engine, String name);
     static native void defineMethod(long engine, String name, Object instance, String className, int argc, boolean varargs);
     static native void reset(long engine);

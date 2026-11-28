@@ -10,7 +10,7 @@
 
 `info.prop` 的 `process` 决定加载进程：默认 `process=main`；需要 Hook 小程序进程时写 `process=appbrand`；同一插件确实要在两类进程分别执行时写 `process=all`。不要把普通消息回调、定时任务或自动回复插件设成 `all`。小程序进程只提供轻量 Hook 运行时，没有主进程联系人/消息数据库和 DexKit 就绪状态；必须使用稳定完整类名、当前 `classLoader`、反射和 Hook API，不得在小程序进程新建 DexKit。
 
-生成小程序 Hook 时，在 `onLoad()` 先检查 `isAppBrandProcess`，再用 `findClass("已确认的稳定完整类名")`、`firstMethod/firstConstructor/firstField` 和 `hookBefore/hookAfter/hookReplace`。类名、方法名、参数数量必须先通过 Agent 的 APK 逆向工具或已有多版本证据确认，不能猜。目标是混淆类且必须运行时定位时，用 `process=all`：主进程实例通过 DexKit 定位后用 `putString` 缓存 descriptor，小程序实例只用 `getString` 读取；缓存缺失时跳过并提示重新打开小程序，禁止在小程序进程初始化 DexKit。
+生成小程序 Hook 时，在 `onLoad()` 先检查 `isAppBrandProcess`，再用 `findClass("已确认的稳定完整类名")`、`firstMethod/firstConstructor/firstField` 和 `hook(member, "拦截函数名")`。类名、方法名、参数数量必须先通过 Agent 的 APK 逆向工具或已有多版本证据确认，不能猜。目标是混淆类且必须运行时定位时，用 `process=all`：主进程实例通过 DexKit 定位后用 `putString` 缓存 descriptor，小程序实例只用 `getString` 读取；缓存缺失时跳过并提示重新打开小程序，禁止在小程序进程初始化 DexKit。
 
 ```java
 void onLoad();
@@ -51,11 +51,11 @@ void useOnNewFriend(String methodName);
 
 ## 内置环境
 
-已导入 `File`、`Map`、`List`、`Set`、`Consumer`、`Function`、`Field`、`Method`、`Constructor`、`Member`、`XposedBridge`、`XposedHelpers`、`XC_MethodHook`、`WeChatApis`、`KavaReflector`、`DexKitBridge`、`DexFinder`、`DexBridgeHolder`、`PluginCallBack`、fastjson2 常用类和 `me.hd.wauxv.data.bean.MsgInfoBean`。不要重复导入这些类。
+已导入 `File`、`Map`、`List`、`Set`、`Consumer`、`Function`、`Field`、`Method`、`Constructor`、`Member`、`ScriptHookChain`、`WeChatApis`、`KavaReflector`、`DexKitBridge`、`DexFinder`、`DexBridgeHolder`、`PluginCallBack`、fastjson2 常用类和 `me.hd.wauxv.data.bean.MsgInfoBean`。不要重复导入这些类。
 
 可直接使用 `context`、`hostContext`、`classLoader`、`bridge`、`wa`、`waBridge`、`http`、`httpClient`、`audio`、`audioBridge`、`apis`、`dexKit`、`dexKitBridge`、`dexFinder`、`dexBridgeHolder`、`pluginDir`、`pluginDirFile`、`cacheDir`、`cacheDirFile`、`scriptDir`、`scriptDirFile`、`pluginId`、`pluginName`、`pluginAuthor`、`pluginVersion`、`pluginUpdateTime`、`processName`、`pluginProcess`、`isMainProcess`、`isAppBrandProcess`、`hostVerName`、`hostVerCode`、`hostVerClient`、`moduleVer`、`startedAt`。小程序进程中四个 DexKit 对象变量均为 `null`。
 
-类对象变量包括 `WeChatApisClass`、`XposedBridgeClass`、`XposedHelpersClass`、`XC_MethodHookClass`、`DexKitBridgeClass`、`DexFinderClass`、`DexBridgeHolderClass`、`KavaReflectorClass`、`ScriptAudioBridgeClass`、`SilkCodecClass`、`AacCodecClass`、`ConversionClass`、`FieldClass`、`MethodClass`、`ConstructorClass`。
+类对象变量包括 `WeChatApisClass`、`DexKitBridgeClass`、`DexFinderClass`、`DexBridgeHolderClass`、`KavaReflectorClass`、`ScriptAudioBridgeClass`、`SilkCodecClass`、`AacCodecClass`、`ConversionClass`、`FieldClass`、`MethodClass`、`ConstructorClass`。
 
 ## 消息对象
 
@@ -455,17 +455,34 @@ void startTransform(int type, String inputPath, String outputPath, int sampleRat
 Class findClass(String className);
 List findClassList(Object usingStrings);
 List findMemberList(Object usingStrings);
-Object hookBefore(Member member, Consumer callback);
-Object hookAfter(Member member, Consumer callback);
-Object hookReplace(Member member, Function callback);
-void unhook(Object handle);
+Object hook(Member member, String functionName);
+Object hook(Member member, String functionName, int priority);
+void unhook(Object token);
 ```
 
-`findClass` 只适合已知且跨版本稳定的完整类名；类名已混淆或会随版本变化时，不得把单版本类名写进 `findClass`，应使用稳定字符串调用 `findClassList` / `findMemberList`。`findClassList` 返回 `Class`，`findMemberList` 返回 `Method` / `Constructor`。`usingStrings` 支持字符串、`List`、`String[]`、`Object[]` 和 BeanShell 大括号数组；多个字符串先按同时包含查询，只有方法和类的联合查询都没有结果时才会逐个字符串扩展。
+`findClass` 只适合已知且跨版本稳定的完整类名；类名已混淆或会随版本变化时，不得把单版本类名写进 `findClass`，应使用稳定字符串调用 `findClassList` / `findMemberList`。`findClass` 找不到类时抛 `ClassNotFoundException`。`findClassList` 返回 `Class`，`findMemberList` 返回 `Method` / `Constructor`。`usingStrings` 支持字符串、`List`、`String[]`、`Object[]` 和 BeanShell 大括号数组；多个字符串先按同时包含查询，只有方法和类的联合查询都没有结果时才会逐个字符串扩展。
 
 `findMemberList` 的返回顺序有语义：先放入字符串直接命中的方法/构造器，再追加类命中后展开的全部声明方法和构造器。因此同一类中出现多个签名相似的展开成员，不等于 DexKit 直接命中了多个目标。先用内置逆向工具确认字符串查询在目标版本中直接命中唯一 descriptor；插件代码再按声明类、参数、返回类型和修饰符从前往后取第一个合格成员，不要对包含类展开成员的整个列表强求全局唯一。如果直接查询本身命中多个 descriptor，必须增强字符串锚点或结构签名，不得猜测第一项。
 
-Hook 回调参数运行时是 `XC_MethodHook.MethodHookParam`，常用 `method`、`thisObject`、`args`、`getResult/setResult`、`getThrowable/setThrowable`、`hasThrowable`。`hookReplace` 的 `Function.apply` 返回替代结果。插件关闭或加载失败时 Hook 自动清理，也可手动 `unhook`。
+Hook 使用 LibXposed API 102 的原生 interceptor 模型：`hook(member, "拦截函数名")` 只登记目标成员和函数名，真正的逻辑写在脚本自己的拦截函数里：
+
+```java
+void onLoad() {
+    Method method = firstMethod(findClass("已确认的稳定完整类名"), "已确认的方法名", 1);
+    if (method != null) Object token = hook(method, "onTarget");
+}
+
+Object onTarget(ScriptHookChain chain) throws Throwable {
+    Object arg0 = chain.arg(0);          // 只读参数副本
+    Object result = chain.proceed();      // 放行原方法并拿返回值
+    // 也可以 chain.proceed(new Object[]{新参数...}) 改参数放行
+    return result;                        // 返回值就是宿主方法的返回值；不 proceed 直接 return 表示短路
+}
+```
+
+`ScriptHookChain` 提供 `executable`、`thisObject`、`args`（只读副本）、`argCount`、`arg(i)` / `getArg(i)`、`proceed()`、`proceed(Object[])`、`hasProceeded()` / `proceedCount()`。它只能在收到回调的那个线程、那一次拦截内使用：跨线程或拦截结束后再用会抛 `IllegalStateException`。`proceed()` 抛出的宿主异常会原样抛进脚本，脚本没恢复时模块把同一个原始对象重新抛回宿主；脚本 catch 后正常返回则表示吞掉异常并用自己的返回值覆盖。脚本自身抛出的异常按框架 `PROTECTIVE` 模式记录并放行宿主原方法，因此不能主动注入新异常。解释器正忙时模块立刻放行宿主方法（不阻塞、不排队），登记的拦截函数不存在时也直接放行并只记录一次。插件关闭、禁用、重载、删除或加载失败时 Hook 自动按 `pluginId` 回收，也可用 `unhook(token)` 手动取消。
+
+旧的 `hookBefore` / `hookAfter` / `hookReplace`、`XC_MethodHook.MethodHookParam` 与 `XposedBridge` / `XposedHelpers` 兼容层已在 API 102 原生模型下移除，生成新插件时不得再使用这些名字；迁移对照见 `docs/SCRIPT_PLUGIN_API.md` 的 Hook 章节。
 
 ```java
 Method firstMethod(Object instance, String methodName);
@@ -484,7 +501,7 @@ void setField(Object instance, String fieldName, Object value);
 
 这组插件全局方法是模块 `KavaReflector` 的稳定薄封装，插件优先调用它们，不需要直接操作 `KavaReflector`。`instance` 可传对象或 `SomeClass.class`；传 Class 时处理静态成员或创建实例。`paramCount` 用于区分重载，`params` 使用 `new Object[]{...}`。`firstMethod` 和 `firstField` 会递归父类，失败一般返回 `null`。不带 `params` 的 `invokeMethod(..., paramCount)` 和 `createInstance(..., paramCount)` 只应用于 `paramCount=0`；有参数时必须使用带 `Object[] params` 的重载。
 
-Hook 回调在 BeanShell 中使用 `Consumer.accept(Object param)` / `Function.apply(Object param)` 最稳妥，再通过 `param.args`、`param.thisObject`、`param.getResult()` 等访问真实 `MethodHookParam`。`findMemberList` 可能因类展开返回多个候选；必须先验证直接命中的 descriptor，再核对成员的声明类、参数、返回类型和修饰符，既不能直接 Hook 未验证的第一项，也不能因后续类展开成员重复而误判为目标不唯一。
+拦截函数在 BeanShell 里用 `Object onTarget(ScriptHookChain chain) throws Throwable` 最稳妥，参数类型写 `Object` 也可以；通过 `chain.args`、`chain.thisObject`、`chain.executable` 读取上下文，用 `chain.proceed()` / `chain.proceed(new Object[]{...})` 放行。`findMemberList` 可能因类展开返回多个候选；必须先验证直接命中的 descriptor，再核对成员的声明类、参数、返回类型和修饰符，既不能直接 Hook 未验证的第一项，也不能因后续类展开成员重复而误判为目标不唯一。
 
 ## Agent 插件工作区工具
 

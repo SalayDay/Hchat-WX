@@ -2,13 +2,17 @@ package h.Hchat.hooks.items.purify
 
 import android.view.View
 import android.view.ViewGroup
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.dexkit.DexMethodCache
 import h.Hchat.event.Events
 import h.Hchat.hooks.core.BaseFeature
 import h.Hchat.hooks.core.DexInstallScheduler
 import h.Hchat.hooks.core.FeatureContext
 import h.Hchat.hooks.api.message.ChatAdapterBindLocator
+import h.Hchat.hooks.api.message.ChatAdapterBinding
+import h.Hchat.hooks.api.message.LocalNoticeProtectionStore
+import h.Hchat.hooks.api.message.NativeSystemMessageAccess
+import h.Hchat.hooks.api.core.WeChatApis
 import h.Hchat.hooks.core.HookRegistry
 import h.Hchat.utils.KavaReflector
 import org.luckypray.dexkit.query.FindMethod
@@ -23,8 +27,7 @@ import java.util.Collections
  *
  * 两项都只做「识别明确的目标就处理、识别不到就完全不动」：
  * - 分割线：只在首页会话列表上跳过类名含 Divider/Separator 的 ItemDecoration；
- * - 系统提示：只在聊天列表 item 的消息类型是 10000（微信的系统提示）时隐藏该行，
- *   不会按文字内容猜，避免误伤正常消息。
+ * - 系统提示：按原生消息字段识别 type=10000；保留精确登记的防撤回及原生红包领取提示。
  */
 class ChatPurifyFeature : BaseFeature() {
     private var runtime: ChatPurifyRuntime? = null
@@ -78,11 +81,33 @@ private class ChatPurifyRuntime(
     private val prefs = context.configStore().getFeaturePrefs(ChatPurifyFeature.ID)
     private val cachePrefs = DexMethodCache.prefs(context.hostContext(), "Hchat_chat_purify_cache")
     private var installed = false
+    private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val protectedNotices = LocalNoticeProtectionStore.get(context.hostContext())
+    private val hiddenItems = OwnedVisibilityState<View>({ it.visibility }, { item, state -> item.visibility = state })
+    private val settingsListener = android.content.SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+        if (key == ChatPurifyFeature.KEY_HIDE_SYSTEM_TIP &&
+            !enabled(ChatPurifyFeature.KEY_HIDE_SYSTEM_TIP, ChatPurifyFeature.DEFAULT_HIDE_SYSTEM_TIP)) {
+            mainHandler.post { hiddenItems.restoreAll() }
+        }
+    }
+    init { prefs.registerOnSharedPreferenceChangeListener(settingsListener) }
+
     /** 诊断结果各记一次，便于从日志定位卡点。 */
     private val diagnostics = Collections.synchronizedSet(HashSet<String>())
 
+    /** 同一轮绑定里两参/三参层层回调的深度，只在最外层处理一次。 */
+    private val bindDepth = ThreadLocal<Int>()
+
+    /** holder 类 → itemView 字段；扫过一次就不再扫。 */
+    private val itemViewFields = java.util.concurrent.ConcurrentHashMap<Class<*>, Any>()
+
+    /** holder 类 → 消息字段（或 NONE_FIELD 表示没有）。 */
+    private val messageFields = java.util.concurrent.ConcurrentHashMap<Class<*>, Any>()
+
     fun install(): Boolean {
         if (installed) return true
+        // 安装任务在 DexInstallScheduler 后台执行；绑定只读 cachedSelfWxId，不触发数据库查询。
+        if (protectedNotices.hasEntries()) WeChatApis.account()?.selfWxId()
         val dividerHooked = installDividerHook()
         val tipHooked = installSystemTipHook()
         installed = dividerHooked || tipHooked
@@ -92,6 +117,11 @@ private class ChatPurifyRuntime(
 
     fun destroy() {
         installed = false
+        prefs.unregisterOnSharedPreferenceChangeListener(settingsListener)
+        if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) hiddenItems.restoreAll()
+        else mainHandler.post { hiddenItems.restoreAll() }
+        itemViewFields.clear()
+        messageFields.clear()
     }
 
     // ------------------------------------------------------------ 隐藏分割线
@@ -118,32 +148,7 @@ private class ChatPurifyRuntime(
         var hooked = 0
         for (method in candidates) {
             runCatching {
-                HookRegistry.get().hook(method, object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        if (!enabled(
-                                ChatPurifyFeature.KEY_HIDE_DIVIDER,
-                                ChatPurifyFeature.DEFAULT_HIDE_DIVIDER
-                            )
-                        ) {
-                            return
-                        }
-                        val recycler = param.thisObject as? View ?: return
-                        if (!recycler.javaClass.name.contains("conversation", ignoreCase = true)) {
-                            return
-                        }
-                        val decoration = param.args?.getOrNull(0) ?: return
-                        val name = decoration.javaClass.name
-                        if (name.contains("Divider", ignoreCase = true) ||
-                            name.contains("Separator", ignoreCase = true) ||
-                            name.contains("ItemOffset", ignoreCase = true)
-                        ) {
-                            // 跳过这次注册。必须走 setResult：直接赋 result 不会置
-                            // returnEarly，原方法照样执行。
-                            param.setResult(null)
-                            diag("divider", "界面净化：已拦下分割线装饰 $name")
-                        }
-                    }
-                })
+                HookRegistry.get().hook(method, DividerDecorationHooker(this))
                 hooked++
             }.onFailure { logger("界面净化：分割线候选 Hook 失败 ${method.name}", it) }
         }
@@ -158,88 +163,180 @@ private class ChatPurifyRuntime(
     // -------------------------------------------------------------- 系统灰字
 
     private fun installSystemTipHook(): Boolean {
-        val method = ChatAdapterBindLocator.locate(context, logger) ?: run {
+        // 真正执行的是继承链上最派生的 onBindViewHolder（含 payload 三参），
+        // 定位器返回链上全部重载，运行时再按适配器实例过滤。
+        val binding = ChatAdapterBindLocator.locate(context, logger)
+        if (binding == null) {
             logger("界面净化：未定位到聊天绑定方法", null)
             return false
         }
-        return runCatching {
-            HookRegistry.get().hook(method, object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    if (!enabled(
-                            ChatPurifyFeature.KEY_HIDE_SYSTEM_TIP,
-                            ChatPurifyFeature.DEFAULT_HIDE_SYSTEM_TIP
-                        )
-                    ) {
-                        return
-                    }
-                    // 聊天列表是 RecyclerView 架构，没有 getView；绑定方法的参数是
-                    // (holder, position)。消息对象只能从 holder 上拿。
-                    val holder = param.args?.getOrNull(0) ?: return
-                    val view = holderItemView(holder) ?: return
-                    val message = holderMessage(holder, param) ?: return
-                    if (messageType(message) == ChatPurifyFeature.MESSAGE_TYPE_SYSTEM) {
-                        hideItem(view)
-                    } else if (view.visibility == View.GONE) {
-                        // 复用自愈：这条 View 之前被隐藏过，现在绑的是普通消息，恢复显示。
-                        view.visibility = View.VISIBLE
-                    }
-                }
-            })
-            logger("界面净化：系统提示 Hook 已挂载 ${method.declaringClass.simpleName}#${method.name}，开关 ${if (enabled(ChatPurifyFeature.KEY_HIDE_SYSTEM_TIP, ChatPurifyFeature.DEFAULT_HIDE_SYSTEM_TIP)) "开" else "关"}", null)
-            true
-        }.getOrElse {
-            logger("界面净化：系统提示 Hook 安装失败", it)
-            false
+        var hooked = 0
+        binding.methods.forEach { method ->
+            runCatching {
+                HookRegistry.get().hook(method, SystemTipBindHooker(this, binding))
+                hooked++
+            }.onFailure {
+                logger("界面净化：系统提示 Hook 安装失败 ${method.toGenericString()}", it)
+            }
+        }
+        if (hooked == 0) {
+            logger("界面净化：系统提示 Hook 安装失败", null)
+            return false
+        }
+        logger(
+            "界面净化：系统提示 Hook 已挂载 ×$hooked " +
+                "(${binding.methods.joinToString("、") { "${it.declaringClass.simpleName}#${it.name}(${it.parameterCount})" }})" +
+                "，适配器 ${binding.adapterClass.simpleName}" +
+                "，开关 ${if (enabled(ChatPurifyFeature.KEY_HIDE_SYSTEM_TIP, ChatPurifyFeature.DEFAULT_HIDE_SYSTEM_TIP)) "开" else "关"}",
+            null
+        )
+        return true
+    }
+
+    private class DividerDecorationHooker(private val runtime: ChatPurifyRuntime) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            if (!runtime.enabled(
+                    ChatPurifyFeature.KEY_HIDE_DIVIDER,
+                    ChatPurifyFeature.DEFAULT_HIDE_DIVIDER
+                )
+            ) return chain.proceed()
+            val recycler = chain.thisObject as? View ?: return chain.proceed()
+            if (!recycler.javaClass.name.contains("conversation", ignoreCase = true)) return chain.proceed()
+            val decoration = chain.args.getOrNull(0) ?: return chain.proceed()
+            val name = decoration.javaClass.name
+            if (name.contains("Divider", ignoreCase = true) ||
+                name.contains("Separator", ignoreCase = true) ||
+                name.contains("ItemOffset", ignoreCase = true)
+            ) {
+                runtime.diag("divider", "界面净化：已拦下分割线装饰 $name")
+                return null
+            }
+            return chain.proceed()
         }
     }
 
+    private class SystemTipBindHooker(
+        private val runtime: ChatPurifyRuntime,
+        private val binding: ChatAdapterBinding
+    ) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            if (!binding.matches(chain.thisObject)) return chain.proceed()
+            // 开关关闭时也需要恢复本功能之前隐藏的复用行，不能直接放行留下 GONE。
+            val outermost = runtime.enterBind()
+            try {
+                if (outermost) {
+                    chain.args.firstOrNull()?.let { runtime.holderItemView(it) }
+                        ?.let { runtime.hiddenItems.restore(it) }
+                }
+                val result = chain.proceed()
+                if (outermost && runtime.enabled(ChatPurifyFeature.KEY_HIDE_SYSTEM_TIP,
+                        ChatPurifyFeature.DEFAULT_HIDE_SYSTEM_TIP)) runtime.applySystemTip(chain)
+                return result
+            } finally {
+                runtime.exitBind()
+            }
+        }
+    }
+
+    /** 判断 holder 是不是系统提示消息，是则隐藏；只改 visibility，靠复用时恢复。 */
+    private fun applySystemTip(chain: XposedInterface.Chain) {
+        val started = h.Hchat.utils.SlowPathLog.now()
+        val holder = chain.args.getOrNull(0) ?: return
+        val view = holderItemView(holder) ?: return
+        val message = holderMessage(holder, chain.thisObject, chain.args) ?: return
+        val snapshot = NativeSystemMessageAccess.snapshot(message) ?: return
+        if (snapshot.type == ChatPurifyFeature.MESSAGE_TYPE_SYSTEM) {
+            val account = if (protectedNotices.hasEntries()) WeChatApis.account()?.cachedSelfWxId().orEmpty() else ""
+            if (protectedNotices.preserve(account, snapshot.talker, snapshot.createTime,
+                    snapshot.content, snapshot.localId, snapshot.serverId)) {
+                diag("protected-notice", "界面净化：已保留登记来源的防撤回或红包领取提示")
+            } else {
+                hiddenItems.hide(view)
+                diag("tip-hit", "界面净化：已命中并隐藏普通系统提示消息（首次）")
+            }
+        }
+        h.Hchat.utils.SlowPathLog.report(
+            "purify.bind",
+            h.Hchat.utils.SlowPathLog.elapsedSince(started),
+            SLOW_BIND_MS,
+            "界面净化绑定处理",
+            holder.javaClass.simpleName
+        )
+    }
+
+    private fun enterBind(): Boolean {
+        val depth = bindDepth.get() ?: 0
+        bindDepth.set(depth + 1)
+        return depth == 0
+    }
+
+    private fun exitBind() {
+        val depth = (bindDepth.get() ?: 1) - 1
+        if (depth <= 0) bindDepth.remove() else bindDepth.set(depth)
+    }
+
+    /** 结果按 holder 类缓存：绑定是热路径，不能每次都遍历整条字段表。 */
     private fun holderItemView(holder: Any): View? {
-        (KavaReflector.readField(holder, "itemView") as? View)?.let { return it }
-        var current: Class<*>? = holder.javaClass
+        val field = itemViewField(holder.javaClass) ?: return null
+        return KavaReflector.readField(field, holder) as? View
+    }
+
+    private fun itemViewField(holderClass: Class<*>): java.lang.reflect.Field? {
+        itemViewFields[holderClass]?.let { return it as? java.lang.reflect.Field }
+        var found: java.lang.reflect.Field? = null
+        var current: Class<*>? = holderClass
         while (current != null && current != Any::class.java) {
-            KavaReflector.declaredFields(current).firstOrNull { it.type == View::class.java }
-                ?.let { return KavaReflector.readField(it, holder) as? View }
+            found = KavaReflector.declaredFields(current).firstOrNull { it.type == View::class.java }
+            if (found != null) break
             current = current.superclass
         }
-        return null
+        itemViewFields[holderClass] = found ?: NONE_FIELD
+        return found
     }
 
     /**
      * 从 holder 上读它当前绑定的消息对象。
      *
-     * holder 通常持有消息字段；字段名逐版本变化，所以按「带 getType 且返回 int」的
-     * 对象特征找，而不是按名字找。找不到就退回用 position 问 adapter 要。
+     * 只接受具备微信原生消息持久化字段形状的对象；不把任意带 getType 的 holder 字段当消息。
+     * 命中的字段按 holder 类缓存；取不到时用已核实的 adapter.getItem(position) 内存回退。
      */
-    private fun holderMessage(holder: Any, param: XC_MethodHook.MethodHookParam): Any? {
-        var current: Class<*>? = holder.javaClass
-        while (current != null && current != Any::class.java) {
-            for (field in KavaReflector.declaredFields(current)) {
-                if (field.type.isPrimitive || field.type == String::class.java) continue
-                val value = KavaReflector.readField(field, holder) ?: continue
-                if (messageType(value) != null) return value
+    private fun holderMessage(holder: Any, owner: Any?, args: List<Any?>): Any? {
+        val cached = messageFields[holder.javaClass]
+        if (cached != null && cached !== NONE_FIELD) {
+            (KavaReflector.readField(cached as java.lang.reflect.Field, holder))
+                ?.takeIf { NativeSystemMessageAccess.isMessageClass(it.javaClass) }
+                ?.let { return it }
+        } else if (cached == null) {
+            var current: Class<*>? = holder.javaClass
+            while (current != null && current != Any::class.java) {
+                for (field in KavaReflector.declaredFields(current)) {
+                    if (field.type.isPrimitive || field.type == String::class.java) continue
+                    val value = KavaReflector.readField(field, holder) ?: continue
+                    if (NativeSystemMessageAccess.isMessageClass(value.javaClass)) {
+                        messageFields[holder.javaClass] = field
+                        return value
+                    }
+                }
+                current = current.superclass
             }
-            current = current.superclass
+            // 该类没有消息字段（例如系统提示 holder），记下来避免下次再扫。
+            messageFields[holder.javaClass] = NONE_FIELD
         }
-        val position = (param.args?.getOrNull(1) as? Number)?.toInt() ?: return null
-        return KavaReflector.invokeMethod(param.thisObject, "getItem", position)
+        val position = (args.getOrNull(1) as? Number)?.toInt() ?: return null
+        // 8.0.80 的 getItem(int) 是 bridge，直接从适配器内存列表返回当前原生消息。
+        return KavaReflector.invokeMethod(owner, "getItem", position)?.takeIf {
+            NativeSystemMessageAccess.isMessageClass(it.javaClass)
+        }
     }
 
-    private fun hideItem(view: View) {
-        if (view.visibility == View.GONE) return
-        // 只改可见性。不要动 layoutParams.height：列表项 View 会被回收复用，
-        // 压成 0 之后复用到正常消息上，那条消息会跟着消失。
-        view.visibility = View.GONE
-    }
-
-    private fun messageType(message: Any): Int? {
-        (KavaReflector.invokeMethod(message, "getType") as? Number)?.let { return it.toInt() }
-        (KavaReflector.readField(message, "field_type") as? Number)?.let { return it.toInt() }
-        return null
-    }
     private fun enabled(key: String, default: Boolean): Boolean = prefs.getBoolean(key, default)
 
     private companion object {
         const val CACHE_KEY = "purify_v2"
+        /** 字段扫描的负结果哨兵：ConcurrentHashMap 不能存 null。 */
+        val NONE_FIELD = Any()
+        /** 单次绑定处理超过这个耗时就记一条慢路径日志。 */
+        const val SLOW_BIND_MS = 8L
     }
 }
 

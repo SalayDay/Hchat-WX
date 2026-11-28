@@ -2,30 +2,27 @@ package h.Hchat.hooks.items.menustyle
 
 import android.content.res.Configuration
 import android.graphics.drawable.ColorDrawable
+import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
 import android.view.View
 import android.widget.PopupWindow
-import de.robv.android.xposed.XC_MethodHook
 import h.Hchat.event.Events
+import h.Hchat.hooks.api.message.ChatMenuPopupLocator
 import h.Hchat.hooks.core.BaseFeature
 import h.Hchat.hooks.core.DexInstallScheduler
 import h.Hchat.hooks.core.FeatureContext
 import h.Hchat.hooks.core.HookRegistry
 import h.Hchat.utils.KavaReflector
+import io.github.libxposed.api.XposedInterface
+import java.lang.reflect.Method
+import java.util.Collections
+import java.util.WeakHashMap
 
-/**
- * 长按菜单磨砂卡片化。
- *
- * 微信的长按菜单是 `PopupWindow` 承载的自绘视图，这里不去改它的内部布局（那是按
- * 版本逐个 view 做手术），只在弹出时把容器的背景换成圆角半透明卡片，并留出内边距。
- * 只处理**内容视图类名含 Menu** 的弹窗，其它 PopupWindow（输入法候选、下拉框等）
- * 完全不碰，避免误伤。
- */
+/** 聊天消息长按菜单的圆角半透明卡片样式。 */
 class MenuStyleFeature : BaseFeature() {
     private var runtime: MenuStyleRuntime? = null
 
     override fun featureId(): String = ID
-
     override fun name(): String = "长按菜单磨砂卡片"
 
     override fun onFeatureInit(context: FeatureContext) {
@@ -33,7 +30,6 @@ class MenuStyleFeature : BaseFeature() {
     }
 
     override fun onFeatureInstall(context: FeatureContext) {
-        // 安装结果一律走 boot 缓冲：功能在启动期安装，而日志采集通常是之后才打开。
         runtime = MenuStyleRuntime(context) { message, throwable ->
             if (throwable == null) logBoot(message) else logError(message, throwable)
         }
@@ -50,10 +46,6 @@ class MenuStyleFeature : BaseFeature() {
         DexInstallScheduler.schedule(ID, name()) { runtime?.install() == true }
     }
 
-    private fun logFeatureError(message: String, throwable: Throwable?) {
-        logError(message, throwable)
-    }
-
     companion object {
         const val ID = "menu_style"
         const val KEY_ENABLED = "enabled"
@@ -66,97 +58,167 @@ private class MenuStyleRuntime(
     private val logger: (String, Throwable?) -> Unit
 ) {
     private val prefs = context.configStore().getFeaturePrefs(MenuStyleFeature.ID)
-    private var installed = false
+    private val displayScope = ChatMenuDisplayScope<View>()
+    private val registeredMethods = HashSet<Method>()
+    private val styles = Collections.synchronizedMap(WeakHashMap<PopupWindow, OriginalStyle>())
+    private val diagnostics = Collections.synchronizedSet(HashSet<String>())
+    @Volatile private var installed = false
+    @Volatile private var destroyed = false
 
+    @Synchronized
     fun install(): Boolean {
         if (installed) return true
-        val popupClass = KavaReflector.loadClass(
-            "android.widget.PopupWindow",
-            context.hostClassLoader()
-        ) ?: run {
-            logger("菜单美化：找不到 PopupWindow", null)
+        val openMethods = ChatMenuPopupLocator.openMethods(context, logger)
+        if (openMethods.isEmpty()) {
+            logger("菜单美化：未找到已验证的聊天长按打开入口，未启用弹窗处理", null)
             return false
         }
-        val methods = listOfNotNull(
+        val showMethods = listOfNotNull(
             KavaReflector.findMethodRecursive(
-                popupClass,
-                "showAtLocation",
-                View::class.java,
-                Integer.TYPE,
-                Integer.TYPE,
-                Integer.TYPE
+                PopupWindow::class.java, "showAtLocation", View::class.java,
+                Integer.TYPE, Integer.TYPE, Integer.TYPE
             ),
             KavaReflector.findMethodRecursive(
-                popupClass,
-                "showAsDropDown",
-                View::class.java,
-                Integer.TYPE,
-                Integer.TYPE,
-                Integer.TYPE
+                PopupWindow::class.java, "showAsDropDown", View::class.java,
+                Integer.TYPE, Integer.TYPE, Integer.TYPE
             )
-        )
-        if (methods.isEmpty()) {
-            logger("菜单美化：找不到弹窗显示方法", null)
+        ).distinct()
+        if (showMethods.isEmpty()) {
+            logger("菜单美化：找不到 PopupWindow 显示方法", null)
             return false
         }
-        var hooked = 0
-        methods.forEach { method ->
-            runCatching {
-                HookRegistry.get().hook(method, object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        if (!enabled()) return
-                        val popup = param.thisObject as? PopupWindow ?: return
-                        runCatching { stylePopup(popup) }.onFailure {
-                            logger("菜单美化：套用样式失败", it)
-                        }
-                    }
-                })
-                hooked++
-            }.onFailure {
-                logger("菜单美化：Hook 安装失败 ${method.name}", it)
-            }
+        destroyed = false
+        var openCount = 0
+        var showCount = 0
+        for (method in openMethods) {
+            if (register(method, ChatMenuOpenHooker(this))) openCount++
         }
-        installed = hooked > 0
+        for (method in showMethods) {
+            if (register(method, PopupShowHooker(this))) showCount++
+        }
+        // 部分失败可以由安装调度器重试，已经注册的 Method 不重复挂载。
+        installed = openCount == openMethods.size && showCount == showMethods.size
         if (installed) {
-            logger("菜单美化：已挂载 PopupWindow 显示 ×$hooked，开关 ${if (enabled()) "开" else "关"}", null)
-        } else {
-            logger("菜单美化 Hook 未安装", null)
+            logger("菜单美化：聊天菜单打开入口 ×$openCount，弹窗显示 ×$showCount，" +
+                "开关 ${if (enabled()) "开" else "关"}", null)
         }
         return installed
     }
 
+    private fun register(method: Method, hooker: XposedInterface.Hooker): Boolean {
+        if (method in registeredMethods) return true
+        return runCatching {
+            HookRegistry.get().hook(method, hooker)
+            registeredMethods.add(method)
+            true
+        }.getOrElse {
+            logger("菜单美化：Hook 安装失败 ${method.toGenericString()}", it)
+            false
+        }
+    }
+
+    private class ChatMenuOpenHooker(private val runtime: MenuStyleRuntime) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val anchor = chain.args.firstOrNull() as? View ?: return chain.proceed()
+            if (runtime.destroyed || !runtime.enabled()) return chain.proceed()
+            // 逆向已确认菜单在此调用内部同步显示。先建立上下文再执行，finally 清除；
+            // 不 Hook View.performLongClick，不保留“任意长按后两秒”的广域窗口。
+            return runtime.displayScope.during(anchor) { chain.proceed() }
+        }
+    }
+
+    private class PopupShowHooker(private val runtime: MenuStyleRuntime) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val popup = chain.thisObject as? PopupWindow ?: return chain.proceed()
+            if (runtime.destroyed || !runtime.enabled()) {
+                runtime.restore(popup)
+                return chain.proceed()
+            }
+            val origin = runtime.displayScope.current() ?: return chain.proceed()
+            val hostAnchor = chain.args.firstOrNull() as? View ?: return chain.proceed()
+            // 仅处理当前聊天窗口中、已验证长按打开入口内部同步出现的弹窗。
+            if (origin.rootView !== hostAnchor.rootView) return chain.proceed()
+            runCatching { runtime.applyCard(popup) }.onFailure {
+                runtime.logger("菜单美化：套用样式失败", it)
+            }
+            return chain.proceed()
+        }
+    }
+
+    private class OriginalStyle(
+        val content: java.lang.ref.WeakReference<View>,
+        val background: Drawable?,
+        val popupBackground: Drawable?,
+        val width: Int,
+        val left: Int,
+        val top: Int,
+        val right: Int,
+        val bottom: Int,
+        val clipToOutline: Boolean
+    )
+
+    private fun applyCard(popup: PopupWindow) {
+        val content = popup.contentView ?: return
+        val previous = styles[popup]
+        val original = if (previous != null && previous.content.get() === content) {
+            previous
+        } else {
+            OriginalStyle(java.lang.ref.WeakReference(content), content.background,
+                popup.background, popup.width, content.paddingLeft, content.paddingTop,
+                content.paddingRight, content.paddingBottom, content.clipToOutline).also { styles[popup] = it }
+        }
+        val density = content.resources.displayMetrics.density
+        val dark = (content.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
+            Configuration.UI_MODE_NIGHT_YES
+        val padding = (density * 8f).toInt()
+        content.background = GradientDrawable().apply {
+            cornerRadius = density * 16f
+            setColor(if (dark) 0xF22B2B2B.toInt() else 0xF2FFFFFF.toInt())
+            setStroke((density * 0.5f).toInt().coerceAtLeast(1),
+                if (dark) 0x33FFFFFF else 0x14000000)
+        }
+        popup.setBackgroundDrawable(ColorDrawable(0x00000000))
+        content.setPadding(original.left + padding, original.top + padding,
+            original.right + padding, original.bottom + padding)
+        // 永远从原始宽度计算，避免同一个弹窗反复打开不断变宽。
+        if (original.width > 0) popup.width = original.width + padding * 2
+        content.clipToOutline = true
+        val signature = popup.javaClass.name + "/" + content.javaClass.name
+        if (diagnostics.add(signature)) {
+            logger("菜单美化：已应用聊天菜单卡片 popup=${popup.javaClass.name} " +
+                "content=${content.javaClass.name}", null)
+        }
+    }
+
+    private fun restore(popup: PopupWindow) {
+        val original = styles.remove(popup) ?: return
+        runCatching {
+            original.content.get()?.let { content ->
+                content.background = original.background
+                content.clipToOutline = original.clipToOutline
+                content.setPadding(original.left, original.top, original.right, original.bottom)
+            }
+            popup.setBackgroundDrawable(original.popupBackground)
+            popup.width = original.width
+        }.onFailure { logger("菜单美化：恢复原生样式失败", it) }
+    }
+
     fun destroy() {
+        destroyed = true
         installed = false
+        val popups = synchronized(styles) { styles.keys.toList() }
+        for (popup in popups) {
+            val content = popup.contentView
+            if (content != null && android.os.Looper.myLooper() != android.os.Looper.getMainLooper()) {
+                content.post { restore(popup) }
+            } else restore(popup)
+        }
+        registeredMethods.clear()
+        diagnostics.clear()
     }
 
     private fun enabled(): Boolean =
         prefs.getBoolean(MenuStyleFeature.KEY_ENABLED, MenuStyleFeature.DEFAULT_ENABLED)
-
-    private fun stylePopup(popup: PopupWindow) {
-        val content = popup.contentView ?: return
-        if (!content.javaClass.name.contains("menu", ignoreCase = true)) return
-        val resources = content.context.resources
-        val density = resources.displayMetrics.density
-        val radius = density * 16f
-        val dark = (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
-            Configuration.UI_MODE_NIGHT_YES
-        val card = GradientDrawable().apply {
-            cornerRadius = radius
-            setColor(if (dark) 0xF22B2B2B.toInt() else 0xF2FFFFFF.toInt())
-            // 极淡的描边，避免纯色块贴在背景上看不出边界。
-            setStroke(
-                (density * 0.5f).toInt().coerceAtLeast(1),
-                if (dark) 0x33FFFFFF else 0x14000000
-            )
-        }
-        // 弹窗外层背景必须透明，否则圆角外面会露出原来的矩形底。
-        popup.setBackgroundDrawable(ColorDrawable(0x00000000))
-        val padding = (density * 8f).toInt()
-        content.setBackgroundDrawable(card)
-        content.setPadding(padding, padding, padding, padding)
-        // WRAP_CONTENT(-2)/MATCH_PARENT(-1) 不能做加法，只有固定宽度才补。
-        if (popup.width > 0) popup.width = popup.width + padding * 2
-    }
 }
 
 class MenuStyleSettingsProvider : h.Hchat.ui.SimpleFeatureSettingsProvider(

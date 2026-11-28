@@ -6,8 +6,9 @@ import android.content.Intent
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import de.robv.android.xposed.XC_MethodHook
-import de.robv.android.xposed.XposedBridge
+import io.github.libxposed.api.XposedInterface
+import h.Hchat.hooks.core.HookRegistry
+import h.Hchat.utils.KavaReflector
 import h.Hchat.utils.HLog
 import java.lang.ref.WeakReference
 import java.util.concurrent.ArrayBlockingQueue
@@ -203,8 +204,8 @@ internal class ConversationGroupFileResultHooks(
     private val onResult: (Activity, Int, Int, Intent?) -> Unit,
     private val onHostFailure: ((Activity, Int) -> Unit)? = null
 ) {
-    private val hooks = linkedMapOf<Class<*>, Set<XC_MethodHook.Unhook>>()
-    private val retiredHooks = linkedSetOf<XC_MethodHook.Unhook>()
+    private val hooks = linkedMapOf<Class<*>, Set<XposedInterface.HookHandle>>()
+    private val retiredHooks = linkedSetOf<XposedInterface.HookHandle>()
     private var generation = 0L
 
     @Synchronized
@@ -215,24 +216,14 @@ internal class ConversationGroupFileResultHooks(
             var clazz: Class<*>? = activityClass
             while (clazz != null && Activity::class.java.isAssignableFrom(clazz)) {
                 if (!hooks.containsKey(clazz)) {
-                    val handles = XposedBridge.hookAllMethods(clazz, "onActivityResult", object : XC_MethodHook() {
-                        override fun afterHookedMethod(param: MethodHookParam) {
-                            val owner = param.thisObject as? Activity ?: return
-                            val code = param.args.getOrNull(0) as? Int ?: return
-                            val result = param.args.getOrNull(1) as? Int ?: Activity.RESULT_CANCELED
-                            synchronized(this@ConversationGroupFileResultHooks) {
-                                if (generation == installingGeneration) {
-                                    if (param.hasThrowable() && onHostFailure != null) {
-                                        runCatching { onHostFailure(owner, code) }
-                                            .onFailure { HLog.e("[Hchat:ConversationGroup] 取消失败的文件结果请求异常", it) }
-                                    } else {
-                                        onResult(owner, code, result, param.args.getOrNull(2) as? Intent)
-                                    }
-                                }
-                            }
-                        }
-                    })
-                    hooks[clazz] = handles
+                    val targetClass = clazz
+                    val handles = HookRegistry.get().hookAllMethods(targetClass, "onActivityResult", FileResultHook(this, installingGeneration))
+                    val expected = KavaReflector.declaredMethods(targetClass).count { it.name == "onActivityResult" }
+                    if (handles.size != expected) {
+                        retiredHooks.addAll(handles)
+                        error("结果 Hook 安装不完整: ${targetClass.name}#onActivityResult ${handles.size}/$expected")
+                    }
+                    hooks[targetClass] = handles
                 }
                 clazz = clazz.superclass
             }
@@ -260,9 +251,42 @@ internal class ConversationGroupFileResultHooks(
         val iterator = retiredHooks.iterator()
         while (iterator.hasNext()) {
             val handle = iterator.next()
-            runCatching { handle.unhook() }
+            runCatching { HookRegistry.get().unhook(handle) }
                 .onSuccess { iterator.remove() }
                 .onFailure { HLog.e("[Hchat:ConversationGroup] 卸载文件选择结果 Hook 失败", it) }
+        }
+    }
+
+    private class FileResultHook(private val owner: ConversationGroupFileResultHooks, private val installingGeneration: Long) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            return with(owner) {
+                val activity = chain.thisObject as? Activity
+                val args = chain.args
+                val code = args.getOrNull(0) as? Int
+                val resultCode = args.getOrNull(1) as? Int ?: Activity.RESULT_CANCELED
+                val data = args.getOrNull(2) as? Intent
+                val outcome = try {
+                    chain.proceed()
+                } catch (hostError: Throwable) {
+                    if (activity != null && code != null) {
+                        runCatching {
+                            synchronized(owner) {
+                                if (generation == installingGeneration) {
+                                    val failure = onHostFailure
+                                    if (failure != null) failure(activity, code)
+                                    else onResult(activity, code, resultCode, data)
+                                }
+                            }
+                        }.onFailure { HLog.e("[Hchat:ConversationGroup] 取消失败的文件结果请求异常", it) }
+                    }
+                    throw hostError
+                }
+                if (activity == null || code == null) return outcome
+                synchronized(owner) {
+                    if (generation == installingGeneration) onResult(activity, code, resultCode, data)
+                }
+                return outcome
+            }
         }
     }
 }

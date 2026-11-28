@@ -3,7 +3,7 @@ package h.Hchat.hooks.items.gameemoji
 import android.app.Activity
 import android.os.Handler
 import android.os.Looper
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.event.Events
 import h.Hchat.hooks.api.core.WeChatApis
 import h.Hchat.hooks.core.BaseFeature
@@ -71,24 +71,7 @@ private class GameEmojiRuntime(
         val fields = resolveEmojiFields(method.parameterTypes[1]) ?: return false
         emojiFields = fields
         return runCatching {
-            HookRegistry.get().hook(method, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    if (replaying.get() == true) return
-                    val emojiInfo = param.args?.getOrNull(1) ?: return
-                    val gameType = detectGameType(emojiInfo) ?: return
-                    when {
-                        GameEmojiSettings.pickBeforeSendEnabled(context.hostContext()) -> {
-                            interceptForChoice(method, param, gameType)
-                        }
-                        GameEmojiSettings.fixedResultEnabled(context.hostContext()) -> {
-                            val result = configuredResult(gameType)
-                            if (!applyResult(emojiInfo, gameType, result)) {
-                                logger("改写游戏表情结果失败", null)
-                            }
-                        }
-                    }
-                }
-            })
+            HookRegistry.get().hook(method, EmojiSendHooker(this, method))
             installed = true
             true
         }.getOrElse {
@@ -98,25 +81,47 @@ private class GameEmojiRuntime(
         }
     }
 
+    private class EmojiSendHooker(
+        private val runtime: GameEmojiRuntime,
+        private val method: Method
+    ) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            if (runtime.replaying.get() == true) return chain.proceed()
+            val emojiInfo = chain.args.getOrNull(1) ?: return chain.proceed()
+            val gameType = runtime.detectGameType(emojiInfo) ?: return chain.proceed()
+            when {
+                GameEmojiSettings.pickBeforeSendEnabled(runtime.context.hostContext()) -> {
+                    if (runtime.interceptForChoice(
+                            method, chain.thisObject, chain.args.toTypedArray(), gameType
+                        )
+                    ) return null
+                }
+                GameEmojiSettings.fixedResultEnabled(runtime.context.hostContext()) -> {
+                    val result = runtime.configuredResult(gameType)
+                    if (!runtime.applyResult(emojiInfo, gameType, result)) {
+                        runtime.logger("改写游戏表情结果失败", null)
+                    }
+                }
+            }
+            return chain.proceed()
+        }
+    }
+
     private fun interceptForChoice(
         method: Method,
-        param: XC_MethodHook.MethodHookParam,
+        receiver: Any?,
+        args: Array<Any?>,
         gameType: GameType
-    ) {
+    ): Boolean {
         val activity = (WeChatApis.currentActivity()?.currentActivity() as? Activity)
             ?.takeUnless { it.isFinishing || it.isDestroyed }
-            ?: return
-        val pending = PendingSend(method, param.thisObject, param.args.copyOf(), gameType)
+            ?: return false
+        val pending = PendingSend(method, receiver, args, gameType)
         if (!dialogShowing.compareAndSet(false, true)) {
-            // 弹窗还在显示时又点了一次（连点、或上一次没关掉）。
-            // 原来这里只做 param.result = null 就返回：这一下点击被静默吞掉，
-            // 消息既不发送也没有任何提示，用户以为发出去了。
-            // 现在改用原生随机结果立即补发（replaying 标志保证不会重入本 hook）。
-            param.setResult(null)
+            // 弹窗显示期间再次点击，保留原有的原生随机结果补发行为。
             replay(pending, null)
-            return
+            return true
         }
-        param.setResult(null)
         mainHandler.post {
             if (activity.isFinishing || activity.isDestroyed) {
                 dialogShowing.set(false)
@@ -139,6 +144,7 @@ private class GameEmojiRuntime(
                 replay(pending, null)
             }
         }
+        return true
     }
 
     private fun replay(pending: PendingSend, selected: GameResult?) {

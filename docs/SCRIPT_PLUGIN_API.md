@@ -110,15 +110,13 @@ process=main
 | `View` | `android.view.View` | 原生界面控件。 |
 | `ContentValues` | `android.content.ContentValues` | 数据库插入和更新参数。 |
 | `Cursor` | `android.database.Cursor` | 数据库原始查询结果。 |
-| `Consumer` | `java.util.function.Consumer` | 异步回调和 Hook 回调。 |
-| `Function` | `java.util.function.Function` | 替换 Hook 回调。 |
+| `Consumer` | `java.util.function.Consumer` | 异步回调（Hook 回调不再使用它）。 |
+| `Function` | `java.util.function.Function` | 普通函数式接口（Hook 替换不再使用它）。 |
 | `Field` | `java.lang.reflect.Field` | Java 反射字段。 |
 | `Method` | `java.lang.reflect.Method` | Java 反射方法。 |
 | `Constructor` | `java.lang.reflect.Constructor` | Java 反射构造函数。 |
 | `Member` | `java.lang.reflect.Member` | 反射成员基类。 |
-| `XposedBridge` | `de.robv.android.xposed.XposedBridge` | Xposed 原生接口。 |
-| `XposedHelpers` | `de.robv.android.xposed.XposedHelpers` | Xposed 辅助接口。 |
-| `XC_MethodHook` | `de.robv.android.xposed.XC_MethodHook` | Xposed Hook 回调类。 |
+| `ScriptHookChain` | `h.Hchat.hooks.items.script.ScriptHookChain` | `hook()` 拦截回调拿到的受限调用链。 |
 | `WeChatApis` | `h.Hchat.hooks.api.core.WeChatApis` | Hchat 内部微信 API 入口，进阶用法。普通插件优先使用本文档里的 WA 风格函数。 |
 | `KavaReflector` | `h.Hchat.utils.KavaReflector` | Hchat 反射封装，进阶用法。 |
 | `DexKitBridge` | `org.luckypray.dexkit.DexKitBridge` | DexKit 原始桥接类，进阶用法。 |
@@ -141,7 +139,6 @@ process=main
 | `dexKitBridge` | DexKit 原始桥接对象。 |
 | `dexFinder` | Hchat DexFinder 实例。 |
 | `dexBridgeHolder` | DexKit 持有器。 |
-| `XposedBridgeClass` / `XposedHelpersClass` / `XC_MethodHookClass` | 对应 Xposed 类对象。 |
 | `WeChatApisClass` / `KavaReflectorClass` | 对应 Hchat 内部类对象。 |
 | `DexKitBridgeClass` / `DexFinderClass` / `DexBridgeHolderClass` | 对应 DexKit 相关类对象。 |
 | `FieldClass` / `MethodClass` / `ConstructorClass` | 对应 Java 反射类对象。 |
@@ -819,7 +816,7 @@ void onNewFriend(String wxid, String ticket, int scene) {
 
 微信主进程冷启动自动加载已启用插件时，模块会先初始化脚本 Bridge、目录和文件监听，等公共 Dex 定位完成并确认联系人数据库包含 `rcontact`、`chatroom` 表后，再在独立线程执行插件源码与 `onLoad()`。该等待不阻塞微信主线程或 DexKit 调度队列，某个主进程插件加载失败也不会阻断后续插件；手动启用或重载仍同步返回真实结果，数据库尚未就绪时会直接返回可重试错误。
 
-`process=appbrand` / `all` 的插件会在每个小程序进程 `Application` 就绪后，由独立轻量运行时加载。模块先按插件清单与启用状态判断该进程是否存在需要运行的小程序插件：没有已启用的小程序插件时，小程序进程不创建脚本 Bridge、不启动加载线程，也不初始化脚本运行时对象；只有确实需要时才创建一次运行时并按清单加载。小程序进程不初始化完整 `FeatureManager`、联系人/消息数据库、主进程消息回调、插件文件监听或 DexKit；`dexKit`、`dexKitBridge`、`dexFinder`、`dexBridgeHolder` 均为 `null`，联系人、数据库、发送消息等依赖主进程公共 API 的函数也不保证可用。小程序插件应通过稳定完整类名、反射及 `hookBefore` / `hookAfter` / `hookReplace` 操作当前 `classLoader`；不要在子进程创建新的 DexKit。各小程序进程使用隔离的 Dex/SO 代码缓存，`config.prop` 写入使用跨进程文件锁；配置值仍由同一插件的各进程共享。小程序进程加载失败只写错误日志，不会自动关闭该插件的共享开关，以免一个小程序进程影响其它进程。
+`process=appbrand` / `all` 的插件会在每个小程序进程 `Application` 就绪后，由独立轻量运行时加载。模块先按插件清单与启用状态判断该进程是否存在需要运行的小程序插件：没有已启用的小程序插件时，小程序进程不创建脚本 Bridge、不启动加载线程，也不初始化脚本运行时对象；只有确实需要时才创建一次运行时并按清单加载。小程序进程不初始化完整 `FeatureManager`、联系人/消息数据库、主进程消息回调、插件文件监听或 DexKit；`dexKit`、`dexKitBridge`、`dexFinder`、`dexBridgeHolder` 均为 `null`，联系人、数据库、发送消息等依赖主进程公共 API 的函数也不保证可用。小程序插件应通过稳定完整类名、反射及 `hook` 操作当前 `classLoader`；不要在子进程创建新的 DexKit。各小程序进程使用隔离的 Dex/SO 代码缓存，`config.prop` 写入使用跨进程文件锁；配置值仍由同一插件的各进程共享。小程序进程加载失败只写错误日志，不会自动关闭该插件的共享开关，以免一个小程序进程影响其它进程。
 
 最小小程序进程 Hook 结构：
 
@@ -836,12 +833,12 @@ void onLoad() {
         log("当前微信版本未找到小程序目标方法");
         return;
     }
-    hookBefore(method, new Consumer() {
-        public void accept(Object value) {
-            XC_MethodHook.MethodHookParam param = (XC_MethodHook.MethodHookParam) value;
-            // 只处理已逆向确认的参数和返回值。
-        }
-    });
+    hook(method, "onAppBrandMethod");
+}
+
+Object onAppBrandMethod(ScriptHookChain chain) throws Throwable {
+    // 只处理已逆向确认的参数和返回值。
+    return chain.proceed();
 }
 ```
 
@@ -1979,41 +1976,141 @@ startTransform(7, pluginDir + "/a.mp3", cacheDir + "/a.aac", 44100, new java.uti
 
 ## Hook
 
+Hchat 的脚本 Hook 使用 LibXposed API 102 的原生 interceptor 模型：`hook()` 只登记「目标成员 + 脚本里的拦截函数名」，脚本拿到的 `ScriptHookChain` 是受限 façade，不暴露任何 Xposed 兼容层类型。
+
 接口：
 
 | 代码 | 说明 |
 | --- | --- |
-| `findClass(String className)` | 按完整类名查找微信里的类。 |
-| `hookBefore(Member member, Consumer callback)` | 前置 Hook。目标方法执行前调用 `callback`。 |
-| `hookAfter(Member member, Consumer callback)` | 后置 Hook。目标方法执行后调用 `callback`。 |
-| `hookReplace(Member member, Function callback)` | 替换 Hook。使用 `callback` 的返回值作为原方法返回值。 |
-| `unhook(Object handle)` | 取消某个 Hook。 |
+| `findClass(String className)` | 按完整类名查找微信里的类；找不到抛 `ClassNotFoundException`。 |
+| `hook(Member member, String functionName)` | 用默认优先级（`50`）安装拦截器。 |
+| `hook(Member member, String functionName, int priority)` | 指定优先级安装拦截器，数值越大越早进入调用链。 |
+| `unhook(Object token)` | 取消 `hook()` 返回的句柄。 |
 
 参数说明：
 
 | 参数 | 说明 |
 | --- | --- |
 | `className` | 完整类名，例如 `com.tencent.mm.ui.LauncherUI`。 |
-| `member` | `Method` 或 `Constructor`。 |
-| `callback` | 回调对象。Hook 参数运行时实际对象是 `XC_MethodHook.MethodHookParam`。脚本加载前会把 `MethodHookParam` 类型声明兼容为 `Object`，运行时回调参数仍是原始 `XC_MethodHook.MethodHookParam`。 |
-| `handle` | `hookBefore/hookAfter/hookReplace` 返回的 Hook 句柄。 |
+| `member` | `Method` 或 `Constructor`，其他 `Member` 直接报错。 |
+| `functionName` | 插件脚本里的拦截函数名，命名规则 `[A-Za-z_][A-Za-z0-9_]*`，函数名可以任意取。 |
+| `priority` | 可选，默认 `50`；`Integer.MAX_VALUE` 最先执行，`Integer.MIN_VALUE` 最后执行。 |
+| `token` | `hook()` 返回的不透明句柄（`Long`）。 |
 
-通过这些接口注册的 Hook 会在插件关闭、重载或加载失败时自动清理，并同步从模块全局 Hook 注册表释放句柄。插件自行保存的句柄、对象以及直接调用 Xposed API 注册的 Hook 仍需插件自行管理。
+### 拦截函数
 
-示例：
+拦截函数只在 Hook 回调线程上同步执行，参数是 `ScriptHookChain`。下面三种写法按需三选一：
 
 ```java
-Class clazz = findClass("com.tencent.mm.ui.LauncherUI");
-Method method = clazz.getDeclaredMethod("onResume", new Class[0]);
+// A. 只看不改：放行后原样返回
+Object intercept(ScriptHookChain chain) throws Throwable {
+    Object result = chain.proceed();
+    log("called " + chain.executable);
+    return result;
+}
 
-Object handle = hookAfter(method, new java.util.function.Consumer() {
-    public void accept(Object param) {
-        log("onResume");
+// B. 改参数：参数个数必须和原方法一致
+Object intercept(ScriptHookChain chain) throws Throwable {
+    Object[] args = chain.args.toArray();   // args 是只读副本，这里先复制成可写数组
+    args[0] = "替换后的第一个参数";
+    return chain.proceed(args);
+}
+
+// C. 短路：不调用 proceed，宿主原方法不会执行
+Object intercept(ScriptHookChain chain) throws Throwable {
+    return null;
+}
+```
+
+注册方式：
+
+```java
+void onLoad() {
+    Method method = firstMethod(findClass("com.tencent.mm.ui.LauncherUI"), "onResume", 0);
+    if (method != null) hook(method, "intercept");
+}
+```
+
+参数类型也可以写 `Object`（`Object intercept(Object chain)`），效果相同；写了 `ScriptHookChain` 时类名会按上面的内置导入解析。
+
+`ScriptHookChain` 的成员：
+
+| 成员 | 说明 |
+| --- | --- |
+| `executable` | 被 Hook 的 `Method` / `Constructor`。 |
+| `thisObject` | 当前调用的 `this`，静态成员为 `null`。 |
+| `args` | 参数只读副本（`List`），改它不会影响宿主；要改参数请用 `proceed(Object[])`。 |
+| `argCount` | 参数个数。 |
+| `arg(int index)` / `getArg(int index)` | 取第 `index` 个参数，越界抛 `IndexOutOfBoundsException`。 |
+| `proceed()` | 继续执行链上的下一个拦截器或宿主原方法，返回其结果。 |
+| `proceed(Object[] newArgs)` | 替换参数后继续执行；参数个数不一致立即抛 `IllegalArgumentException`。 |
+| `hasProceeded()` / `proceedCount()` | 是否调用过 `proceed` / 调用了几次。 |
+
+`ScriptHookChain` 的生命周期约束：
+
+- 只在**收到回调的那个线程**上有效，跨线程访问抛 `IllegalStateException`。
+- 只在**本次拦截期间**有效，把 `chain` 存到字段、闭包或别的回调里，拦截结束后再用同样抛 `IllegalStateException`。
+- 不暴露 `XC_MethodHook`、`MethodHookParam`、`HookBuilder`、`XposedModule`、`HookHandle` 或原始 `Chain`，脚本也不需要它们。
+
+### 返回值、异常和 busy 放行
+
+- **返回值**：拦截函数的返回值就是宿主方法的返回值。`void` 方法和构造函数的返回值会被框架忽略。
+- **短路**：不调用 `proceed()` 直接 `return`，宿主原方法不会执行。
+- **异常透传**：`proceed()` 抛出的宿主 `Throwable` 会原样抛进脚本；模块把宿主抛出的**同一个对象**保存下来，脚本没有恢复它时，分发器会把该原始对象重新抛回宿主，不会在解释器边界上重建异常。脚本自己 `catch` 后正常返回，等于吞掉宿主异常并用自己的返回值覆盖。
+- **脚本报错**：脚本自身抛出的异常会交给框架的 `PROTECTIVE` 模式处理——记录日志并放行宿主方法。因此**不能主动注入新异常**给宿主；要"让宿主看到异常"只能抛出 `proceed()` 自己产生的那个异常。
+- **解释器忙**：解释器是单线程执行的。Hook 触发时如果脚本引擎正被本插件或别的插件占用，模块**立即**放行宿主方法（`chain.proceed()`），既不阻塞也不排队，也不把回调挪到别的线程。放行只在解释器忙的瞬间发生，不会影响下一次拦截；被跳过的次数按插件限频记录到模块错误日志。如果安装包里的 native 库缺少同步 Hook 入口（只在 native 库未随源码重建时出现），模块同样只记录一次错误并永久放行宿主方法，不会每次调用都抛 `UnsatisfiedLinkError`。
+- **函数缺失**：`hook(member, "名字")` 登记的名字在插件脚本里不存在时，该 Hook 视为不处理：第一次会写一条模块日志和插件 `log.txt`，之后直接放行宿主方法，不会每次调用都抛异常。
+
+### 句柄回收
+
+`hook()` 注册的拦截器按插件 `pluginId` 记账。插件**卸载、禁用、重载、删除或加载失败**时，模块统一 `unhook` 对应的原生 `HookHandle`，不会留下悬挂句柄。如果需要提前取消，调用 `unhook(token)`；`token` 只在所属插件内有效，用别的插件 ID 卸载会被忽略并记录日志。
+
+### 从旧脚本迁移
+
+旧的 `hookBefore` / `hookAfter` / `hookReplace` 与 `XC_MethodHook.MethodHookParam` 已在 API 102 原生模型下移除，旧脚本必须改写。对照关系：
+
+| 旧写法 | 新写法 |
+| --- | --- |
+| `hookBefore(member, new Consumer(){ accept(param) {...} })` | `hook(member, "fn")` + `Object fn(ScriptHookChain chain)`，在 `chain.proceed()` **之前**写原 `before` 逻辑 |
+| `hookAfter(member, new Consumer(){ accept(param) {...} })` | 在 `chain.proceed()` **之后**写原 `after` 逻辑，最后 `return` 结果 |
+| `hookReplace(member, new Function(){ apply(param) { return x; } })` | 同样 `hook(member, "fn")`，函数里直接 `return x`（不调用 `proceed()`） |
+| `param.method` / `param.thisObject` | `chain.executable` / `chain.thisObject` |
+| `param.args` | `chain.args`（只读副本）/ `chain.arg(i)` |
+| `param.args[0] = v;` + 原方法执行 | `chain.proceed(new Object[]{v, ...})` |
+| `param.setResult(x)` | `return x` |
+| `param.getResult()` | `Object r = chain.proceed()` 的返回值 |
+| `param.hasThrowable()` / `getThrowable()` | `try { chain.proceed(); } catch (Throwable t) { ... }` |
+| `param.setThrowable(t)` | 不支持主动注入新异常；只能重新抛出 `proceed()` 产生的异常 |
+| `XC_MethodHook.Unhook` 句柄 | `hook()` 返回的 `Long` token |
+| `unhook(handle)` | `unhook(token)`（不变） |
+| `XposedBridge.log(...)` | `log(...)` |
+| `XposedHelpers.findClass(name, loader)` | `findClass(name)` |
+| `XposedBridgeClass` / `XposedHelpersClass` / `XC_MethodHookClass` | 已移除，改用 `WeChatApisClass` / `KavaReflectorClass` 等仍保留的类对象 |
+
+改写示例（旧→新）：
+
+```java
+// 旧：onResume 之后打日志
+hookAfter(method, new Consumer() {
+    public void accept(Object value) {
+        XC_MethodHook.MethodHookParam param = (XC_MethodHook.MethodHookParam) value;
+        log("onResume " + param.thisObject);
     }
 });
 
-unhook(handle);
+// 新：同一个文件里定义一个拦截函数
+void onLoad() {
+    hook(method, "afterOnResume");
+}
+
+Object afterOnResume(ScriptHookChain chain) throws Throwable {
+    Object result = chain.proceed();
+    log("onResume " + chain.thisObject);
+    return result;
+}
 ```
+
+注意：新旧 ABI 不并存。模块不再注入 `XC_MethodHook` 等兼容类，也不再自动 `import de.robv.*`；脚本里残留这些名字会在加载时报错，需要按上表一次性改完。
 
 ## DexKit
 

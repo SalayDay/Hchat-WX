@@ -1,8 +1,7 @@
 package h.Hchat.hooks.items.antirecall
 
 import android.content.ContentValues
-import de.robv.android.xposed.XC_MethodHook
-import de.robv.android.xposed.XposedBridge
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.dexkit.DexMethodCache
 import h.Hchat.event.Events
 import h.Hchat.hooks.api.core.WeChatApis
@@ -107,26 +106,7 @@ class AntiRecallFeature : BaseFeature() {
             var installed = false
             revokeEntries.map { it.method }.forEach { method ->
                 try {
-                    HookRegistry.get().hook(method, object : XC_MethodHook() {
-                        override fun beforeHookedMethod(param: MethodHookParam) {
-                            val args = param.args ?: return
-                            val talker = args.getOrNull(0) as? String ?: ""
-                            val svrId = (args.getOrNull(1) as? Number)?.toLong() ?: 0L
-                            val replaceMsg = args.getOrNull(3) as? String ?: ""
-                            val payload = args.getOrNull(2)
-                            val recallTime = resolveRecallEventTime(payload)
-                            val payloadInfo = parseRevokePayload(talker, svrId, payload, replaceMsg)
-                            val recalledInfo = resolveRecalledInfo(talker, svrId, payloadInfo)
-                            publishRecallEvent(context, talker, svrId, recalledInfo)
-                            if (!isAntiRecallEnabled(context)) return
-                            val handledKey = recallHandledKey(talker, svrId, recalledInfo)
-                            if (!isHandled(handledKey)) {
-                                if (!handleRecall(context, talker, svrId, recalledInfo, recallTime)) return
-                                markHandled(handledKey)
-                            }
-                            param.setResult(null)
-                        }
-                    })
+                    HookRegistry.get().hook(method, RevokeEntryHooker(this, context))
                     installed = true
                 } catch (e: Throwable) {
                     logError("防撤回入口Hook安装失败", e)
@@ -252,19 +232,7 @@ class AntiRecallFeature : BaseFeature() {
         var installed = false
         methods.forEach { method ->
             try {
-                HookRegistry.get().hook(method, object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        if (!isAntiRecallEnabled(context) || !keepSelfRecallEnabled(context)) return
-                        val msgId = (param.args?.getOrNull(0) as? Number)?.toLong() ?: return
-                        val msg = param.args?.getOrNull(1) ?: return
-                        val type = messageObjectType(msg)
-                        if (!isWechatRecallType(type)) return
-                        val outgoing = selfRecallMsgIds.contains(msgId) || messageObjectIsSend(msg)
-                        if (!outgoing) return
-                        markSelfRecallMsgId(msgId)
-                        param.setResult(blockedReturnValue(method))
-                    }
-                })
+                HookRegistry.get().hook(method, MessageStorageRevokeHooker(this, context, method))
                 installed = true
             } catch (e: Throwable) {
                 logError("自己撤回消息存储Hook安装失败", e)
@@ -282,13 +250,7 @@ class AntiRecallFeature : BaseFeature() {
         var installed = false
         methods.forEach { method ->
             try {
-                HookRegistry.get().hook(method, object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        if (!isAntiRecallEnabled(context) || !keepSelfRecallEnabled(context)) return
-                        if (!shouldBlockMsgProcessingClear(param.args)) return
-                        param.setResult(null)
-                    }
-                })
+                HookRegistry.get().hook(method, ProcessingClearHooker(this, context))
                 installed = true
             } catch (e: Throwable) {
                 logError("媒体处理信息清理Hook安装失败", e)
@@ -303,13 +265,7 @@ class AntiRecallFeature : BaseFeature() {
         var installed = false
         methods.forEach { method ->
             try {
-                HookRegistry.get().hook(method, object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        if (!isAntiRecallEnabled(context) || !keepSelfRecallEnabled(context)) return
-                        if (!shouldBlockLegacySelfRecallMediaCleanup(param.args)) return
-                        param.setResult(null)
-                    }
-                })
+                HookRegistry.get().hook(method, LegacyMediaCleanupHooker(this, context))
                 installed = true
             } catch (e: Throwable) {
                 logError("旧版自己撤回媒体清理Hook安装失败", e)
@@ -461,12 +417,7 @@ class AntiRecallFeature : BaseFeature() {
         var count = 0
         for (method in KavaReflector.declaredMethods(dbClass)) {
             if (!isUpdateMethod(method)) continue
-            HookRegistry.get().hook(method, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    if (!isAntiRecallEnabled(context) || !keepSelfRecallEnabled(context)) return
-                    if (!fixSelfRecallUpdateValues(param.args)) return
-                }
-            })
+            HookRegistry.get().hook(method, SelfRecallUpdateHooker(this, context))
             count++
         }
         return count
@@ -593,40 +544,34 @@ class AntiRecallFeature : BaseFeature() {
             h.Hchat.utils.HLog.e("$TAG 插入提示失败: talker 为空")
             return
         }
-        // svrId 只用于定位原消息和日志，为 0 时仍可插入（时间走兜底）。
-        // 原实现直接 return，会让部分机型的撤回事件静默丢掉提示。
-        if (svrId <= 0L) {
-            h.Hchat.utils.HLog.e("$TAG 撤回事件 newmsgid 为 0，改用兜底时间插入 talker=$talker")
-        }
+        // 提示的排序时间来自被撤回的原记录，不能使用撤回事件时间或会话末条时间。
         val localMessages = WeChatApis.localMessages()
         if (localMessages == null) {
             h.Hchat.utils.HLog.e("$TAG 插入提示失败: LocalMessage API为空")
             return
         }
         localMessages.ensureReady()
-        val resolvedCreateTime = resolveRecalledCreateTime(svrId, recalledInfo)
-        // 定位不到原消息时间时不要直接放弃提示——那会让「显示撤回提示」看起来完全没生效。
-        // 退回撤回事件时间（再不行用当前时间），提示会落在会话末尾附近，但用户能看到。
-        val targetCreateTime = when {
-            resolvedCreateTime > 0L -> resolvedCreateTime
-            recallTime > 0L -> recallTime
-            else -> System.currentTimeMillis()
-        }
-        if (resolvedCreateTime <= 0L) {
+        val targetCreateTime = resolveRecalledCreateTime(talker, svrId, recalledInfo)
+        val noticeCreateTime = RecallNoticeAnchor.noticeTime(targetCreateTime)
+        if (noticeCreateTime <= 0L) {
             h.Hchat.utils.HLog.e(
-                "$TAG 未定位原消息时间，提示改用兜底时间 talker=$talker id=$svrId " +
-                    "origin=${recalledInfo?.originSvrId ?: 0L} new=${recalledInfo?.newMsgId ?: 0L} " +
-                    "fallback=$targetCreateTime"
+                "$TAG 未定位原消息时间，取消错误位置的提示插入 talker=$talker id=$svrId " +
+                    "origin=${recalledInfo?.originSvrId ?: 0L} new=${recalledInfo?.newMsgId ?: 0L}"
             )
+            return
         }
         val notice = if (selfRecall) {
             AntiRecallSettings.SELF_NOTICE_TEXT
         } else {
             noticeText(context, talker, recalledInfo, targetCreateTime, recallTime)
         }
-        val result = localMessages.insertSystemMessageAt(talker, notice, targetCreateTime + 1L)
+        val result = localMessages.insertProtectedSystemMessageAt(talker, notice, noticeCreateTime)
         if (result <= 0L) {
             h.Hchat.utils.HLog.e("$TAG 插入提示失败: talker=$talker newmsgid=$svrId")
+        } else {
+            h.Hchat.utils.HLog.event(
+                "$TAG 撤回提示已落库并保护可见性: msgId=$result originalTime=$targetCreateTime noticeTime=$noticeCreateTime"
+            )
         }
     }
 
@@ -649,29 +594,25 @@ class AntiRecallFeature : BaseFeature() {
         svrId: Long,
         payloadInfo: WeChatRecalledMessage?
     ): WeChatMessage? {
-        for (id in recallLookupIds(svrId, payloadInfo)) {
-            messageCache[cacheKey(talker, id)]?.let { return it }
-            val message = WeChatApis.messageStore()?.getMessageById(id)
-                ?: WeChatApis.messageStore()?.getMessageBySvrId(talker, id)
-                ?: WeChatApis.messageStore()?.getMessageBySvrId(id)
-            if (message != null) {
-                rememberMessage(message)
-                return message
-            }
-        }
-        return null
+        val message = RecallNoticeAnchor.resolve(
+            talker,
+            recallLookupIds(svrId, payloadInfo),
+            stored = { room, id -> WeChatApis.messageStore()?.getMessageBySvrId(room, id) },
+            cached = { room, id -> messageCache[cacheKey(room, id)] }
+        )
+        if (message != null) rememberMessage(message)
+        return message
     }
 
-    private fun resolveRecalledCreateTime(svrId: Long, info: WeChatRecalledMessage?): Long {
-        for (id in recallLookupIds(svrId, info)) {
-            val byLocalId = normalizeMillis(WeChatApis.messageStore()?.getMessageById(id)?.createTime ?: 0L)
-            if (byLocalId > 0L) return byLocalId
+    private fun resolveRecalledCreateTime(talker: String, svrId: Long, info: WeChatRecalledMessage?): Long {
+        val ids = recallLookupIds(svrId, info)
+        val source = info?.message?.takeIf { message ->
+            ids.any { RecallNoticeAnchor.matches(message, talker, it) }
         }
-        val newMsgCreateTime = normalizeMillis(WeChatApis.messageStore()?.getCreateTimeBySvrId(info?.newMsgId ?: 0L) ?: 0L)
-        if (newMsgCreateTime > 0L) return newMsgCreateTime
-        val createTime = normalizeMillis(info?.bestCreateTime() ?: 0L)
-        if (createTime > 0L) return createTime
-        return normalizeMillis(WeChatApis.messageStore()?.getCreateTimeBySvrId(svrId) ?: 0L)
+        val time = normalizeMillis(source?.createTime ?: 0L)
+        if (time > 0L) return time
+        // newMsgId 可能属于撤回通知本身，不能让它的时间覆盖可信原记录。
+        return normalizeMillis(resolveRecalledMessage(talker, svrId, info)?.createTime ?: 0L)
     }
 
     private fun normalizeMillis(createTime: Long): Long {
@@ -1202,4 +1143,98 @@ class AntiRecallFeature : BaseFeature() {
         val method: Method,
         val data: MethodData?
     )
+
+    private class RevokeEntryHooker(private val owner: AntiRecallFeature, private val context: FeatureContext) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val args = chain.args.toTypedArray()
+            val receiver = chain.thisObject
+            with(owner) {
+            run patch@{
+                val args = args ?: return@patch
+                val talker = args.getOrNull(0) as? String ?: ""
+                val svrId = (args.getOrNull(1) as? Number)?.toLong() ?: 0L
+                val replaceMsg = args.getOrNull(3) as? String ?: ""
+                val payload = args.getOrNull(2)
+                val recallTime = resolveRecallEventTime(payload)
+                val payloadInfo = parseRevokePayload(talker, svrId, payload, replaceMsg)
+                val recalledInfo = resolveRecalledInfo(talker, svrId, payloadInfo)
+                publishRecallEvent(context, talker, svrId, recalledInfo)
+                if (!isAntiRecallEnabled(context)) return@patch
+                val handledKey = recallHandledKey(talker, svrId, recalledInfo)
+                if (!isHandled(handledKey)) {
+                    if (!handleRecall(context, talker, svrId, recalledInfo, recallTime)) return@patch
+                    markHandled(handledKey)
+                }
+                return null
+            }
+            return chain.proceed(args)
+            }
+        }
+    }
+
+    private class MessageStorageRevokeHooker(private val owner: AntiRecallFeature, private val context: FeatureContext, private val method: Method) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val args = chain.args.toTypedArray()
+            val receiver = chain.thisObject
+            with(owner) {
+            run patch@{
+                if (!isAntiRecallEnabled(context) || !keepSelfRecallEnabled(context)) return@patch
+                val msgId = (args?.getOrNull(0) as? Number)?.toLong() ?: return@patch
+                val msg = args?.getOrNull(1) ?: return@patch
+                val type = messageObjectType(msg)
+                if (!isWechatRecallType(type)) return@patch
+                val outgoing = selfRecallMsgIds.contains(msgId) || messageObjectIsSend(msg)
+                if (!outgoing) return@patch
+                markSelfRecallMsgId(msgId)
+                return blockedReturnValue(method)
+            }
+            return chain.proceed(args)
+            }
+        }
+    }
+
+    private class ProcessingClearHooker(private val owner: AntiRecallFeature, private val context: FeatureContext) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val args = chain.args.toTypedArray()
+            val receiver = chain.thisObject
+            with(owner) {
+            run patch@{
+                if (!isAntiRecallEnabled(context) || !keepSelfRecallEnabled(context)) return@patch
+                if (!shouldBlockMsgProcessingClear(args)) return@patch
+                return null
+            }
+            return chain.proceed(args)
+            }
+        }
+    }
+
+    private class LegacyMediaCleanupHooker(private val owner: AntiRecallFeature, private val context: FeatureContext) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val args = chain.args.toTypedArray()
+            val receiver = chain.thisObject
+            with(owner) {
+            run patch@{
+                if (!isAntiRecallEnabled(context) || !keepSelfRecallEnabled(context)) return@patch
+                if (!shouldBlockLegacySelfRecallMediaCleanup(args)) return@patch
+                return null
+            }
+            return chain.proceed(args)
+            }
+        }
+    }
+
+    private class SelfRecallUpdateHooker(private val owner: AntiRecallFeature, private val context: FeatureContext) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val args = chain.args.toTypedArray()
+            val receiver = chain.thisObject
+            with(owner) {
+            run patch@{
+                if (!isAntiRecallEnabled(context) || !keepSelfRecallEnabled(context)) return@patch
+                if (!fixSelfRecallUpdateValues(args)) return@patch
+            }
+            return chain.proceed(args)
+            }
+        }
+    }
+
 }

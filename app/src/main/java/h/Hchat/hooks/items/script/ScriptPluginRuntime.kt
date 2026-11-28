@@ -11,9 +11,6 @@ import android.system.Os
 import android.widget.Toast
 import h.Hchat.hooks.items.script.engine.RustScriptInterpreter as Interpreter
 import h.Hchat.hooks.items.script.engine.RustScriptLibrary
-import de.robv.android.xposed.XC_MethodHook
-import de.robv.android.xposed.XposedBridge
-import de.robv.android.xposed.XposedHelpers
 import dalvik.system.DexClassLoader
 import h.Hchat.BuildConfig
 import h.Hchat.dexkit.DexBridgeHolder
@@ -80,6 +77,7 @@ object ScriptPluginRuntime {
     private const val FINDER_MEDIA_DOWNLOAD_DROP_LOG_COOLDOWN_MS = 10_000L
     private const val FINDER_MEDIA_DOWNLOAD_TASK_DEDUP_WINDOW_MS = 10 * 60_000L
     private const val FINDER_MEDIA_DOWNLOAD_TASK_RUNNING = Long.MIN_VALUE
+    private const val HOOK_BUSY_LOG_COOLDOWN_MS = 10_000L
     private const val SNS_PREPARE_QUEUE_CAPACITY = 32
     private const val PROCESS_MAIN = "main"
     private const val PROCESS_APPBRAND = "appbrand"
@@ -108,6 +106,11 @@ object ScriptPluginRuntime {
     private val reloadTasks = ConcurrentHashMap<String, Runnable>()
     private val interpreterLocks = WeakHashMap<Interpreter, ReentrantLock>()
     private val sendButtonDiagnosticLogAt = ConcurrentHashMap<String, Long>()
+    private val hookMissingFunctions = ConcurrentHashMap.newKeySet<String>()
+    private val hookBusyCount = AtomicLong(0L)
+    private val hookBusyLogAt = AtomicLong(0L)
+    @Volatile
+    private var hookEntryUnsupported = false
     private val mainHandler = Handler(Looper.getMainLooper())
     private val protobufListenerLock = Any()
     private val protobufListenerRegistered = AtomicBoolean(false)
@@ -780,6 +783,97 @@ object ScriptPluginRuntime {
             h.Hchat.utils.HLog.e("$TAG 调用插件函数失败: ${loaded.plugin.name}#$functionName ${it.message}", it)
             bridge?.log(loaded.plugin.name, loaded.plugin.dir, "调用插件函数失败: $functionName ${it.message}")
         }
+    }
+
+    /** 该插件的 Hook 是否值得进入脚本执行；插件未加载时直接放行宿主方法。 */
+    internal fun isHookDispatchAvailable(pluginId: String): Boolean {
+        return loadedPlugins.containsKey(pluginId)
+    }
+
+    /**
+     * 在拿到宿主 interceptor chain 的那个线程上同步执行脚本拦截函数。
+     *
+     * 解释器执行权当前不可用时立刻返回 [ScriptHookOutcome.Proceed]，由分发器直接放行宿主方法；
+     * 这里不排队、不阻塞，也不把回调丢给别的线程 —— chain 不能跨线程。
+     */
+    internal fun invokeScriptHook(
+        pluginId: String,
+        functionName: String,
+        facade: ScriptHookChain
+    ): ScriptHookOutcome {
+        val loaded = loadedPlugins[pluginId] ?: return ScriptHookOutcome.Proceed
+        // 本机 native 库缺少同步 Hook 入口时永久 fail-open：不要再逐帧抛异常。
+        if (hookEntryUnsupported) return ScriptHookOutcome.Proceed
+        val lock = interpreterLock(loaded.interpreter)
+        if (!lock.tryLock()) {
+            noteHookBusy(pluginId)
+            return ScriptHookOutcome.Proceed
+        }
+        try {
+            if (loadedPlugins[pluginId] !== loaded) return ScriptHookOutcome.Proceed
+            val value = loaded.interpreter.tryInvokeHook(functionName, arrayOf<Any?>(facade))
+            if (value === Interpreter.HOOK_BUSY_MARK) {
+                noteHookBusy(pluginId)
+                return ScriptHookOutcome.Proceed
+            }
+            return ScriptHookOutcome.Return(value)
+        } catch (error: Throwable) {
+            if (isUnsupportedHookEntry(error)) {
+                noteUnsupportedHookEntry(loaded, error)
+                return ScriptHookOutcome.Proceed
+            }
+            if (isMissingHookFunction(error, functionName)) {
+                noteMissingHookFunction(loaded, functionName)
+                return ScriptHookOutcome.Proceed
+            }
+            h.Hchat.utils.HLog.e(
+                "$TAG 脚本 Hook 拦截失败: ${loaded.plugin.name} #$functionName ${error.message}",
+                error
+            )
+            return ScriptHookOutcome.Failure(error)
+        } finally {
+            lock.unlock()
+        }
+    }
+
+    /**
+     * 旧 `libbsh_rs.so` 没有 `tryInvokeHook` 导出时会抛 `UnsatisfiedLinkError`；
+     * 这类情况只可能在本机没重建 native 库时出现，按「引擎不支持同步 Hook」永久放行宿主方法。
+     */
+    private fun isUnsupportedHookEntry(error: Throwable): Boolean {
+        return error is UnsatisfiedLinkError || error is NoSuchMethodError
+    }
+
+    private fun noteUnsupportedHookEntry(loaded: LoadedPlugin, error: Throwable) {
+        if (hookEntryUnsupported) return
+        hookEntryUnsupported = true
+        val text = "当前 libbsh_rs.so 缺少同步 Hook 入口 tryInvokeHook，脚本 Hook 一律放行宿主方法；请重新构建 native 库"
+        h.Hchat.utils.HLog.e("$TAG $text: ${loaded.plugin.name}", error)
+        runCatching { bridge?.log(loaded.plugin.name, loaded.plugin.dir, text) }
+    }
+
+    private fun noteHookBusy(pluginId: String) {
+        hookBusyCount.incrementAndGet()
+        val now = SystemClock.elapsedRealtime()
+        val previous = hookBusyLogAt.get()
+        if (previous != 0L && now - previous < HOOK_BUSY_LOG_COOLDOWN_MS) return
+        if (!hookBusyLogAt.compareAndSet(previous, now)) return
+        val skipped = hookBusyCount.getAndSet(0L)
+        h.Hchat.utils.HLog.e("$TAG 解释器正忙，脚本 Hook 已放行宿主方法 $skipped 次: $pluginId")
+    }
+
+    private fun isMissingHookFunction(error: Throwable, functionName: String): Boolean {
+        val message = error.message.orEmpty()
+        return message.contains("No script method", ignoreCase = true) &&
+            message.contains(functionName)
+    }
+
+    private fun noteMissingHookFunction(loaded: LoadedPlugin, functionName: String) {
+        val key = "${loaded.plugin.id}#$functionName"
+        if (!hookMissingFunctions.add(key)) return
+        val text = "脚本没有拦截函数 $functionName，相关 Hook 直接放行宿主方法"
+        h.Hchat.utils.HLog.e("$TAG $text: ${loaded.plugin.name}")
+        runCatching { bridge?.log(loaded.plugin.name, loaded.plugin.dir, text) }
     }
 
     fun dispatchOnClickSendBtn(text: String): SendButtonEventResult {
@@ -1616,6 +1710,10 @@ object ScriptPluginRuntime {
         try {
             bridge?.unhookPlugin(pluginId)
         } finally {
+            val prefix = "$pluginId#"
+            for (key in hookMissingFunctions.toList()) {
+                if (key.startsWith(prefix)) hookMissingFunctions.remove(key)
+            }
             closeInterpreter(loaded.interpreter, pluginId)
         }
         notifyPluginCatalogChanged()
@@ -1711,9 +1809,6 @@ object ScriptPluginRuntime {
             set("dexFinder", currentBridge.dexKit?.holder()?.dexFinder)
             set("dexBridgeHolder", currentBridge.dexKit?.holder())
             set("WeChatApisClass", WeChatApis::class.java)
-            set("XposedBridgeClass", XposedBridge::class.java)
-            set("XposedHelpersClass", XposedHelpers::class.java)
-            set("XC_MethodHookClass", XC_MethodHook::class.java)
             set("DexKitBridgeClass", DexKitBridge::class.java)
             set("DexFinderClass", DexFinder::class.java)
             set("DexBridgeHolderClass", DexBridgeHolder::class.java)
@@ -1728,13 +1823,11 @@ object ScriptPluginRuntime {
             set("startedAt", SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date()))
             eval(
                 """
-                import de.robv.android.xposed.XC_MethodHook;
-                import de.robv.android.xposed.XposedBridge;
-                import de.robv.android.xposed.XposedHelpers;
                 import h.Hchat.dexkit.DexBridgeHolder;
                 import h.Hchat.dexkit.DexFinder;
                 import h.Hchat.hooks.api.core.WeChatApis;
                 import h.Hchat.hooks.items.script.ScriptDexKitBridge;
+                import h.Hchat.hooks.items.script.ScriptHookChain;
                 import h.Hchat.hooks.items.script.ScriptPluginBridge;
                 import h.Hchat.hooks.items.script.ScriptAudioBridge;
                 import h.Hchat.hooks.items.script.ScriptWaBridge;
@@ -1818,10 +1911,9 @@ object ScriptPluginRuntime {
                 Object createInstance(Object instance, int paramCount, Object[] params) { return bridge.createInstance(instance, paramCount, params); }
                 Object getField(Object instance, String fieldName) { return bridge.getField(instance, fieldName); }
                 void setField(Object instance, String fieldName, Object value) { bridge.setField(instance, fieldName, value); }
-                Object hookBefore(Member member, Consumer callback) { return bridge.hookBefore(pluginId, member, callback); }
-                Object hookAfter(Member member, Consumer callback) { return bridge.hookAfter(pluginId, member, callback); }
-                Object hookReplace(Member member, Function callback) { return bridge.hookReplace(pluginId, member, callback); }
-                void unhook(Object handle) { bridge.unhook(pluginId, handle); }
+                Object hook(Member member, String functionName) { return bridge.hook(pluginId, member, functionName); }
+                Object hook(Member member, String functionName, int priority) { return bridge.hook(pluginId, member, functionName, priority); }
+                void unhook(Object token) { bridge.unhook(pluginId, token); }
                 void reloadPlugin() { __hchat_runtime.reloadPluginAsync(hostContext, pluginId); }
                 String compileSnapshot(String path) { return __hchat_runtime.compileSnapshot(pluginId, pluginDirFile, __hchat_interpreter, path); }
                 Object evalSnapshot(String path) { return __hchat_runtime.evalSnapshot(pluginId, pluginDirFile, __hchat_interpreter, path); }

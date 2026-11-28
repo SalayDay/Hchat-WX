@@ -5,7 +5,7 @@ import android.content.Intent
 import android.os.Handler
 import android.os.Looper
 import android.view.MenuItem
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.hooks.core.FeatureContext
 import h.Hchat.hooks.core.HookRegistry
 import h.Hchat.utils.HLog
@@ -51,11 +51,7 @@ internal class NativeMassSendPicker(
             return false
         }
         return runCatching {
-            HookRegistry.get().hook(KavaReflector.accessible(method) ?: method, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    handleNextClick(param)
-                }
-            })
+            HookRegistry.get().hook(KavaReflector.accessible(method) ?: method, NextClickHook(this))
             // 用户从选择页直接返回时，pending 必须立刻清掉；只靠 8 分钟超时会让
             // 他在超时窗口内自己用群发助手时被我们劫持。
             installDismissCleanup()
@@ -98,13 +94,7 @@ internal class NativeMassSendPicker(
         val ui = KavaReflector.loadClass(SELECT_UI_CLASS_NAME, context.hostClassLoader()) ?: return
         val destroy = KavaReflector.findMethodRecursive(ui, "onDestroy") ?: return
         runCatching {
-            HookRegistry.get().hook(KavaReflector.accessible(destroy) ?: destroy, object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    // 只清 pending，不动 pendingToken：已在 handleNextClick 里回传的
-                    // 名单不受影响（那时 pending 已经是 null）。
-                    pending = null
-                }
-            })
+            HookRegistry.get().hook(KavaReflector.accessible(destroy) ?: destroy, DismissCleanupHook(this))
         }.onFailure {
             logger("群发选择页生命周期Hook安装失败", it)
         }
@@ -115,20 +105,35 @@ internal class NativeMassSendPicker(
         pendingToken += 1
     }
 
-    private fun handleNextClick(param: XC_MethodHook.MethodHookParam) {
-        val callback = pending ?: return
-        val activity = findActivity(param.thisObject) ?: return
-        val selected = readSelectedUsers(param.thisObject)
+    private class NextClickHook(private val owner: NativeMassSendPicker) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            if (owner.handleNextClick(chain.thisObject)) return true
+            return chain.proceed()
+        }
+    }
+
+    private class DismissCleanupHook(private val owner: NativeMassSendPicker) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val result = chain.proceed()
+            owner.pending = null
+            return result
+        }
+    }
+
+    private fun handleNextClick(receiver: Any?): Boolean {
+        val callback = pending ?: return false
+        val activity = findActivity(receiver) ?: return false
+        val selected = readSelectedUsers(receiver)
         if (selected.isEmpty()) {
             // 一个人都没选：交给微信自己弹「未选择」提示。
-            return
+            return false
         }
         pending = null
         pendingToken += 1
         // 拦掉原生跳转，避免闪一下群发编辑页；再关掉选择页回到原聊天。
-        param.result = true
         runCatching { activity.finish() }
         main.post { callback(selected) }
+        return true
     }
 
     private fun findActivity(listener: Any?): Activity? {

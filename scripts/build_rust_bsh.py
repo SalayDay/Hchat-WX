@@ -29,7 +29,11 @@ def main():
     if 'AArch64' not in header or 'DYN' not in header:
         raise RuntimeError('产物不是 arm64 共享库')
     symbols = subprocess.check_output(['readelf', '--dyn-syms', '--wide', str(library)], text=True)
-    for name in ['createEngine', 'evalSource', 'validate', 'compileAst', 'evalAst', 'unsetVariable']:
+    # tryInvokeHook 是脚本插件 Hook ABI 的同步入口：宿主 interceptor chain 只能留在
+    # 收到它的线程，所以它必须是不排队、拿不到执行权就返回 busy 的独立导出。
+    for name in ['createEngine', 'destroyEngine', 'eval', 'evalValue', 'evalSource',
+                 'invokeMethod', 'tryInvokeHook', 'setVariable', 'getVariable',
+                 'unsetVariable', 'validate', 'compileAst', 'evalAst']:
         if 'Java_me_yun_bsh_rust_Native_' + name not in symbols:
             raise RuntimeError('JNI 导出缺失：' + name)
     program_headers = subprocess.check_output(['readelf', '-lW', str(library)], text=True)

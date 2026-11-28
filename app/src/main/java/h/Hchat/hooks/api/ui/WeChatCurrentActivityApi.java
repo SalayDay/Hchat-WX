@@ -8,7 +8,7 @@ import h.Hchat.utils.KavaReflector;
 import java.lang.ref.WeakReference;
 import java.lang.reflect.Method;
 
-import de.robv.android.xposed.XC_MethodHook;
+import io.github.libxposed.api.XposedInterface;
 
 /**
  * 当前微信 Activity 跟踪 API。
@@ -37,25 +37,9 @@ public final class WeChatCurrentActivityApi {
             Method onResume = KavaReflector.findDeclaredMethod(Activity.class, "onResume");
             Method onPause = KavaReflector.findDeclaredMethod(Activity.class, "onPause");
             Method onDestroy = KavaReflector.findDeclaredMethod(Activity.class, "onDestroy");
-            HookRegistry.get().hook(onResume, new XC_MethodHook() {
-                @Override
-                public void afterHookedMethod(MethodHookParam param) {
-                    if (param.thisObject instanceof Activity) {
-                        currentActivity = new WeakReference<>((Activity) param.thisObject);
-                    }
-                }
-            });
-            XC_MethodHook clearHook = new XC_MethodHook() {
-                @Override
-                public void afterHookedMethod(MethodHookParam param) {
-                    Activity current = currentActivity();
-                    if (current != null && current == param.thisObject) {
-                        currentActivity = new WeakReference<>(null);
-                    }
-                }
-            };
-            HookRegistry.get().hook(onPause, clearHook);
-            HookRegistry.get().hook(onDestroy, clearHook);
+            HookRegistry.get().hook(onResume, new CurrentActivityResumeHooker(this));
+            HookRegistry.get().hook(onPause, new CurrentActivityClearHooker(this));
+            HookRegistry.get().hook(onDestroy, new CurrentActivityClearHooker(this));
             installed = true;
             log("当前Activity Hook已安装");
         } catch (Throwable e) {
@@ -96,4 +80,32 @@ public final class WeChatCurrentActivityApi {
     private void log(String message) {
         if (logger != null) logger.log("[WeChatCurrentActivityApi] " + message);
     }
+
+    private static final class CurrentActivityResumeHooker implements XposedInterface.Hooker {
+        private final WeChatCurrentActivityApi owner;
+        private CurrentActivityResumeHooker(WeChatCurrentActivityApi owner) { this.owner = owner; }
+        @Override
+        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+            Object result = chain.proceed();
+            if (chain.getThisObject() instanceof Activity) {
+                owner.currentActivity = new WeakReference<>((Activity) chain.getThisObject());
+            }
+            return result;
+        }
+    }
+
+    private static final class CurrentActivityClearHooker implements XposedInterface.Hooker {
+        private final WeChatCurrentActivityApi owner;
+        private CurrentActivityClearHooker(WeChatCurrentActivityApi owner) { this.owner = owner; }
+        @Override
+        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+            Object result = chain.proceed();
+            Activity current = owner.currentActivity();
+            if (current != null && current == chain.getThisObject()) {
+                owner.currentActivity = new WeakReference<>(null);
+            }
+            return result;
+        }
+    }
+
 }

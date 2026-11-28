@@ -6,7 +6,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.view.MenuItem
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.hooks.core.BaseFeature
 import h.Hchat.hooks.core.FeatureContext
 import h.Hchat.hooks.core.HookRegistry
@@ -68,11 +68,7 @@ class MomentsContactFilterFeature : BaseFeature() {
             Bundle::class.java
         ) ?: return false
         return runCatching {
-            HookRegistry.get().hook(onCreate, object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    bindFilterMenu(param.thisObject as? Activity ?: return)
-                }
-            })
+            HookRegistry.get().hook(onCreate, TimelineMenuHooker(this))
             true
         }.getOrElse {
             logError("朋友圈过滤快捷入口安装失败: $className", it)
@@ -168,4 +164,14 @@ class MomentsContactFilterFeature : BaseFeature() {
             "com.tencent.mm.plugin.sns.ui.improve.ImproveSnsTimelineUI"
         )
     }
+
+    private class TimelineMenuHooker(private val owner: MomentsContactFilterFeature) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val result = chain.proceed()
+            val activity = chain.thisObject as? Activity ?: return result
+            owner.bindFilterMenu(activity)
+            return result
+        }
+    }
+
 }

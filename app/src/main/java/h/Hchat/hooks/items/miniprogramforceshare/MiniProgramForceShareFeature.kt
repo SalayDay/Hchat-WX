@@ -1,6 +1,6 @@
 package h.Hchat.hooks.items.miniprogramforceshare
 
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.hooks.api.core.WeChatApis
 import h.Hchat.hooks.core.BaseFeature
 import h.Hchat.hooks.core.DexInstallScheduler
@@ -103,18 +103,7 @@ class MiniProgramForceShareFeature : BaseFeature() {
             if (add == null) {
                 HLog.e("$TAG 未找到菜单项追加方法 ${registry.name}.a(List,int,boolean,boolean)")
             } else {
-                HookRegistry.get().hook(add, object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        if (!enabled()) return
-                        val index = param.args?.getOrNull(1) as? Int ?: return
-                        if (index != SHARE_INDEX && index != TIMELINE_INDEX) return
-                        // args[3] 才是 e1.c（隐藏标记）；args[2] 是首屏主菜单位，不要动。
-                        param.args[3] = false
-                        if (HLog.isCaptureEnabled()) {
-                            HLog.event("$TAG 强制可见 index=$index flag=${param.args[2]}")
-                        }
-                    }
-                })
+                HookRegistry.get().hook(add, ShareAppendHooker(this, enabled))
                 installed++
             }
         }
@@ -131,35 +120,14 @@ class MiniProgramForceShareFeature : BaseFeature() {
         if (gate == null) {
             HLog.e("$TAG 未找到菜单可见性开关（微信 ${wechatVersion()}）")
         } else {
-            HookRegistry.get().hook(KavaReflector.accessible(gate) ?: gate, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    if (!enabled()) return
-                    val index = param.args?.getOrNull(0) as? Int ?: return
-                    if (index != SHARE_INDEX && index != TIMELINE_INDEX) return
-                    if (param.args[1] != true) return
-                    // 把「隐藏」改成「显示」；小程序调用仍返回 ok，行为无感。
-                    param.args[1] = false
-                    if (hitHidden.compareAndSet(false, true)) {
-                        HLog.e("$TAG 已拦截 hideShareMenu(index=$index)")
-                    }
-                }
-            })
+            HookRegistry.get().hook(KavaReflector.accessible(gate) ?: gate, ShareVisibilityHooker(this, enabled))
             installed++
         }
         val build = page.listMethod
         if (build == null || build.returnType != java.util.List::class.java) {
             HLog.e("$TAG 未找到菜单列表构建方法（微信 ${wechatVersion()}）")
         } else {
-            HookRegistry.get().hook(build, object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    if (!enabled() || param.hasThrowable()) return
-                    val list = param.result as? MutableList<*> ?: return
-                    ensureShareItem(loader, list, page)
-                    if (HLog.isCaptureEnabled()) {
-                        HLog.event("$TAG 菜单列表 ${describeMenu(page, list)}")
-                    }
-                }
-            })
+            HookRegistry.get().hook(build, ShareListHooker(this, enabled, loader, page))
             installed++
         }
         return installed
@@ -346,4 +314,65 @@ class MiniProgramForceShareFeature : BaseFeature() {
         /** 只用于日志去重：hideShareMenu 会被反复调用，没必要每次都写一条。 */
         private val hitHidden = java.util.concurrent.atomic.AtomicBoolean(false)
     }
+
+    private class ShareAppendHooker(private val owner: MiniProgramForceShareFeature, private val enabled: () -> Boolean) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val args = chain.args.toTypedArray()
+            val receiver = chain.thisObject
+            with(owner) {
+            run patch@{
+                if (!enabled()) return@patch
+                val index = args?.getOrNull(1) as? Int ?: return@patch
+                if (index != SHARE_INDEX && index != TIMELINE_INDEX) return@patch
+                // args[3] 才是 e1.c（隐藏标记）；args[2] 是首屏主菜单位，不要动。
+                args[3] = false
+                if (HLog.isCaptureEnabled()) {
+                    HLog.event("$TAG 强制可见 index=$index flag=${args[2]}")
+                }
+            }
+            return chain.proceed(args)
+            }
+        }
+    }
+
+    private class ShareVisibilityHooker(private val owner: MiniProgramForceShareFeature, private val enabled: () -> Boolean) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val args = chain.args.toTypedArray()
+            val receiver = chain.thisObject
+            with(owner) {
+            run patch@{
+                if (!enabled()) return@patch
+                val index = args?.getOrNull(0) as? Int ?: return@patch
+                if (index != SHARE_INDEX && index != TIMELINE_INDEX) return@patch
+                if (args[1] != true) return@patch
+                // 把「隐藏」改成「显示」；小程序调用仍返回 ok，行为无感。
+                args[1] = false
+                if (hitHidden.compareAndSet(false, true)) {
+                    HLog.e("$TAG 已拦截 hideShareMenu(index=$index)")
+                }
+            }
+            return chain.proceed(args)
+            }
+        }
+    }
+
+    private class ShareListHooker(private val owner: MiniProgramForceShareFeature, private val enabled: () -> Boolean, private val loader: ClassLoader, private val page: MenuTargets) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val args = chain.args.toTypedArray()
+            val receiver = chain.thisObject
+            var result = chain.proceed()
+            with(owner) {
+            run update@{
+                if (!enabled()) return@update
+                val list = result as? MutableList<*> ?: return@update
+                ensureShareItem(loader, list, page)
+                if (HLog.isCaptureEnabled()) {
+                    HLog.event("$TAG 菜单列表 ${describeMenu(page, list)}")
+                }
+            }
+            return result
+            }
+        }
+    }
+
 }

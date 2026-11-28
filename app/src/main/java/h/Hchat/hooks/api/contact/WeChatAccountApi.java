@@ -44,6 +44,12 @@ public final class WeChatAccountApi {
         return databaseApi != null && databaseApi.isAvailable();
     }
 
+    /** 仅返回已解析的账号；UI 绑定热路径不能因账号未就绪反复查询 userinfo。 */
+    public String cachedSelfWxId() {
+        String value = cachedWxId;
+        return value != null ? value : "";
+    }
+
     public String selfWxId() {
         if (!TextUtils.isEmpty(cachedWxId)) return cachedWxId;
         String wxId = getSelfProfileField(FIELD_WXID);

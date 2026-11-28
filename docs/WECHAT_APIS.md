@@ -305,6 +305,14 @@ WeChatApis.message().events().subscribeMessage(event -> {
 });
 ```
 
+`WeChatApis.localMessages()`
+
+本地系统提示有两种时间语义：`insertSystemMessage(talker, content, createTime)` 沿用微信普通插入时间；`insertSystemMessageAt(talker, content, createTime)` 使用调用方提供的毫秒时间。后者不能在时间定位失败时退回会话末尾，失败返回 `0` 并记录错误。微信 8.0.76/80 的系统提示 Listener 同步调用独立 MsgInfoStorageLogic 时间函数，运行时按语义字符串与直接调用关系定位，不在 Listener 自身猜方法名。时间覆盖仅对当前线程、当前插入的目标会话有效，嵌套与异常退出恢复原作用域；普通嵌套插入不继承外层时间。原生调用异常必须向本 API 的错误处理传播，不能吞异常后返回成功。`insertProtectedSystemMessageAt` 仅供模块自有提示使用：在当前同步作用域捕获微信 storage 插入返回的真实本地 msgId，并按账号、会话、createTime 和完整消息内容的 SHA-256 登记来源；它不依赖系统提示第三参数伪造 msgSource，也不按正文词语判断来源。详见 [防撤回提示位置修复](ANTI_RECALL_NOTICE_FIX.md) 与 [6.7.7.38 修复记录](EMOJI_RECALL_FIX_6_7_7_38.md)。
+
+UI 绑定热路径可用 `WeChatApis.account().cachedSelfWxId()` 只读已解析账号：未就绪返回空字符串，绝不发起数据库或偏好查询；需要主动解析时仍使用 `selfWxId()`，净化只在后台安装或原生提示准备阶段主动解析。
+
+6.7.7.39 另在公共 API 预热与有限补装阶段调用 `installLuckyMoneyNoticeProtection(context)`：动态验证普通、Union 开包回调到原生领取提示 helper，再到原生 storage insert 的调用链，缓存唯一 helper 描述符。这个入口只包住微信自己的提示插入，以完整 `SystemMsgContext` 与 `sessionUserName` 匹配存储行并登记真实本地 ID；不额外生成提示，不改变卡片 XML。登记失败必须放行宿主，原生异常继续传播；原有模块自建提示仍保留失败关闭语义。它不属于脚本 API。证据及覆盖边界见 [6.7.7.39 红包领取灰字修复](RED_PACKET_NOTICE_FIX_6_7_7_39.md)。
+
 `WeChatApis.message().changes()`
 
 监听 `message` 表新增、更新、删除。来源是 `runtime().databaseChanges()`，不额外猜微信混淆类。需要监听消息分表的功能应在自己的业务范围内订阅底层变更，不能扩大该共享 API 的事件语义。
@@ -319,7 +327,7 @@ WeChatApis.message().changes().subscribe(change -> {
 
 `WeChatApis.message().observe()`
 
-业务级消息观察 API，统一封装 AddMsg 实时事件和 `message` 表变化。数据库链路只把入站 `insert/replace` 作为新消息候选，不派发已读、下载、状态变化等入站 `update`；候选还必须晚于本次数据库观察启动边界、具有五分钟内的有效创建时间，并按服务端消息 ID、本地消息 ID 或稳定回退键去重，避免高版本用 `replace/upsert` 更新旧记录时被业务功能重复消费。自己手动发送消息仍允许通过出站更新补偿。可识别文本、图片、语音、视频、表情、位置、AppMsg、红包、转账、引用、文件、拍一拍、撤回等常用消息类型。
+业务级消息观察 API，统一封装 AddMsg 实时事件和 `message` 表变化。订阅保持同步、按注册顺序交付；`subscribe(listener)` 保持兼容，新增 `subscribe(ownerId, listener)` 可为内置功能提供稳定的慢回调诊断标识。监听器超过 20ms 时，在日志采集开启期间按 owner 限频记录耗时、事件来源/类型与线程，不记录正文、账号或金额。此重载不引入线程切换、额外事件源或重新排序。数据库链路只把入站 `insert/replace` 作为新消息候选，不派发已读、下载、状态变化等入站 `update`；候选还必须晚于本次数据库观察启动边界、具有五分钟内的有效创建时间，并按服务端消息 ID、本地消息 ID 或稳定回退键去重，避免高版本用 `replace/upsert` 更新旧记录时被业务功能重复消费。自己手动发送消息仍允许通过出站更新补偿。可识别文本、图片、语音、视频、表情、位置、AppMsg、红包、转账、引用、文件、拍一拍、撤回等常用消息类型。
 
 监听路径：
 

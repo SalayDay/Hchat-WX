@@ -11,7 +11,7 @@ import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.List;
 
-import de.robv.android.xposed.XC_MethodHook;
+import io.github.libxposed.api.XposedInterface;
 
 /**
  * AddMsg 消息预监听。
@@ -73,17 +73,7 @@ public class RedPacketMessageHook {
                 }
                 if (addMsgArgIndexes.isEmpty()) continue;
 
-                HookRegistry.get().hook(method, new XC_MethodHook() {
-                    @Override
-                    public void beforeHookedMethod(MethodHookParam param) {
-                        if (param.args == null) return;
-                        for (int index : addMsgArgIndexes) {
-                            if (index >= 0 && index < param.args.length && param.args[index] != null) {
-                                handleAddMsgBeforeDb(param.args[index]);
-                            }
-                        }
-                    }
-                });
+                HookRegistry.get().hook(method, new IncomingMessageHooker(this, addMsgArgIndexes));
                 count++;
             }
         }
@@ -161,4 +151,32 @@ public class RedPacketMessageHook {
     private void log(String message) {
         if (logger != null) logger.log(message);
     }
+
+    private void inspectIncomingArguments(Object receiver, Object[] args, List<Integer> addMsgArgIndexes) {
+        if (args == null) return;
+        for (int index : addMsgArgIndexes) {
+            if (index >= 0 && index < args.length && args[index] != null) {
+                handleAddMsgBeforeDb(args[index]);
+            }
+        }
+    }
+
+    private static final class IncomingMessageHooker implements XposedInterface.Hooker {
+        private final RedPacketMessageHook owner;
+        private final List<Integer> addMsgArgIndexes;
+
+        IncomingMessageHooker(RedPacketMessageHook owner, List<Integer> addMsgArgIndexes) {
+            this.owner = owner;
+            this.addMsgArgIndexes = addMsgArgIndexes;
+        }
+
+        @Override
+        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+            Object receiver = chain.getThisObject();
+            Object[] args = chain.getArgs().toArray();
+            owner.inspectIncomingArguments(receiver, args, addMsgArgIndexes);
+            return chain.proceed(args);
+        }
+    }
+
 }

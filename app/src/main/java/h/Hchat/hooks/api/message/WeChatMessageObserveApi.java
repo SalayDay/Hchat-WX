@@ -15,6 +15,7 @@ import h.Hchat.hooks.api.model.WeChatTransferMsg;
 
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * 业务级消息观察 API。
@@ -361,11 +362,22 @@ public final class WeChatMessageObserveApi {
         public void unsubscribe() {
             if (!active) return;
             active = false;
-            listeners.remove(listener);
+            WeChatMessageObserveApi.this.unsubscribe(listener);
         }
 
         public boolean isActive() {
             return active;
+        }
+    }
+
+    private static final class ListenerEntry {
+        private final Listener listener;
+        private final String ownerId;
+        private final AtomicLong lastDiagnosticAt = new AtomicLong(Long.MIN_VALUE);
+
+        private ListenerEntry(Listener listener, String ownerId) {
+            this.listener = listener;
+            this.ownerId = ownerId;
         }
     }
 
@@ -374,7 +386,7 @@ public final class WeChatMessageObserveApi {
     private final WeChatMessageParseApi parseApi;
     private final WeChatAccountApi accountApi;
     private final Logger logger;
-    private final CopyOnWriteArrayList<Listener> listeners = new CopyOnWriteArrayList<>();
+    private final CopyOnWriteArrayList<ListenerEntry> listeners = new CopyOnWriteArrayList<>();
     private final ConcurrentHashMap<String, Long> recentOutgoing = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Long> recentIncomingDatabaseMessages = new ConcurrentHashMap<>();
     private volatile boolean installed;
@@ -400,13 +412,38 @@ public final class WeChatMessageObserveApi {
     }
 
     public Subscription subscribe(Listener listener) {
+        return subscribe("unassigned", listener);
+    }
+
+    /**
+     * Subscribe with a stable diagnostic owner while preserving listener identity semantics.
+     * Calls are still delivered synchronously on the publishing thread.
+     */
+    public Subscription subscribe(String ownerId, Listener listener) {
         if (listener == null) return null;
-        listeners.addIfAbsent(listener);
+        synchronized (listeners) {
+            boolean registered = false;
+            for (ListenerEntry entry : listeners) {
+                if (listener.equals(entry.listener)) {
+                    registered = true;
+                    break;
+                }
+            }
+            if (!registered) listeners.add(new ListenerEntry(listener, normalizeOwnerId(ownerId)));
+        }
         return new Subscription(listener);
     }
 
     public void unsubscribe(Listener listener) {
-        if (listener != null) listeners.remove(listener);
+        if (listener == null) return;
+        synchronized (listeners) {
+            for (ListenerEntry entry : listeners) {
+                if (listener.equals(entry.listener)) {
+                    listeners.remove(entry);
+                    break;
+                }
+            }
+        }
     }
 
     public synchronized void install() {
@@ -667,13 +704,42 @@ public final class WeChatMessageObserveApi {
     }
 
     private void dispatch(ObservedMessage message) {
-        for (Listener listener : listeners) {
+        for (ListenerEntry entry : listeners) {
+            long started = System.nanoTime();
             try {
-                listener.onObservedMessage(message);
+                entry.listener.onObservedMessage(message);
             } catch (Throwable e) {
-                log("消息观察回调失败: " + e.getMessage());
+                // 日志端的失败也不能使后续监听器失去本条消息。
+                try { log("消息观察回调失败: " + e.getMessage()); } catch (Throwable ignored) {}
+            } finally {
+                reportSlowListener(entry, message, System.nanoTime() - started);
             }
         }
+    }
+
+    private void reportSlowListener(ListenerEntry entry, ObservedMessage message, long nanos) {
+        if (nanos < 20_000_000L) return;
+        try {
+            if (!h.Hchat.utils.HLog.isCaptureEnabled()) return;
+            long now = android.os.SystemClock.elapsedRealtime();
+            long previous = entry.lastDiagnosticAt.get();
+            if (previous != Long.MIN_VALUE && now - previous < 10_000L) return;
+            if (!entry.lastDiagnosticAt.compareAndSet(previous, now)) return;
+            String detail = "owner=" + entry.ownerId
+                    + " source=" + (message != null ? message.source : "unknown")
+                    + " kind=" + (message != null ? message.kind : "unknown")
+                    + " thread=" + Thread.currentThread().getName();
+            h.Hchat.utils.SlowPathLog.report("message.listener." + entry.ownerId,
+                    nanos / 1_000_000L, 20L, "消息观察监听器", detail);
+        } catch (Throwable ignored) {
+            // 耗时诊断不影响回调顺序、异常隔离或线程。
+        }
+    }
+
+    private static String normalizeOwnerId(String value) {
+        if (value == null || value.isEmpty()) return "unassigned";
+        String sanitized = value.replaceAll("[^A-Za-z0-9_.-]", "_");
+        return sanitized.length() > 64 ? sanitized.substring(0, 64) : sanitized;
     }
 
     private static String safe(String value) {

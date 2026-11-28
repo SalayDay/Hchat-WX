@@ -75,6 +75,12 @@ unsafe fn get_object_array_element(env: Env, array: JArray, index: i32) -> JObje
     f(env, array, index)
 }
 
+unsafe fn set_boolean_array_region(env: Env, array: JArray, start: i32, len: i32, buffer: *const u8) {
+    let f: unsafe extern "system" fn(Env, JArray, i32, i32, *const u8) =
+        std::mem::transmute(env_fn(env, 207));
+    f(env, array, start, len, buffer);
+}
+
 fn read_java_string(env: Env, s: JString) -> String {
     unsafe {
         if s.is_null() {
@@ -306,20 +312,9 @@ fn ensure_callback_handler() {
     }));
 }
 
-fn with_engine<T>(engine: u64, f: impl FnOnce(&mut Runtime) -> T) -> T {
-    // Nested calls happen when a script host API calls interpreter.source()
-    // (loadJava). The outer call already holds the engine mutex; reuse its
-    // session instead of deadlocking on a non-reentrant Mutex.
-    let nested = CURRENT_SESSION.with(|cell| cell.get());
-    if !nested.is_null() && CURRENT_ENGINE.with(|cell| cell.get()) == engine {
-        return f(unsafe { &mut *nested });
-    }
-
-    let mut engines = lock_engines();
-    if !engines.contains_key(&engine) {
-        engines.insert(engine, new_runtime(engine));
-    }
-    let session = engines.get_mut(&engine).unwrap();
+/// Runs `f` with the session bookkeeping (thread-local current engine) applied.
+/// The caller keeps holding whatever engine lock it acquired.
+fn run_session_guarded<T>(engine: u64, session: &mut Runtime, f: impl FnOnce(&mut Runtime) -> T) -> T {
     let interpreter_pointer = &mut session.interpreter as *mut Interpreter;
     let session_pointer = session as *mut Runtime;
     let previous_pointer = CURRENT_INTERPRETER.with(|cell| cell.replace(interpreter_pointer));
@@ -335,6 +330,49 @@ fn with_engine<T>(engine: u64, f: impl FnOnce(&mut Runtime) -> T) -> T {
         Ok(value) => value,
         Err(panic) => std::panic::resume_unwind(panic),
     }
+}
+
+fn with_engine<T>(engine: u64, f: impl FnOnce(&mut Runtime) -> T) -> T {
+    // Nested calls happen when a script host API calls interpreter.source()
+    // (loadJava). The outer call already holds the engine mutex; reuse its
+    // session instead of deadlocking on a non-reentrant Mutex.
+    let nested = CURRENT_SESSION.with(|cell| cell.get());
+    if !nested.is_null() && CURRENT_ENGINE.with(|cell| cell.get()) == engine {
+        return f(unsafe { &mut *nested });
+    }
+
+    let mut engines = lock_engines();
+    if !engines.contains_key(&engine) {
+        engines.insert(engine, new_runtime(engine));
+    }
+    let session = engines.get_mut(&engine).unwrap();
+    run_session_guarded(engine, session, f)
+}
+
+/// Synchronous, non-queuing entry for host hook callbacks.
+///
+/// Returns `None` when the interpreter execution right is not available right
+/// now. The caller must then let the host method run untouched instead of
+/// blocking or queueing the callback onto another thread: an interceptor chain
+/// is only valid on the thread that received it.
+fn try_with_engine<T>(engine: u64, f: impl FnOnce(&mut Runtime) -> T) -> Option<T> {
+    let nested = CURRENT_SESSION.with(|cell| cell.get());
+    if !nested.is_null() && CURRENT_ENGINE.with(|cell| cell.get()) == engine {
+        return Some(f(unsafe { &mut *nested }));
+    }
+
+    let mut engines = match engines().try_lock() {
+        Ok(guard) => guard,
+        // `WouldBlock` is the normal busy case. Poisoning can only come from a
+        // panic that escaped `run_session_guarded`; treat it the same way so the
+        // host method simply runs without the script instead of blocking.
+        Err(_) => return None,
+    };
+    if !engines.contains_key(&engine) {
+        engines.insert(engine, new_runtime(engine));
+    }
+    let session = engines.get_mut(&engine).unwrap();
+    Some(run_session_guarded(engine, session, f))
 }
 
 const AST_HEADER: &[u8; 8] = b"BSHAST\0\x01";
@@ -799,6 +837,81 @@ pub unsafe extern "system" fn Java_me_yun_bsh_rust_Native_invokeMethod(
         Ok(Ok(value)) => export_value(engine as u64, env, &value),
         Ok(Err(error)) => {
             throw_runtime(env, &format!("{}", error));
+            ptr::null_mut()
+        }
+        Err(_) => {
+            throw_runtime(env, "interpreter panicked");
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Invokes one script function for a host hook callback. The caller already
+/// holds the engine execution right, and no other thread can take it over,
+/// because the interceptor chain passed to the script must stay on this thread.
+unsafe fn invoke_hook_in_session(
+    env: Env,
+    session: &mut Runtime,
+    method: &str,
+    args: JArray,
+    argc: usize,
+) -> Result<JObject, String> {
+    let mut values = Vec::with_capacity(argc);
+    for index in 0..argc {
+        let argument = get_object_array_element(env, args, index as i32);
+        values.push(import_value(env, argument)?);
+    }
+    let value = session
+        .interpreter
+        .invoke_script_method(method, values)
+        .map_err(|error| format!("{}", error))?;
+    let jvm = bsh_jvm::global().ok_or_else(|| "No JVM available".to_string())?;
+    let jval = bsh_runtime::java::to_jval(&mut session.interpreter, &value)
+        .map_err(|error| error.to_string())?;
+    jvm.export_object_raw(env as *mut c_void, &jval)
+        .map_err(|error| error.to_string())
+}
+
+/// Calls a script function for a host hook callback without waiting.
+///
+/// Unlike `Native_invokeMethod`, this entry never queues and never blocks: the
+/// callback runs on the calling thread or not at all. `busy_flags[0]` is set to
+/// `true` when the interpreter execution right is unavailable right now; the
+/// caller then leaves the hooked method untouched so the chain continues on the
+/// thread that owns it.
+#[no_mangle]
+pub unsafe extern "system" fn Java_me_yun_bsh_rust_Native_tryInvokeHook(
+    env: Env,
+    _this: JClass,
+    engine: JLong,
+    name: JString,
+    args: JArray,
+    busy_flags: JArray,
+) -> JObject {
+    let outcome =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<Option<JObject>, String> {
+            let method = read_java_string(env, name);
+            let argc = if args.is_null() {
+                0
+            } else {
+                get_array_length(env, args) as usize
+            };
+            let result = try_with_engine(engine as u64, |session| {
+                invoke_hook_in_session(env, session, &method, args, argc)
+            });
+            result.transpose()
+        }));
+    match outcome {
+        Ok(Ok(Some(object))) => object,
+        Ok(Ok(None)) => {
+            if !busy_flags.is_null() {
+                let flag: u8 = 1;
+                set_boolean_array_region(env, busy_flags, 0, 1, &flag);
+            }
+            ptr::null_mut()
+        }
+        Ok(Err(error)) => {
+            throw_runtime(env, &error);
             ptr::null_mut()
         }
         Err(_) => {

@@ -4,7 +4,7 @@ import android.text.SpannableStringBuilder
 import android.text.Spanned
 import android.view.View
 import android.widget.TextView
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.dexkit.DexMethodCache
 import h.Hchat.hooks.api.core.WeChatApis
 import h.Hchat.hooks.core.FeatureContext
@@ -43,11 +43,7 @@ class RealNameTailRenderer(
         if (installed) return true
         val method = locateUsernameBindMethod() ?: return false
         return try {
-            HookRegistry.get().hook(method, object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    handleUsernameBind(param)
-                }
-            })
+            HookRegistry.get().hook(method, UsernameBindHook(this))
             installed = true
             true
         } catch (e: Throwable) {
@@ -69,61 +65,6 @@ class RealNameTailRenderer(
         }
     }
 
-    private fun handleUsernameBind(param: XC_MethodHook.MethodHookParam) {
-        val args = param.args ?: return
-        val holder = args.firstOrNull() ?: return
-        val tv = findUserTextView(holder) ?: return
-        val tailEnabled = store.isEnabled()
-        val nicknameColorEnabled = nicknameColorStore.isEnabled()
-        if (!tailEnabled && !nicknameColorEnabled) {
-            clearBoundDecorations(tv)
-            return
-        }
-        val roomId = currentRoomId()
-        if (!isRoom(roomId)) {
-            clearBoundDecorations(tv)
-            return
-        }
-        var msg: Any? = null
-        var raw = ""
-        val stringCandidates = mutableListOf<String>()
-        args.forEach {
-            if (it is String) {
-                if (raw.isEmpty()) raw = it
-                val value = it.trim()
-                if (RealNameTailStore.isValidWxid(value)) stringCandidates += value
-            }
-            if (it != null && isLikelyMessageClass(it.javaClass)) msg = it
-        }
-        if (isOutgoingMessage(msg)) {
-            clearBoundDecorations(tv)
-            return
-        }
-        val sender = resolveBindSender(msg, raw, stringCandidates)
-        if (!RealNameTailStore.isValidWxid(sender) || isSelf(sender)) {
-            clearBoundDecorations(tv)
-            return
-        }
-        boundViews[tv] = sender
-        if (tailEnabled) {
-            val rawTail = store.cachedTail(sender)
-            if (rawTail.isNotEmpty()) {
-                if (!applyTail(tv, sender, rawTail)) scheduleDelayedApply(tv, sender, rawTail)
-            } else {
-                hideTail(tv)
-                if (store.visibleQueryEnabled()) {
-                    scheduler.onVisible(roomId, sender)
-                }
-            }
-        } else {
-            hideTail(tv)
-        }
-        if (nicknameColorEnabled) {
-            applyNicknameColor(tv)
-        } else {
-            hideNicknameColor(tv)
-        }
-    }
 
     private fun applyConfiguredDecorations(tv: TextView, sender: String) {
         if (store.isEnabled()) {
@@ -539,5 +480,68 @@ class RealNameTailRenderer(
     }
 
     companion object {
+    }
+
+    private class UsernameBindHook(private val owner: RealNameTailRenderer) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            return with(owner) {
+                val outcome = chain.proceed()
+                val args = chain.args
+
+                val holder = args.firstOrNull() ?: return outcome
+                val tv = findUserTextView(holder) ?: return outcome
+                val tailEnabled = store.isEnabled()
+                val nicknameColorEnabled = nicknameColorStore.isEnabled()
+                if (!tailEnabled && !nicknameColorEnabled) {
+                    clearBoundDecorations(tv)
+                    return outcome
+                }
+                val roomId = currentRoomId()
+                if (!isRoom(roomId)) {
+                    clearBoundDecorations(tv)
+                    return outcome
+                }
+                var msg: Any? = null
+                var raw = ""
+                val stringCandidates = mutableListOf<String>()
+                args.forEach {
+                    if (it is String) {
+                        if (raw.isEmpty()) raw = it
+                        val value = it.trim()
+                        if (RealNameTailStore.isValidWxid(value)) stringCandidates += value
+                    }
+                    if (it != null && isLikelyMessageClass(it.javaClass)) msg = it
+                }
+                if (isOutgoingMessage(msg)) {
+                    clearBoundDecorations(tv)
+                    return outcome
+                }
+                val sender = resolveBindSender(msg, raw, stringCandidates)
+                if (!RealNameTailStore.isValidWxid(sender) || isSelf(sender)) {
+                    clearBoundDecorations(tv)
+                    return outcome
+                }
+                boundViews[tv] = sender
+                if (tailEnabled) {
+                    val rawTail = store.cachedTail(sender)
+                    if (rawTail.isNotEmpty()) {
+                        if (!applyTail(tv, sender, rawTail)) scheduleDelayedApply(tv, sender, rawTail)
+                    } else {
+                        hideTail(tv)
+                        if (store.visibleQueryEnabled()) {
+                            scheduler.onVisible(roomId, sender)
+                        }
+                    }
+                } else {
+                    hideTail(tv)
+                }
+                if (nicknameColorEnabled) {
+                    applyNicknameColor(tv)
+                } else {
+                    hideNicknameColor(tv)
+                }
+                return outcome
+            }
+        }
     }
 }

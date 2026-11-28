@@ -3,7 +3,7 @@ package h.Hchat.hooks.items.theme
 import android.app.Activity
 import android.content.Intent
 import android.net.Uri
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.hooks.core.FeatureContext
 import h.Hchat.hooks.core.HookRegistry
 import h.Hchat.utils.KavaReflector
@@ -33,21 +33,25 @@ internal object ActivityResultBridge {
             return false
         }
         return runCatching {
-            HookRegistry.get().hook(method, object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    val requestCode = (param.args?.getOrNull(0) as? Number)?.toInt() ?: return
-                    val callback = pending.remove(requestCode) ?: return
-                    val resultCode = (param.args?.getOrNull(1) as? Number)?.toInt()
-                    val data = param.args?.getOrNull(2) as? Intent
-                    val uri = if (resultCode == Activity.RESULT_OK) data?.data else null
-                    runCatching { callback(uri) }
-                }
-            })
+            HookRegistry.get().hook(method, ActivityResultHooker())
             installed = true
             true
         }.getOrElse {
             logger("文件选择通道 Hook 安装失败", it)
             false
+        }
+    }
+
+    private class ActivityResultHooker : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val result = chain.proceed()
+            val requestCode = (chain.args.getOrNull(0) as? Number)?.toInt() ?: return result
+            val callback = ActivityResultBridge.pending.remove(requestCode) ?: return result
+            val resultCode = (chain.args.getOrNull(1) as? Number)?.toInt()
+            val data = chain.args.getOrNull(2) as? Intent
+            val uri = if (resultCode == Activity.RESULT_OK) data?.data else null
+            runCatching { callback(uri) }
+            return result
         }
     }
 

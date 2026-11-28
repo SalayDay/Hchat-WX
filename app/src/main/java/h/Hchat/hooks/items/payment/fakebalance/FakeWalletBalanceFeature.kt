@@ -7,7 +7,7 @@ import android.content.ContextWrapper
 import android.view.View
 import android.view.ViewGroup
 import android.widget.TextView
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.dexkit.DexMethodCache
 import h.Hchat.hooks.core.BaseFeature
 import h.Hchat.hooks.core.DexInstallScheduler
@@ -20,7 +20,6 @@ import org.luckypray.dexkit.query.FindMethod
 import org.luckypray.dexkit.query.matchers.MethodMatcher
 import java.math.RoundingMode
 import java.lang.reflect.Method
-import java.util.ArrayDeque
 import java.util.Locale
 import java.util.WeakHashMap
 
@@ -55,7 +54,6 @@ private class FakeWalletBalanceHooker(
     private val tickerTextSizeReady = WeakHashMap<View, Boolean>()
     private val amountTextStates = WeakHashMap<View, AmountTextState>()
     // 微信金额控件会嵌套调用多个 setter，同一调用链只能应用一次动态增减。
-    private val amountHookFrames = ThreadLocal<ArrayDeque<Boolean>>()
     private val activeAmountOverride = ThreadLocal<AmountOverride>()
 
     @Volatile
@@ -93,28 +91,7 @@ private class FakeWalletBalanceHooker(
         if (methods.isEmpty()) return
         var hooked = 0
         methods.forEach { method ->
-            HookRegistry.get().hook(method, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    val raw = param.args?.getOrNull(0) as? String
-                    val view = param.thisObject as? View
-                    if (enterAmountHook(view, raw)) return
-                    view ?: return
-                    val target = targetForMoneyView(view) ?: AmountTarget.BALANCE
-                    if (requiresFinalTextSize(target) && !moneyTickerReady(view)) return
-                    val source = raw ?: return
-                    if (!isEnabled(target)) return
-                    val original = originalAmountText(view, target, source)
-                    val amount = currentAmountText(target, original)
-                    val rendered = formatAmountLike(original, amount)
-                    rememberRenderedAmount(view, target, rendered)
-                    markAmountOverride(target, original)
-                    param.args?.set(0, rendered)
-                }
-
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    exitAmountHook()
-                }
-            })
+            HookRegistry.get().hook(method, MoneyLoadingHooker(this))
             hooked++
         }
         moneyLoadingInstalled = hooked > 0
@@ -131,57 +108,11 @@ private class FakeWalletBalanceHooker(
         if (methods.isEmpty() && textSizeMethod == null) return
         var hooked = 0
         methods.forEach { method ->
-            HookRegistry.get().hook(method, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    val raw = param.args?.getOrNull(0) as? String
-                    val view = param.thisObject as? View
-                    if (enterAmountHook(view, raw)) return
-                    val source = raw ?: return
-                    if (source.none { it.isDigit() }) return
-                    view ?: return
-                    val target = targetForMoneyView(view) ?: AmountTarget.BALANCE
-                    if (requiresFinalTextSize(target) && tickerTextSizeReady[view] != true) return
-                    if (!isEnabled(target)) return
-                    val original = originalAmountText(view, target, source)
-                    val amount = currentAmountText(target, original)
-                    finishTickerAnimation(view)
-                    val rendered = formatAmountLike(original, amount)
-                    rememberRenderedAmount(view, target, rendered)
-                    markAmountOverride(target, original)
-                    param.args?.set(0, rendered)
-                    if (method.parameterTypes.size == 2) {
-                        param.args?.set(1, false)
-                    }
-                }
-
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    exitAmountHook()
-                }
-            })
+            HookRegistry.get().hook(method, TickerTextHooker(this, method))
             hooked++
         }
         if (textSizeMethod != null) {
-            HookRegistry.get().hook(textSizeMethod, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    val view = param.thisObject as? View ?: return
-                    val target = targetForMoneyView(view) ?: AmountTarget.BALANCE
-                    if (!isEnabled(target)) return
-                    finishTickerAnimation(view)
-                    if (view.parent != null && requiresFinalTextSize(target)) {
-                        tickerTextSizeReady[view] = true
-                    }
-                }
-
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    val view = param.thisObject as? View ?: return
-                    val target = targetForMoneyView(view) ?: AmountTarget.BALANCE
-                    if (!isEnabled(target)) return
-                    refreshTickerCharacterMetrics(view)
-                    if (requiresFinalTextSize(target) && tickerTextSizeReady[view] == true) {
-                        applyCurrentAmountToTicker(view)
-                    }
-                }
-            })
+            HookRegistry.get().hook(textSizeMethod, TickerSizeHooker(this))
             hooked++
         }
         tickerInstalled = hooked > 0
@@ -238,30 +169,7 @@ private class FakeWalletBalanceHooker(
         if (methods.isEmpty()) return
         var hooked = 0
         methods.forEach { method ->
-            HookRegistry.get().hook(method, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    val args = param.args
-                    val view = param.thisObject as? View
-                    val raw = args?.getOrNull(3) as? String
-                    if (enterAmountHook(view, raw)) return
-                    args ?: return
-                    val target = when (KavaReflector.readField(args.getOrNull(0), "i") as? String) {
-                        "balance_cell" -> AmountTarget.BALANCE
-                        "lqt_cell" -> AmountTarget.LQT
-                        else -> return
-                    }
-                    if (!isEnabled(target)) return
-                    val original = originalAmountText(view, target, raw.orEmpty())
-                    val rendered = formatAmountLike(original, currentAmountText(target, original))
-                    rememberRenderedAmount(view, target, rendered)
-                    markAmountOverride(target, original)
-                    args[3] = rendered
-                }
-
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    exitAmountHook()
-                }
-            })
+            HookRegistry.get().hook(method, WalletCellHooker(this))
             hooked++
         }
         mallWalletCellInstalled = hooked > 0
@@ -273,22 +181,7 @@ private class FakeWalletBalanceHooker(
         if (methods.isEmpty()) return
         var hooked = 0
         methods.forEach { method ->
-            HookRegistry.get().hook(method, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    if (enterAmountHook(null, null)) return
-                    if (!isEnabled(AmountTarget.LQT)) return
-                    val actualCents = param.args?.getOrNull(1) as? Long ?: return
-                    val actual = java.math.BigDecimal.valueOf(actualCents, 2).toPlainString()
-                    val rendered = currentAmountText(AmountTarget.LQT, actual)
-                    val cents = amountTextToCents(rendered) ?: return
-                    markAmountOverride(AmountTarget.LQT, actual)
-                    param.args?.set(1, cents)
-                }
-
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    exitAmountHook()
-                }
-            })
+            HookRegistry.get().hook(method, LqtEntryHooker(this))
             hooked++
         }
         lqtDetailEntryInstalled = hooked > 0
@@ -497,8 +390,6 @@ private class FakeWalletBalanceHooker(
     }
 
     private fun enterAmountHook(view: View?, raw: String?): Boolean {
-        val frames = amountHookFrames.get() ?: ArrayDeque<Boolean>().also(amountHookFrames::set)
-        frames.addLast(false)
         val active = activeAmountOverride.get() ?: return false
         if (view != null && raw != null && raw.any { it.isDigit() }) {
             val original = formatAmountLike(raw, FakeWalletBalanceSettings.amountDecimal(active.original).toPlainString())
@@ -510,23 +401,10 @@ private class FakeWalletBalanceHooker(
     }
 
     private fun markAmountOverride(target: AmountTarget, original: String) {
-        val frames = amountHookFrames.get() ?: return
-        if (frames.isEmpty()) return
-        frames.removeLast()
-        frames.addLast(true)
         activeAmountOverride.set(AmountOverride(target, original))
     }
 
-    private fun exitAmountHook() {
-        val frames = amountHookFrames.get() ?: return
-        if (frames.isEmpty()) {
-            amountHookFrames.remove()
-            activeAmountOverride.remove()
-            return
-        }
-        if (frames.removeLast()) activeAmountOverride.remove()
-        if (frames.isEmpty()) amountHookFrames.remove()
-    }
+
 
     private fun sameAmount(first: String, second: String): Boolean {
         if (first.none { it.isDigit() } || second.none { it.isDigit() }) return false
@@ -655,4 +533,163 @@ private class FakeWalletBalanceHooker(
         val original: String,
         val rendered: String
     )
+
+    private class MoneyLoadingHooker(private val owner: FakeWalletBalanceHooker) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val args = chain.args.toTypedArray()
+            val receiver = chain.thisObject
+            val previousOverride = owner.activeAmountOverride.get()
+            try {
+                with(owner) {
+                    run patch@{
+                        val raw = args?.getOrNull(0) as? String
+                        val view = receiver as? View
+                        if (enterAmountHook(view, raw)) return@patch
+                        view ?: return@patch
+                        val target = targetForMoneyView(view) ?: AmountTarget.BALANCE
+                        if (requiresFinalTextSize(target) && !moneyTickerReady(view)) return@patch
+                        val source = raw ?: return@patch
+                        if (!isEnabled(target)) return@patch
+                        val original = originalAmountText(view, target, source)
+                        val amount = currentAmountText(target, original)
+                        val rendered = formatAmountLike(original, amount)
+                        rememberRenderedAmount(view, target, rendered)
+                        markAmountOverride(target, original)
+                        args?.set(0, rendered)
+                    }
+                }
+                return chain.proceed(args)
+            } finally {
+                if (previousOverride == null) owner.activeAmountOverride.remove()
+                else owner.activeAmountOverride.set(previousOverride)
+            }
+        }
+    }
+
+    private class TickerTextHooker(private val owner: FakeWalletBalanceHooker, private val method: Method) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val args = chain.args.toTypedArray()
+            val receiver = chain.thisObject
+            val previousOverride = owner.activeAmountOverride.get()
+            try {
+                with(owner) {
+                    run patch@{
+                        val raw = args?.getOrNull(0) as? String
+                        val view = receiver as? View
+                        if (enterAmountHook(view, raw)) return@patch
+                        val source = raw ?: return@patch
+                        if (source.none { it.isDigit() }) return@patch
+                        view ?: return@patch
+                        val target = targetForMoneyView(view) ?: AmountTarget.BALANCE
+                        if (requiresFinalTextSize(target) && tickerTextSizeReady[view] != true) return@patch
+                        if (!isEnabled(target)) return@patch
+                        val original = originalAmountText(view, target, source)
+                        val amount = currentAmountText(target, original)
+                        finishTickerAnimation(view)
+                        val rendered = formatAmountLike(original, amount)
+                        rememberRenderedAmount(view, target, rendered)
+                        markAmountOverride(target, original)
+                        args?.set(0, rendered)
+                        if (method.parameterTypes.size == 2) {
+                            args?.set(1, false)
+                        }
+                    }
+                }
+                return chain.proceed(args)
+            } finally {
+                if (previousOverride == null) owner.activeAmountOverride.remove()
+                else owner.activeAmountOverride.set(previousOverride)
+            }
+        }
+    }
+
+    private class TickerSizeHooker(private val owner: FakeWalletBalanceHooker) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val args = chain.args.toTypedArray()
+            val receiver = chain.thisObject
+            with(owner) {
+            run patch@{
+                val view = receiver as? View ?: return@patch
+                val target = targetForMoneyView(view) ?: AmountTarget.BALANCE
+                if (!isEnabled(target)) return@patch
+                finishTickerAnimation(view)
+                if (view.parent != null && requiresFinalTextSize(target)) {
+                    tickerTextSizeReady[view] = true
+                }
+            }
+            var result = chain.proceed(args)
+            run update@{
+                val view = receiver as? View ?: return@update
+                val target = targetForMoneyView(view) ?: AmountTarget.BALANCE
+                if (!isEnabled(target)) return@update
+                refreshTickerCharacterMetrics(view)
+                if (requiresFinalTextSize(target) && tickerTextSizeReady[view] == true) {
+                    applyCurrentAmountToTicker(view)
+                }
+            }
+            return result
+            }
+        }
+    }
+
+    private class WalletCellHooker(private val owner: FakeWalletBalanceHooker) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val args = chain.args.toTypedArray()
+            val receiver = chain.thisObject
+            val previousOverride = owner.activeAmountOverride.get()
+            try {
+                with(owner) {
+                    run patch@{
+                        val args = args
+                        val view = receiver as? View
+                        val raw = args?.getOrNull(3) as? String
+                        if (enterAmountHook(view, raw)) return@patch
+                        args ?: return@patch
+                        val target = when (KavaReflector.readField(args.getOrNull(0), "i") as? String) {
+                            "balance_cell" -> AmountTarget.BALANCE
+                            "lqt_cell" -> AmountTarget.LQT
+                            else -> return@patch
+                        }
+                        if (!isEnabled(target)) return@patch
+                        val original = originalAmountText(view, target, raw.orEmpty())
+                        val rendered = formatAmountLike(original, currentAmountText(target, original))
+                        rememberRenderedAmount(view, target, rendered)
+                        markAmountOverride(target, original)
+                        args[3] = rendered
+                    }
+                }
+                return chain.proceed(args)
+            } finally {
+                if (previousOverride == null) owner.activeAmountOverride.remove()
+                else owner.activeAmountOverride.set(previousOverride)
+            }
+        }
+    }
+
+    private class LqtEntryHooker(private val owner: FakeWalletBalanceHooker) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val args = chain.args.toTypedArray()
+            val receiver = chain.thisObject
+            val previousOverride = owner.activeAmountOverride.get()
+            try {
+                with(owner) {
+                    run patch@{
+                        if (enterAmountHook(null, null)) return@patch
+                        if (!isEnabled(AmountTarget.LQT)) return@patch
+                        val actualCents = args?.getOrNull(1) as? Long ?: return@patch
+                        val actual = java.math.BigDecimal.valueOf(actualCents, 2).toPlainString()
+                        val rendered = currentAmountText(AmountTarget.LQT, actual)
+                        val cents = amountTextToCents(rendered) ?: return@patch
+                        markAmountOverride(AmountTarget.LQT, actual)
+                        args?.set(1, cents)
+                    }
+                }
+                return chain.proceed(args)
+            } finally {
+                if (previousOverride == null) owner.activeAmountOverride.remove()
+                else owner.activeAmountOverride.set(previousOverride)
+            }
+        }
+    }
+
 }

@@ -20,7 +20,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
-import de.robv.android.xposed.XC_MethodHook;
+import io.github.libxposed.api.XposedInterface;
 
 /**
  * 微信网络发包器缓存与发包封装。
@@ -150,31 +150,7 @@ public class WeChatNetworkDispatcher {
                 for (Method method : KavaReflector.declaredMethods(queueClass)) {
                     if (!isSendMethodCandidate(method, null) || !hookedQueueMethods.add(method)) continue;
                     try {
-                        HookRegistry.get().hook(method, new XC_MethodHook() {
-                            @Override
-                            public void beforeHookedMethod(MethodHookParam param) {
-                                if (dispatcherInstance == null
-                                        || methodPriority(method) > methodPriority(dispatcherMethod)) {
-                                    cacheDispatcher(param.thisObject, method, "网络发包器已缓存");
-                                }
-                                if (SEND_GUARDS.isEmpty()) return;
-                                String[] blockedUriOut = new String[1];
-                                if (shouldGuardBlock(param.args, blockedUriOut)) {
-                                    long blockedCount = GUARD_BLOCK_COUNTER.incrementAndGet();
-                                    if (blockedCount <= 20 || blockedCount % 200 == 0) {
-                                        log("已拦截风控上报 CGI(累计" + blockedCount + "次): " + blockedUriOut[0]);
-                                    }
-                                    Class<?> returnType = method.getReturnType();
-                                    if (returnType == boolean.class || returnType == Boolean.class) {
-                                        param.setResult(Boolean.FALSE);
-                                    } else if (returnType == int.class || returnType == Integer.class) {
-                                        param.setResult(Integer.valueOf(0));
-                                    } else {
-                                        param.setResult(null);
-                                    }
-                                }
-                            }
-                        });
+                        HookRegistry.get().hook(method, new NetworkSendHooker(this, method));
                         hooked++;
                     } catch (Throwable hookError) {
                         hookedQueueMethods.remove(method);
@@ -471,4 +447,34 @@ public class WeChatNetworkDispatcher {
     private void log(String message) {
         if (logger != null) logger.log(message);
     }
+
+    private static final class NetworkSendHooker implements XposedInterface.Hooker {
+        private final WeChatNetworkDispatcher owner;
+        private final Method method;
+        private NetworkSendHooker(WeChatNetworkDispatcher owner, Method method) {
+            this.owner = owner; this.method = method;
+        }
+        @Override
+        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+            if (owner.dispatcherInstance == null
+                    || owner.methodPriority(method) > owner.methodPriority(owner.dispatcherMethod)) {
+                owner.cacheDispatcher(chain.getThisObject(), method, "网络发包器已缓存");
+            }
+            if (!SEND_GUARDS.isEmpty()) {
+                String[] blockedUriOut = new String[1];
+                if (owner.shouldGuardBlock(chain.getArgs().toArray(), blockedUriOut)) {
+                    long blockedCount = GUARD_BLOCK_COUNTER.incrementAndGet();
+                    if (blockedCount <= 20 || blockedCount % 200 == 0) {
+                        owner.log("已拦截风控上报 CGI(累计" + blockedCount + "次): " + blockedUriOut[0]);
+                    }
+                    Class<?> returnType = method.getReturnType();
+                    if (returnType == boolean.class || returnType == Boolean.class) return Boolean.FALSE;
+                    if (returnType == int.class || returnType == Integer.class) return Integer.valueOf(0);
+                    return null;
+                }
+            }
+            return chain.proceed();
+        }
+    }
+
 }

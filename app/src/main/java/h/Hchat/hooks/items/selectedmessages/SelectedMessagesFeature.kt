@@ -7,7 +7,7 @@ import android.os.Handler
 import android.os.Looper
 import android.view.MenuItem
 import android.widget.Toast
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.dexkit.DexMethodCache
 import h.Hchat.event.Events
 import h.Hchat.hooks.api.core.WeChatApis
@@ -96,24 +96,11 @@ private class SelectedMessagesHooker(
         val menuCreate = MultiSelectMessageMenuLocator.menuCreateMethod(context, logger)
         val menuClick = MultiSelectMessageMenuLocator.menuClickMethod(context, logger)
         val exitMethod = menuClick?.let { MultiSelectMessageMenuLocator.multiSelectExitMethod(context, it, logger) }
-        val createHooked = menuCreate != null && exitMethod != null && hook(menuCreate, object : XC_MethodHook() {
-            override fun afterHookedMethod(param: MethodHookParam) {
-                addMenu(param)
-            }
-        })
-        val clickHooked = menuClick != null && exitMethod != null && hook(menuClick, object : XC_MethodHook() {
-            override fun beforeHookedMethod(param: MethodHookParam) {
-                handleMenuClick(param, exitMethod)
-            }
-        })
+        val createHooked = menuCreate != null && exitMethod != null && hook(menuCreate, SelectedMenuHook(this))
+        val clickHooked = menuClick != null && exitMethod != null && hook(menuClick, SelectedMenuClickHook(this, exitMethod))
         val doneMethods = locateRetransmitDoneMethods()
         val doneHooked = doneMethods.isNotEmpty() && doneMethods.all { method ->
-            hook(method, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    val activity = param.thisObject as? Activity ?: return
-                    if (moduleSender.handleRetransmitDone(activity)) param.setResult(null)
-                }
-            })
+            hook(method, RetransmitDoneHook(this))
         }
         val officialHooked = officialSender.install()
         if (!createHooked) logger("群发助手菜单创建Hook未安装", null)
@@ -123,10 +110,10 @@ private class SelectedMessagesHooker(
         return createHooked && clickHooked && doneHooked && officialHooked
     }
 
-    private fun addMenu(param: XC_MethodHook.MethodHookParam) {
+    private fun addMenu(receiver: Any?, args: Array<Any?>) {
         if (!isEnabled()) return
-        if (MultiSelectMessageResolver.resolve(param.thisObject).isEmpty()) return
-        val menu = param.args?.getOrNull(0) ?: return
+        if (MultiSelectMessageResolver.resolve(receiver).isEmpty()) return
+        val menu = args?.getOrNull(0) ?: return
         addMenuItem(menu, MENU_MASS_SEND_ID, MENU_MASS_SEND_TITLE)
         addMenuItem(menu, MENU_SCHEDULE_ID, MENU_SCHEDULE_TITLE)
     }
@@ -139,28 +126,27 @@ private class SelectedMessagesHooker(
             ?: KavaReflector.invokeMethod(menu, "f", itemId, title as CharSequence)
     }
 
-    private fun handleMenuClick(param: XC_MethodHook.MethodHookParam, exitMethod: Method) {
-        if (!isEnabled()) return
-        val item = param.args?.getOrNull(0) as? MenuItem ?: return
+    private fun handleMenuClick(receiver: Any?, args: Array<Any?>, exitMethod: Method): Boolean {
+        if (!isEnabled()) return false
+        val item = args?.getOrNull(0) as? MenuItem ?: return false
         val action = when (item.itemId) {
             MENU_MASS_SEND_ID -> MenuAction.MASS_SEND
             MENU_SCHEDULE_ID -> MenuAction.SCHEDULE
-            else -> return
+            else -> return false
         }
-        param.setResult(null)
         val activity = currentActivity()
-        if (activity == null) return
-        val selected = MultiSelectMessageResolver.resolve(param.thisObject)
+        if (activity == null) return true
+        val selected = MultiSelectMessageResolver.resolve(receiver)
         val snapshots = selected.mapNotNull { SelectedMessageSnapshot.fromNative(it) }
             .sortedWith(compareBy<SelectedMessageSnapshot> { it.createTime }.thenBy { it.msgId })
         if (selected.isEmpty() || snapshots.size != selected.size) {
             toast(activity, "部分选中消息暂不支持发送")
-            return
+            return true
         }
-        val exitTarget = MultiSelectMessageUi.resolveExitTarget(param.thisObject, exitMethod, logger)
+        val exitTarget = MultiSelectMessageUi.resolveExitTarget(receiver, exitMethod, logger)
         if (exitTarget == null) {
             toast(activity, "无法退出多选状态，请稍后重试")
-            return
+            return true
         }
         main.post {
             if (activity.isFinishing) return@post
@@ -169,6 +155,7 @@ private class SelectedMessagesHooker(
                 MenuAction.SCHEDULE -> chooseScheduleChannel(activity, snapshots, exitTarget)
             }
         }
+        return true
     }
 
     private fun chooseScheduleChannel(
@@ -585,7 +572,30 @@ private class SelectedMessagesHooker(
             method.parameterTypes.contentEquals(arrayOf(String::class.java))
     }
 
-    private fun hook(method: Method, callback: XC_MethodHook): Boolean {
+    private class SelectedMenuHook(private val owner: SelectedMessagesHooker) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val result = chain.proceed()
+            owner.addMenu(chain.thisObject, chain.args.toTypedArray())
+            return result
+        }
+    }
+
+    private class SelectedMenuClickHook(private val owner: SelectedMessagesHooker, private val exitMethod: Method) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            if (owner.handleMenuClick(chain.thisObject, chain.args.toTypedArray(), exitMethod)) return null
+            return chain.proceed()
+        }
+    }
+
+    private class RetransmitDoneHook(private val owner: SelectedMessagesHooker) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val activity = chain.thisObject as? Activity
+            if (activity != null && owner.moduleSender.handleRetransmitDone(activity)) return null
+            return chain.proceed()
+        }
+    }
+
+    private fun hook(method: Method, callback: XposedInterface.Hooker): Boolean {
         if (!hookedMethods.add(method)) return true
         return runCatching {
             HookRegistry.get().hook(KavaReflector.accessible(method) ?: method, callback)

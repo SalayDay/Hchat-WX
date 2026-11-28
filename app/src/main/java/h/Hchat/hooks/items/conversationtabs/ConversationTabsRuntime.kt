@@ -19,7 +19,7 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.RelativeLayout
 import android.widget.FrameLayout
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.hooks.core.DexInstallScheduler
 import h.Hchat.hooks.core.FeatureContext
 import h.Hchat.hooks.core.HookRegistry
@@ -127,37 +127,11 @@ internal object ConversationTabsRuntime {
             HLog.e("$TAG 未找到 MainUI 的唯一 MainUIView 字段，标签分组未安装")
             return false
         }
-        val hooks = arrayListOf<XC_MethodHook.Unhook>()
+        val hooks = arrayListOf<XposedInterface.HookHandle>()
         return runCatching {
-            hooks += HookRegistry.get().hook(layout, object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    if (param.hasThrowable() || !clazz.isInstance(param.thisObject)) return
-                    val original = param.result as? View ?: return
-                    clearChangedAccount()
-                    ensureHost(param.thisObject, original)
-                    reload()
-                }
-            })
-            hooks += HookRegistry.get().hook(resume, object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    if (param.hasThrowable() || !clazz.isInstance(param.thisObject)) return
-                    clearChangedAccount()
-                    // getLayoutView inflates a NEW root. Read the existing native root instead.
-                    val root = KavaReflector.readField(rootField, param.thisObject) as? View
-                    if (root != null) ensureHost(param.thisObject, root)
-                    reload()
-                }
-            })
-            hooks += HookRegistry.get().hook(destroy, object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    if (!clazz.isInstance(param.thisObject)) return
-                    hosts.remove(param.thisObject)?.get()?.let { removeHost(it) }
-                    if (liveHosts().isEmpty()) synchronized(reloadLock) {
-                        invalidateLoads()
-                        filter = null; loadedIcons = emptyMap(); compiledFilters = emptyMap(); bitmaps.evictAll()
-                    }
-                }
-            })
+            hooks += HookRegistry.get().hook(layout, MainLayoutHook(clazz))
+            hooks += HookRegistry.get().hook(resume, MainResumeHook(clazz, rootField))
+            hooks += HookRegistry.get().hook(destroy, MainDestroyHook(clazz))
             hookedMainUi = clazz
             true
         }.getOrElse {
@@ -593,6 +567,47 @@ internal object ConversationTabsRuntime {
                 hosts.clear()
                 ConversationGroupHomeProjection.refresh()
             }
+        }
+    }
+
+    private class MainLayoutHook(private val clazz: Class<*>) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val outcome = chain.proceed()
+
+            if (!clazz.isInstance(chain.thisObject)) return outcome
+            val original = outcome as? View ?: return outcome
+            clearChangedAccount()
+            ensureHost(chain.thisObject, original)
+            reload()
+            return outcome
+        }
+    }
+
+    private class MainResumeHook(private val clazz: Class<*>, private val rootField: java.lang.reflect.Field) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val outcome = chain.proceed()
+
+            if (!clazz.isInstance(chain.thisObject)) return outcome
+            clearChangedAccount()
+            // getLayoutView inflates a NEW root. Read the existing native root instead.
+            val root = KavaReflector.readField(rootField, chain.thisObject) as? View
+            if (root != null) ensureHost(chain.thisObject, root)
+            reload()
+            return outcome
+        }
+    }
+
+    private class MainDestroyHook(private val clazz: Class<*>) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val outcome = chain.proceed()
+
+            if (!clazz.isInstance(chain.thisObject)) return outcome
+            hosts.remove(chain.thisObject)?.get()?.let { removeHost(it) }
+            if (liveHosts().isEmpty()) synchronized(reloadLock) {
+                invalidateLoads()
+                filter = null; loadedIcons = emptyMap(); compiledFilters = emptyMap(); bitmaps.evictAll()
+            }
+            return outcome
         }
     }
 }

@@ -2,8 +2,10 @@ package h.Hchat.hooks.items.floatingshortcut
 
 import android.app.Activity
 import android.content.Intent
-import de.robv.android.xposed.XC_MethodHook
-import de.robv.android.xposed.XposedBridge
+import io.github.libxposed.api.XposedInterface
+import h.Hchat.hooks.core.HookRegistry
+import h.Hchat.utils.HLog
+import h.Hchat.utils.KavaReflector
 import java.lang.ref.WeakReference
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
@@ -75,43 +77,18 @@ object FloatingShortcutIconPicker {
     private fun hookActivityResult(clazz: Class<*>) {
         if (!hookedClasses.add(clazz)) return
         runCatching {
-            XposedBridge.hookAllMethods(clazz, "onActivityResult", object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    val requestCode = param.args.getOrNull(0) as? Int ?: return
-                    val result = pending[requestCode] ?: return
-                    val activity = result.activity.get()
-                    if (activity == null) {
-                        pending.remove(requestCode, result)
-                        return
-                    }
-                    if (param.thisObject !== activity || !pending.remove(requestCode, result)) return
-                    val resultCode = param.args.getOrNull(1) as? Int ?: return
-                    val data = param.args.getOrNull(2) as? Intent
-                    val uri = data?.data
-                    if (resultCode != Activity.RESULT_OK || uri == null) {
-                        result.callback(FloatingShortcutIconPickResult.CANCELLED)
-                        return
-                    }
-                    Thread({
-                        val path = runCatching {
-                            FloatingShortcutIconStore.saveFromUri(activity, result.key, uri)
-                        }.getOrNull()
-                        activity.runOnUiThread {
-                            if (activity.isFinishing || activity.isDestroyed) {
-                                FloatingShortcutIconStore.delete(activity, path)
-                                return@runOnUiThread
-                            }
-                            result.callback(
-                                if (path != null) {
-                                    FloatingShortcutIconPickResult.Saved(path)
-                                } else {
-                                    FloatingShortcutIconPickResult.FAILED
-                                }
-                            )
+            val handles = HookRegistry.get().hookAllMethods(clazz, "onActivityResult", IconResultHook())
+            val expected = KavaReflector.declaredMethods(clazz).count { it.name == "onActivityResult" }
+            if (handles.size != expected) {
+                handles.forEach { handle ->
+                    runCatching { HookRegistry.get().unhook(handle) }
+                        .onFailure { error ->
+                            HookRegistry.get().add(handle)
+                            HLog.e("[Hchat] 回滚结果 Hook 失败: ${clazz.name}#onActivityResult", error)
                         }
-                    }, "Hchat-FloatingShortcutIcon").start()
                 }
-            })
+                error("结果 Hook 安装不完整: ${clazz.name}#onActivityResult ${handles.size}/$expected")
+            }
         }.onFailure { hookedClasses.remove(clazz) }
     }
 
@@ -119,17 +96,18 @@ object FloatingShortcutIconPicker {
     private fun hookActivityDestroy(clazz: Class<*>) {
         if (!destroyHookedClasses.add(clazz)) return
         runCatching {
-            XposedBridge.hookAllMethods(clazz, "onDestroy", object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    val activity = param.thisObject as? Activity ?: return
-                    pending.entries.forEach { entry ->
-                        val owner = entry.value.activity.get()
-                        if (owner == null || owner === activity) {
-                            pending.remove(entry.key, entry.value)
+            val handles = HookRegistry.get().hookAllMethods(clazz, "onDestroy", ActivityDestroyHook())
+            val expected = KavaReflector.declaredMethods(clazz).count { it.name == "onDestroy" }
+            if (handles.size != expected) {
+                handles.forEach { handle ->
+                    runCatching { HookRegistry.get().unhook(handle) }
+                        .onFailure { error ->
+                            HookRegistry.get().add(handle)
+                            HLog.e("[Hchat] 回滚结果 Hook 失败: ${clazz.name}#onDestroy", error)
                         }
-                    }
                 }
-            })
+                error("结果 Hook 安装不完整: ${clazz.name}#onDestroy ${handles.size}/$expected")
+            }
         }.onFailure {
             destroyHookedClasses.remove(clazz)
         }
@@ -139,6 +117,62 @@ object FloatingShortcutIconPicker {
 
     private const val REQUEST_CODE_START = 0x7410
     private const val REQUEST_CODE_END = 0x74ff
+
+    private class IconResultHook : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val outcome = chain.proceed()
+            val args = chain.args
+            val requestCode = args.getOrNull(0) as? Int ?: return outcome
+            val result = pending[requestCode] ?: return outcome
+            val activity = result.activity.get()
+            if (activity == null) {
+                pending.remove(requestCode, result)
+                return outcome
+            }
+            if (chain.thisObject !== activity || !pending.remove(requestCode, result)) return outcome
+            val resultCode = args.getOrNull(1) as? Int ?: return outcome
+            val data = args.getOrNull(2) as? Intent
+            val uri = data?.data
+            if (resultCode != Activity.RESULT_OK || uri == null) {
+                result.callback(FloatingShortcutIconPickResult.CANCELLED)
+                return outcome
+            }
+            Thread({
+                val path = runCatching {
+                    FloatingShortcutIconStore.saveFromUri(activity, result.key, uri)
+                }.getOrNull()
+                activity.runOnUiThread {
+                    if (activity.isFinishing || activity.isDestroyed) {
+                        FloatingShortcutIconStore.delete(activity, path)
+                        return@runOnUiThread
+                    }
+                    result.callback(
+                        if (path != null) {
+                            FloatingShortcutIconPickResult.Saved(path)
+                        } else {
+                            FloatingShortcutIconPickResult.FAILED
+                        }
+                    )
+                }
+            }, "Hchat-FloatingShortcutIcon").start()
+            return outcome
+        }
+    }
+
+    private class ActivityDestroyHook : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val outcome = chain.proceed()
+
+            val activity = chain.thisObject as? Activity ?: return outcome
+            pending.entries.forEach { entry ->
+                val owner = entry.value.activity.get()
+                if (owner == null || owner === activity) {
+                    pending.remove(entry.key, entry.value)
+                }
+            }
+            return outcome
+        }
+    }
 }
 
 sealed class FloatingShortcutIconPickResult {

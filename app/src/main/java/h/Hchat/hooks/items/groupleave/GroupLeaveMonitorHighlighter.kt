@@ -10,7 +10,7 @@ import android.text.Spanned
 import android.text.style.ForegroundColorSpan
 import android.view.View
 import android.widget.TextView
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.dexkit.DexMethodCache
 import h.Hchat.hooks.api.core.WeChatApis
 import h.Hchat.hooks.core.DexInstallScheduler
@@ -88,16 +88,7 @@ object GroupLeaveMonitorHighlighter {
             return false
         }
         return runCatching {
-            HookRegistry.get().hook(method, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    // 第一行必须是最廉价的判断：功能关闭时这里直接返回，
-                    // 不碰字符串、不碰配置存储。
-                    if (!highlightEnabled()) return
-                    val original = param.args?.getOrNull(0) as? CharSequence ?: return
-                    val highlighted = highlight(context, original) ?: return
-                    param.args[0] = highlighted
-                }
-            })
+            HookRegistry.get().hook(method, LeaveTextHook(context))
             textCleanupInstalled = true
             true
         }.getOrElse {
@@ -263,25 +254,7 @@ object GroupLeaveMonitorHighlighter {
         var lastError: Throwable? = null
         for (method in methods) {
             runCatching {
-                HookRegistry.get().hook(method, object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        val uri = findHchatUri(param.args) ?: return
-                        val memberId = GroupLeaveMonitorLinks.memberIdFromUri(uri)
-                        if (memberId.isBlank()) return
-                        val viewContext = param.args?.firstOrNull { it is View }?.let { (it as View).context }
-                            ?: context.hostContext()
-                        openProfile(viewContext, memberId)
-                        param.setResult(
-                            if (method.returnType == java.lang.Boolean.TYPE ||
-                                method.returnType == Boolean::class.javaObjectType
-                            ) {
-                                true
-                            } else {
-                                null
-                            }
-                        )
-                    }
-                })
+                HookRegistry.get().hook(method, ProfileLinkHook(context, method))
                 count++
             }.onFailure {
                 lastError = it
@@ -392,4 +365,27 @@ object GroupLeaveMonitorHighlighter {
     private const val CACHE_PREFS = "Hchat_group_leave_monitor_method_cache"
     private const val CACHE_SCHEMA = "group_leave_monitor_uri_click_v1"
     private const val CACHE_URI_SPAN_CLICK = "uri_span_click_methods"
+
+    private class LeaveTextHook(private val context: Context) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            if (!highlightEnabled()) return chain.proceed()
+            val original = chain.args.getOrNull(0) as? CharSequence ?: return chain.proceed()
+            val highlighted = highlight(context, original) ?: return chain.proceed()
+            val args = chain.args.toTypedArray()
+            args[0] = highlighted
+            return chain.proceed(args)
+        }
+    }
+
+    private class ProfileLinkHook(private val context: FeatureContext, private val method: Method) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val args = chain.args.toTypedArray()
+            val uri = findHchatUri(args) ?: return chain.proceed()
+            val memberId = GroupLeaveMonitorLinks.memberIdFromUri(uri)
+            if (memberId.isBlank()) return chain.proceed()
+            val viewContext = args.firstOrNull { it is View }?.let { (it as View).context } ?: context.hostContext()
+            openProfile(viewContext, memberId)
+            return if (method.returnType == java.lang.Boolean.TYPE || method.returnType == Boolean::class.javaObjectType) true else null
+        }
+    }
 }

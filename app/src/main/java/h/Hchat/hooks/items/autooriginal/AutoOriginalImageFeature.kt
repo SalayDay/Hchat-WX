@@ -3,7 +3,7 @@ package h.Hchat.hooks.items.autooriginal
 import android.app.Activity
 import android.content.Intent
 import android.os.Bundle
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.hooks.core.BaseFeature
 import h.Hchat.hooks.core.FeatureContext
 import h.Hchat.hooks.core.HookRegistry
@@ -71,27 +71,32 @@ private class AutoOriginalImageRuntime(
             return false
         }
         return runCatching {
-            HookRegistry.get().hook(method, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    if (!prefs.getBoolean(
-                            AutoOriginalImageSettings.KEY_ENABLE,
-                            AutoOriginalImageSettings.DEFAULT_ENABLE
-                        )
-                    ) {
-                        return
-                    }
-                    val activity = param.thisObject as? Activity ?: return
-                    val intent = activity.intent
-                    if (!isChatImageSend(intent)) return
-                    intent.putExtra("key_send_raw_image", true)
-                    intent.putExtra("send_raw_img", true)
-                }
-            })
+            HookRegistry.get().hook(method, ImageSendCreateHooker(this))
             hookedMethods.add(method)
             true
         }.getOrElse {
             HLog.e("$TAG 安装图片发送页面 Hook 失败: ${method.toGenericString()}", it)
             false
+        }
+    }
+
+    private class ImageSendCreateHooker(
+        private val runtime: AutoOriginalImageRuntime
+    ) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            if (runtime.prefs.getBoolean(
+                    AutoOriginalImageSettings.KEY_ENABLE,
+                    AutoOriginalImageSettings.DEFAULT_ENABLE
+                )
+            ) {
+                val activity = chain.thisObject as? Activity
+                val intent = activity?.intent
+                if (intent != null && runtime.isChatImageSend(intent)) {
+                    intent.putExtra("key_send_raw_image", true)
+                    intent.putExtra("send_raw_img", true)
+                }
+            }
+            return chain.proceed()
         }
     }
 

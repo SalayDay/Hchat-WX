@@ -13,7 +13,7 @@ import java.util.Locale;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 
-import de.robv.android.xposed.XposedBridge;
+import h.Hchat.hooks.core.ModuleRuntime;
 import h.Hchat.preferences.HchatStorage;
 
 /**
@@ -148,6 +148,7 @@ public final class HLog {
         }
         CAPTURE_WORKER.execute(() -> {
             try {
+                mainProcess = isMainProcess(app);
                 SharedPreferences prefs = HchatStorage.preferences(app, PREFS_NAME);
                 boolean initial = prefs.getBoolean(KEY_CAPTURE_ENABLED, false);
                 synchronized (CAPTURE_LOCK) {
@@ -219,7 +220,9 @@ public final class HLog {
                     if (request == requestRevision) {
                         requestedEnabled = null;
                         requestedClear = false;
-                        captureEnabled = snapshot.enabled;
+                        // 用户在本进程明确拨过开关时以本地为准：store 里的 active 只用于
+                        // 跨进程共享，不能被别的进程/旧文件覆盖掉刚打开的采集。
+                        if (!captureSetExplicitly) captureEnabled = snapshot.enabled;
                         flushBootLocked();
                         if (snapshot.revision != storeRevision || !pending.isEmpty() || clear) {
                             CAPTURE.clear();
@@ -261,6 +264,7 @@ public final class HLog {
             syncStore();
         } catch (Throwable ignored) {
         }
+        maybeHeartbeat();
         long delay = isPollIdle() ? POLL_IDLE_MS : POLL_ACTIVE_MS;
         try {
             CAPTURE_WORKER.schedule(HLog::pollLoop, delay,
@@ -268,6 +272,46 @@ public final class HLog {
         } catch (Throwable ignored) {
             // 线程池已关闭（进程收尾）：停止轮询即可，显式写入仍走 execute(syncStore)。
         }
+    }
+
+    /** 心跳间隔：足够区分“采集还活着”和“已经停了”，又不至于刷屏。 */
+    private static final long HEARTBEAT_MS = 30_000L;
+    private static volatile long lastHeartbeatMs;
+    /** 只有主进程写心跳：多进程共用一份日志文件，子进程心跳只会把日志刷成噪声。 */
+    private static volatile boolean mainProcess = true;
+
+    private static boolean isMainProcess(Context context) {
+        try (java.io.BufferedReader reader = new java.io.BufferedReader(
+                new java.io.FileReader("/proc/self/cmdline"))) {
+            String line = reader.readLine();
+            if (line != null) {
+                int end = line.indexOf('\0');
+                if (end > 0) line = line.substring(0, end);
+                return line.equals(context.getPackageName());
+            }
+        } catch (Throwable ignored) {
+        }
+        return true;
+    }
+
+    /**
+     * 采集开启时每 30 秒写一条心跳。
+     *
+     * <p>日志页只能看到内存缓冲，一旦采集被意外关掉，用户看到的就是“启动后再也没有新日志”。
+     * 有心跳就能一眼区分：心跳在涨说明采集正常（只是被操作没产生日志），
+     * 心跳停了说明采集真的断了。
+     */
+    private static void maybeHeartbeat() {
+        if (!captureEnabled || !mainProcess) return;
+        long now = SystemClock.elapsedRealtime();
+        if (now - lastHeartbeatMs < HEARTBEAT_MS) return;
+        lastHeartbeatMs = now;
+        int size;
+        synchronized (CAPTURE_LOCK) {
+            size = CAPTURE.size();
+        }
+        log("[Hchat:Log] 采集心跳 PID=" + android.os.Process.myPid()
+                + " 缓冲=" + size + " 条", null);
     }
 
     /**
@@ -305,10 +349,7 @@ public final class HLog {
             }
         }
         if (capture) appendCapture(text);
-        try {
-            XposedBridge.log(TAG + " " + text);
-        } catch (Throwable ignored) {
-        }
+        bridgeLog(android.util.Log.INFO, TAG + " " + text, null);
     }
 
     /**
@@ -330,11 +371,15 @@ public final class HLog {
         // 采集一旦打开，把启动期暂存的关键日志补进来，否则用户永远看不到
         // "功能到底挂没挂上"这类只输出一次的记录。
         if (enabled) flushBootLocked();
-        // 自检记录直接写缓冲，不经过 XposedBridge：即使宿主日志桥异常，
+        // 自检记录直接写缓冲，不经过框架日志桥：即使宿主日志桥异常，
         // 用户也能立刻确认设置页与日志写入端使用的是同一份运行状态。
         if (explicit || (enabled && changed)) {
+            int size;
+            synchronized (CAPTURE_LOCK) {
+                size = CAPTURE.size();
+            }
             appendCapture("[Hchat:Log] " + (enabled
-                    ? "日志采集已开启，进程 PID=" + android.os.Process.myPid()
+                    ? "日志采集已开启，进程 PID=" + android.os.Process.myPid() + " 缓冲=" + size + " 条"
                     : "日志采集已关闭；以下仅保留本次关闭前的历史记录"), true);
         }
     }
@@ -419,7 +464,7 @@ public final class HLog {
         boolean duplicate = isDuplicate(text);
         // 堆栈模式也去重。线上抓包时用户开着堆栈开关，而"视频号详情解析失败"
         // 这类错误是每次进页面都报一次；原实现每条都要 new RuntimeException 抓堆栈
-        // （异常构造本身就要遍历一次栈）再走 XposedBridge 的同步跨进程序列化，
+        // （异常构造本身就要遍历一次栈）再走框架日志桥的同步跨进程序列化，
         // 高频路径上直接把帧率吃掉。现在同一位置 10 秒内只有第一条带完整堆栈。
         if (duplicate) return;
 
@@ -432,18 +477,30 @@ public final class HLog {
         }
 
         try {
-        if (stackTraceEnabled) {
-            XposedBridge.log(new RuntimeException(TAG + " " + text, throwable));
-        } else {
-            // 始终同步写 LSPosed 日志。原来采集开启时跳过 XposedBridge.log 省一次 IPC，
-            // 结果是"开了记录运行日志，LSPosed 日志里的模块输出反而全部消失"——
-            // 用户按老习惯去 LSPosed/Vector 导日志时抓到的就是空的。采集模式本来就是
-            // 排查用的短期开关，双写（内存缓冲 + LSPosed）才是正确语义；
-            // 去重已经在上面的 isDuplicate 里做完，不会造成刷屏。
-            XposedBridge.log(TAG + " " + text + suffix);
-        }
+            if (stackTraceEnabled) {
+                bridgeLog(android.util.Log.ERROR, TAG + " " + text, throwable);
+            } else {
+                // 始终同步写框架日志。原来采集开启时跳过日志桥省一次 IPC，
+                // 结果是"开了记录运行日志，LSPosed 日志里的模块输出反而全部消失"——
+                // 用户按老习惯去 LSPosed/Vector 导日志时抓到的就是空的。采集模式本来就是
+                // 排查用的短期开关，双写（内存缓冲 + 框架日志）才是正确语义；
+                // 去重已经在上面的 isDuplicate 里做完，不会造成刷屏。
+                bridgeLog(android.util.Log.ERROR, TAG + " " + text + suffix, null);
+            }
         } catch (Throwable bridgeFailure) {
             // 日志桥不可用时仍保留模块采集记录，不能让日志异常中断宿主功能。
+        }
+    }
+
+    /** 通过当前代次的 LibXposed 接口写日志；接口未就绪时静默跳过。 */
+    private static void bridgeLog(int priority, String message, Throwable error) {
+        try {
+            if (error == null) {
+                ModuleRuntime.api().log(priority, TAG, message);
+            } else {
+                ModuleRuntime.api().log(priority, TAG, message, error);
+            }
+        } catch (Throwable ignored) {
         }
     }
 

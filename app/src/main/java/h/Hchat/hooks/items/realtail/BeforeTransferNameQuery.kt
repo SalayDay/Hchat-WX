@@ -1,6 +1,6 @@
 package h.Hchat.hooks.items.realtail
 
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.hooks.api.core.WeChatApis
 import h.Hchat.hooks.core.FeatureContext
 import h.Hchat.hooks.core.HookRegistry
@@ -121,14 +121,7 @@ class BeforeTransferNameQuery(
 
     private fun setupCallbackHook() {
         val method = callbackMethod ?: return
-        HookRegistry.get().hook(method, object : XC_MethodHook() {
-            override fun afterHookedMethod(param: MethodHookParam) {
-                val scene = param.thisObject ?: return
-                val callback = pending.remove(scene) ?: return
-                val maskedName = extractMaskedName(scene)
-                callback.onResult(maskedName)
-            }
-        })
+        HookRegistry.get().hook(method, TransferResultHook(this))
     }
 
     private fun extractMaskedName(scene: Any): String {
@@ -149,5 +142,19 @@ class BeforeTransferNameQuery(
     private fun cacheKey(name: String): String {
         val version = WeChatApis.version()?.versionName() ?: "unknown"
         return "feature_${version}_$name"
+    }
+
+    private class TransferResultHook(private val owner: BeforeTransferNameQuery) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            return with(owner) {
+                val outcome = chain.proceed()
+
+                val scene = chain.thisObject ?: return outcome
+                val callback = pending.remove(scene) ?: return outcome
+                val maskedName = extractMaskedName(scene)
+                callback.onResult(maskedName)
+                return outcome
+            }
+        }
     }
 }

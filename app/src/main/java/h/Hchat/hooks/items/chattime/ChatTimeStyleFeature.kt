@@ -4,7 +4,7 @@ import android.content.SharedPreferences
 import android.view.View
 import android.widget.AbsListView
 import android.widget.TextView
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.dexkit.DexMethodCache
 import h.Hchat.event.Events
 import h.Hchat.hooks.core.BaseFeature
@@ -21,7 +21,6 @@ import java.lang.reflect.Field
 import java.lang.reflect.Method
 import java.lang.ref.WeakReference
 import java.text.SimpleDateFormat
-import java.util.ArrayDeque
 import java.util.Collections
 import java.util.Date
 import java.util.Locale
@@ -64,8 +63,6 @@ class ChatTimeStyleFeature : BaseFeature() {
 private class ChatTimeStyleRuntime(
     private val context: FeatureContext
 ) {
-    private data class BindState(val timeHolder: Any?)
-
     private data class BoundTime(
         val msgId: Long,
         val msgSvrId: Long,
@@ -83,7 +80,6 @@ private class ChatTimeStyleRuntime(
     private val timeFieldCache = ConcurrentHashMap<Class<*>, Field>()
     private val unsupportedTimeHolders = ConcurrentHashMap.newKeySet<Class<*>>()
     private val bindings = Collections.synchronizedMap(WeakHashMap<TextView, BoundTime>())
-    private val bindStates = ThreadLocal<ArrayDeque<BindState>>()
 
     /**
      * 开关 / 模式 / 时间格式的缓存。
@@ -148,31 +144,30 @@ private class ChatTimeStyleRuntime(
             return false
         }
         return runCatching {
-            HookRegistry.get().hook(method, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    val active = isEnabled() && currentMode() != ChatTimeStyleSettings.MODE_ORIGINAL
-                    if (!active && bindings.isEmpty()) return
-                    val state = BindState(captureTimeHolder(param.args))
-                    restoreBoundTime(param.args, state.timeHolder)
-                    if (active) {
-                        val stack = bindStates.get() ?: ArrayDeque<BindState>().also(bindStates::set)
-                        stack.addLast(state)
-                    }
-                }
-
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    val stack = bindStates.get()
-                    val state = stack?.pollLast() ?: return
-                    if (stack.isEmpty()) bindStates.remove()
-                    if (!isEnabled() || currentMode() == ChatTimeStyleSettings.MODE_ORIGINAL) return
-                    bindTime(param.thisObject, param.args, state.timeHolder)
-                }
-            })
+            HookRegistry.get().hook(method, TimeBindHooker(this))
             installed = true
             true
         }.getOrElse {
             HLog.e("$TAG 安装聊天时间样式 Hook 失败: ${it.message}", it)
             false
+        }
+    }
+
+    private class TimeBindHooker(private val runtime: ChatTimeStyleRuntime) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val active = runtime.isEnabled() &&
+                runtime.currentMode() != ChatTimeStyleSettings.MODE_ORIGINAL
+            if (!active && runtime.bindings.isEmpty()) return chain.proceed()
+            val args = chain.args.toTypedArray()
+            val timeHolder = runtime.captureTimeHolder(args)
+            runtime.restoreBoundTime(args, timeHolder)
+            val result = chain.proceed()
+            if (active && runtime.isEnabled() &&
+                runtime.currentMode() != ChatTimeStyleSettings.MODE_ORIGINAL
+            ) {
+                runtime.bindTime(chain.thisObject, args, timeHolder)
+            }
+            return result
         }
     }
 

@@ -1,7 +1,7 @@
 package h.Hchat.hooks.items.moments
 
 import android.content.Intent
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.dexkit.DexMethodCache
 import h.Hchat.event.Events
 import h.Hchat.hooks.core.BaseFeature
@@ -69,17 +69,7 @@ private class OriginalMomentsUploadHooker(
         if (!imagePreviewInstalled) {
             locateImagePreviewSendMethod(allowDexSearch)?.let { method ->
                 try {
-                    HookRegistry.get().hook(method, object : XC_MethodHook() {
-                        override fun beforeHookedMethod(param: MethodHookParam) {
-                            if (!isEnabled()) return
-                            patchGalleryTimelineArgs(param.args)
-                        }
-
-                        override fun afterHookedMethod(param: MethodHookParam) {
-                            if (!isEnabled()) return
-                            patchGalleryResultIntent(param.args)
-                        }
-                    })
+                    HookRegistry.get().hook(method, GalleryOriginalHooker(this))
                     imagePreviewInstalled = true
                 } catch (e: Throwable) {
                     HLog.e("$TAG 安装图库返回 Hook 失败: ${e.message}", e)
@@ -89,12 +79,7 @@ private class OriginalMomentsUploadHooker(
         if (!createPicInstalled) {
             locateSnsCreatePicMethod(allowDexSearch)?.let { method ->
                 try {
-                    HookRegistry.get().hook(method, object : XC_MethodHook() {
-                        override fun beforeHookedMethod(param: MethodHookParam) {
-                            if (!isEnabled()) return
-                            bypassImageReencode(param)
-                        }
-                    })
+                    HookRegistry.get().hook(method, CreateOriginalImageHooker(this))
                     createPicInstalled = true
                 } catch (e: Throwable) {
                     HLog.e("$TAG 安装朋友圈图片压缩 Hook 失败: ${e.message}", e)
@@ -120,20 +105,14 @@ private class OriginalMomentsUploadHooker(
         intent.putExtra("key_delete_origin_file", false)
     }
 
-    private fun bypassImageReencode(param: XC_MethodHook.MethodHookParam) {
-        val args = param.args ?: return
-        if (args.size < 3) return
-        val dir = args[0] as? String ?: return
-        val sourcePath = args[1] as? String ?: return
-        val targetName = args[2] as? String ?: return
-        if (dir.isBlank() || sourcePath.isBlank() || targetName.isBlank()) return
-        if (convertWithoutZip(sourcePath, dir + targetName)) {
-            param.setResult(true)
-            return
-        }
-        if (copyWithWechatVfs(dir, sourcePath, targetName)) {
-            param.setResult(true)
-        }
+    private fun bypassImageReencode(args: Array<Any?>): Boolean {
+        if (args.size < 3) return false
+        val dir = args[0] as? String ?: return false
+        val sourcePath = args[1] as? String ?: return false
+        val targetName = args[2] as? String ?: return false
+        if (dir.isBlank() || sourcePath.isBlank() || targetName.isBlank()) return false
+        if (convertWithoutZip(sourcePath, dir + targetName)) return true
+        return copyWithWechatVfs(dir, sourcePath, targetName)
     }
 
     private fun convertWithoutZip(sourcePath: String, targetPath: String): Boolean {
@@ -310,4 +289,31 @@ private class OriginalMomentsUploadHooker(
         private const val CACHE_CREATE_PIC = "sns_create_pic"
         private const val CACHE_CONVERT_IMG = "sns_convert_img_without_zip"
     }
+
+    private class GalleryOriginalHooker(private val owner: OriginalMomentsUploadHooker) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val args = chain.args.toTypedArray()
+            val receiver = chain.thisObject
+            with(owner) {
+            run patch@{
+                if (!isEnabled()) return@patch
+                patchGalleryTimelineArgs(args)
+            }
+            var result = chain.proceed(args)
+            run update@{
+                if (!isEnabled()) return@update
+                patchGalleryResultIntent(args)
+            }
+            return result
+            }
+        }
+    }
+
+    private class CreateOriginalImageHooker(private val owner: OriginalMomentsUploadHooker) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            if (owner.isEnabled() && owner.bypassImageReencode(chain.args.toTypedArray())) return true
+            return chain.proceed()
+        }
+    }
+
 }

@@ -22,13 +22,11 @@ import java.lang.reflect.Proxy;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.Locale;
-import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-import de.robv.android.xposed.XC_MethodHook;
-import de.robv.android.xposed.XposedBridge;
+import io.github.libxposed.api.XposedInterface;
 
 /**
  * 微信图片发送 API。
@@ -333,32 +331,8 @@ public final class WeChatImageApi {
             return;
         }
         try {
-            XC_MethodHook captureConstructedManager = new XC_MethodHook() {
-                @Override
-                public void afterHookedMethod(MethodHookParam param) {
-                    rememberMarsCdnManager(managerClass, param != null ? param.thisObject : null);
-                }
-            };
-            Set<XC_MethodHook.Unhook> unhooks = XposedBridge.hookAllConstructors(
-                    managerClass,
-                    captureConstructedManager);
-            for (XC_MethodHook.Unhook unhook : unhooks) {
-                HookRegistry.get().add(unhook);
-            }
-            Set<XC_MethodHook.Unhook> startUnhooks = XposedBridge.hookAllMethods(
-                    managerClass,
-                    "startC2CDownload",
-                    new XC_MethodHook() {
-                        @Override
-                        public void beforeHookedMethod(MethodHookParam param) {
-                            rememberMarsCdnManager(
-                                    managerClass,
-                                    param != null ? param.thisObject : null);
-                        }
-                    });
-            for (XC_MethodHook.Unhook unhook : startUnhooks) {
-                HookRegistry.get().add(unhook);
-            }
+            HookRegistry.get().hookAllConstructors(managerClass, new CdnManagerConstructedHooker(managerClass));
+            HookRegistry.get().hookAllMethods(managerClass, "startC2CDownload", new CdnDownloadHooker(managerClass));
             resolveMarsCdnManager(managerClass);
         } catch (Throwable e) {
             marsHookedManagerClasses.remove(managerClass);
@@ -931,4 +905,26 @@ public final class WeChatImageApi {
     private static void logStatic(Logger logger, String message) {
         if (logger != null) logger.log("[WeChatImageApi] " + message);
     }
+
+    private static final class CdnManagerConstructedHooker implements XposedInterface.Hooker {
+        private final Class<?> managerClass;
+        private CdnManagerConstructedHooker(Class<?> managerClass) { this.managerClass = managerClass; }
+        @Override
+        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+            Object result = chain.proceed();
+            rememberMarsCdnManager(managerClass, chain.getThisObject());
+            return result;
+        }
+    }
+
+    private static final class CdnDownloadHooker implements XposedInterface.Hooker {
+        private final Class<?> managerClass;
+        private CdnDownloadHooker(Class<?> managerClass) { this.managerClass = managerClass; }
+        @Override
+        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+            rememberMarsCdnManager(managerClass, chain.getThisObject());
+            return chain.proceed();
+        }
+    }
+
 }

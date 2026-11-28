@@ -4,8 +4,7 @@ import android.content.Context
 import android.content.SharedPreferences
 import android.view.View
 import android.widget.Button
-import de.robv.android.xposed.XC_MethodHook
-import de.robv.android.xposed.XposedBridge
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.hooks.core.BaseFeature
 import h.Hchat.hooks.core.FeatureContext
 import h.Hchat.hooks.core.HookRegistry
@@ -109,13 +108,7 @@ class WeChatTabletFeature : BaseFeature() {
             val key = hookKey(method, fallbackClassLoader)
             synchronized(WeChatTabletFeature::class.java) {
                 if (padHookedLoaders.contains(key)) return
-                HookRegistry.get().hook(method, object : XC_MethodHook() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        param.result = Throwable().stackTrace.none {
-                            it.className.contains(CHAT_VOICE_STACK)
-                        }
-                    }
-                })
+                HookRegistry.get().hook(method, PadCheckHooker())
                 padHookedLoaders.add(key)
             }
         }
@@ -124,12 +117,7 @@ class WeChatTabletFeature : BaseFeature() {
             val key = hookKey(method, fallbackClassLoader)
             synchronized(WeChatTabletFeature::class.java) {
                 if (loginButtonHookedLoaders.contains(key)) return
-                HookRegistry.get().hook(method, object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        val button = param.args?.firstOrNull() as? Button ?: return
-                        if (button.visibility != View.VISIBLE) button.visibility = View.VISIBLE
-                    }
-                })
+                HookRegistry.get().hook(method, LoginButtonHooker())
                 loginButtonHookedLoaders.add(key)
             }
         }
@@ -277,4 +265,35 @@ class WeChatTabletFeature : BaseFeature() {
             return "L${name.replace('.', '/')};"
         }
     }
+
+    private class PadCheckHooker() : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val args = chain.args.toTypedArray()
+            val receiver = chain.thisObject
+            var result = chain.proceed()
+            run {
+            run update@{
+                result = Throwable().stackTrace.none {
+                    it.className.contains(CHAT_VOICE_STACK)
+                }
+            }
+            return result
+            }
+        }
+    }
+
+    private class LoginButtonHooker() : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val args = chain.args.toTypedArray()
+            val receiver = chain.thisObject
+            run {
+            run patch@{
+                val button = args?.firstOrNull() as? Button ?: return@patch
+                if (button.visibility != View.VISIBLE) button.visibility = View.VISIBLE
+            }
+            return chain.proceed(args)
+            }
+        }
+    }
+
 }

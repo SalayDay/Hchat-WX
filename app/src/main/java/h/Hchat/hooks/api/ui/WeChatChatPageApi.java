@@ -12,7 +12,7 @@ import h.Hchat.utils.KavaReflector;
 import java.lang.reflect.Method;
 import java.util.concurrent.CopyOnWriteArrayList;
 
-import de.robv.android.xposed.XC_MethodHook;
+import io.github.libxposed.api.XposedInterface;
 
 /**
  * 当前聊天页 API。
@@ -230,15 +230,7 @@ public final class WeChatChatPageApi {
         if (method == null) return 0;
         try {
             KavaReflector.accessible(method);
-            HookRegistry.get().hook(method, new XC_MethodHook() {
-                @Override
-                public void beforeHookedMethod(MethodHookParam param) {
-                    String talker = firstStringArg(param.args);
-                    if (TextUtils.isEmpty(talker)) return;
-                    pendingTalker = talker;
-                    dispatchEnter(talker, sourceOf(method));
-                }
-            });
+            HookRegistry.get().hook(method, new StartChattingHooker(this, method));
             log("聊天页启动方法Hook: " + sourceOf(method));
             return 1;
         } catch (Throwable e) {
@@ -251,16 +243,7 @@ public final class WeChatChatPageApi {
         if (method == null) return 0;
         try {
             KavaReflector.accessible(method);
-            HookRegistry.get().hook(method, new XC_MethodHook() {
-                @Override
-                public void afterHookedMethod(MethodHookParam param) {
-                    String talker = callStringMethod(param.thisObject, "getStringExtra", CHAT_USER);
-                    if (TextUtils.isEmpty(talker)) talker = pendingTalker;
-                    if (!TextUtils.isEmpty(talker)) {
-                        dispatchEnter(talker, sourceOf(method));
-                    }
-                }
-            });
+            HookRegistry.get().hook(method, new FragmentEnterHooker(this, method));
             log("聊天页Fragment进入方法Hook: " + sourceOf(method));
             return 1;
         } catch (Throwable e) {
@@ -273,17 +256,7 @@ public final class WeChatChatPageApi {
         if (method == null) return 0;
         try {
             KavaReflector.accessible(method);
-            HookRegistry.get().hook(method, new XC_MethodHook() {
-                @Override
-                public void afterHookedMethod(MethodHookParam param) {
-                    String old = currentTalker;
-                    currentTalker = "";
-                    pendingTalker = "";
-                    if (!TextUtils.isEmpty(old)) {
-                        dispatch(ChatPageEvent.EXIT, old, sourceOf(method));
-                    }
-                }
-            });
+            HookRegistry.get().hook(method, new FragmentExitHooker(this, method));
             log("聊天页Fragment退出方法Hook: " + sourceOf(method));
             return 1;
         } catch (Throwable e) {
@@ -381,4 +354,54 @@ public final class WeChatChatPageApi {
     private void log(String message) {
         if (logger != null) logger.log("[WeChatChatPageApi] " + message);
     }
+
+    private static final class StartChattingHooker implements XposedInterface.Hooker {
+        private final WeChatChatPageApi owner;
+        private final Method method;
+        private StartChattingHooker(WeChatChatPageApi owner, Method method) {
+            this.owner = owner; this.method = method;
+        }
+        @Override
+        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+            String talker = owner.firstStringArg(chain.getArgs().toArray());
+            if (!TextUtils.isEmpty(talker)) {
+                owner.pendingTalker = talker;
+                owner.dispatchEnter(talker, owner.sourceOf(method));
+            }
+            return chain.proceed();
+        }
+    }
+
+    private static final class FragmentEnterHooker implements XposedInterface.Hooker {
+        private final WeChatChatPageApi owner;
+        private final Method method;
+        private FragmentEnterHooker(WeChatChatPageApi owner, Method method) {
+            this.owner = owner; this.method = method;
+        }
+        @Override
+        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+            Object result = chain.proceed();
+            String talker = owner.callStringMethod(chain.getThisObject(), "getStringExtra", CHAT_USER);
+            if (TextUtils.isEmpty(talker)) talker = owner.pendingTalker;
+            if (!TextUtils.isEmpty(talker)) owner.dispatchEnter(talker, owner.sourceOf(method));
+            return result;
+        }
+    }
+
+    private static final class FragmentExitHooker implements XposedInterface.Hooker {
+        private final WeChatChatPageApi owner;
+        private final Method method;
+        private FragmentExitHooker(WeChatChatPageApi owner, Method method) {
+            this.owner = owner; this.method = method;
+        }
+        @Override
+        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+            Object result = chain.proceed();
+            String old = owner.currentTalker;
+            owner.currentTalker = ""; owner.pendingTalker = "";
+            if (!TextUtils.isEmpty(old)) owner.dispatch(ChatPageEvent.EXIT, old, owner.sourceOf(method));
+            return result;
+        }
+    }
+
 }

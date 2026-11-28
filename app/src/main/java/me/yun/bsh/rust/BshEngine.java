@@ -41,6 +41,17 @@ public final class BshEngine implements Closeable {
     public Object getVariable(String name) { return access(() -> Native.getVariable(handle, name)); }
     public String scriptMethods() { return access(() -> Native.scriptMethods(handle)); }
     public Object invokeMethod(String name, Object... args) { return access(() -> Native.invokeMethod(handle, name, args)); }
+
+    /**
+     * 同步、不排队的脚本函数调用，只给宿主 Hook 回调使用。
+     *
+     * <p>Hook 回调必须留在拿到 interceptor chain 的那个线程上，排队到别的线程会破坏
+     * chain 的同线程约束。这里拿不到解释器执行权时立即返回 {@code null} 并把
+     * {@code busy[0]} 置为 {@code true}，调用方据此直接放行宿主方法，既不阻塞也不排队。</p>
+     */
+    public Object tryInvokeHook(String name, Object[] args, boolean[] busy) {
+        return access(() -> Native.tryInvokeHook(handle, name, args, busy));
+    }
     public void setVariable(String name, Object value) { access(() -> { Native.setVariable(handle, name, value); return null; }); }
     public void unsetVariable(String name) { access(() -> { Native.unsetVariable(handle, name); return null; }); }
     public void addClassLoader(ClassLoader loader) { access(() -> { Bridge.addScriptLoader(handle, loader); return null; }); }

@@ -29,7 +29,7 @@ class AutoMessageForwardFeature : BaseFeature() {
                 HLog.e("$TAG $message", error)
             }
             runtime = installed
-            trackSubscription(observe.subscribe(installed::handleMessage))
+            trackSubscription(observe.subscribe(ID, installed::handleMessage))
             subscribe(Events.MessageRecalled::class.java) { event -> installed.handleRecall(event) }
         }
     }

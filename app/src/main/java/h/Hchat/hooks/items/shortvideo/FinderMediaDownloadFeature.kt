@@ -14,7 +14,7 @@ import android.view.ContextMenu
 import android.view.MenuItem
 import android.widget.Toast
 import h.Hchat.R
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.dexkit.DexMethodCache
 import h.Hchat.event.Events
 import h.Hchat.hooks.core.BaseFeature
@@ -92,11 +92,7 @@ private class FinderMediaDownloadHooker(
     private fun hookCreateMenu(method: Method): Boolean {
         if (!hookedMethods.add(method)) return true
         return runCatching {
-            HookRegistry.get().hook(method, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    findMenuObject(param.args)?.let { addMenuItems(it) }
-                }
-            })
+            HookRegistry.get().hook(method, FinderMenuCreateHooker(this))
             true
         }.getOrElse {
             hookedMethods.remove(method)
@@ -108,11 +104,7 @@ private class FinderMediaDownloadHooker(
     private fun hookClick(method: Method): Boolean {
         if (!hookedMethods.add(method)) return true
         return runCatching {
-            HookRegistry.get().hook(method, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    handleMenuClick(param)
-                }
-            })
+            HookRegistry.get().hook(method, FinderMenuClickHooker(this))
             true
         }.getOrElse {
             hookedMethods.remove(method)
@@ -258,20 +250,15 @@ private class FinderMediaDownloadHooker(
         return methods
     }
 
-    private fun handleMenuClick(param: XC_MethodHook.MethodHookParam) {
-        val item = param.args?.firstOrNull { it is MenuItem } as? MenuItem ?: return
-        if (item.itemId != MENU_COPY_LINK && item.itemId != MENU_DOWNLOAD) return
-        val media = findFinderMedia(param) ?: run {
+    private fun handleMenuClick(receiver: Any?, args: Array<Any?>): Boolean {
+        val item = args.firstOrNull { it is MenuItem } as? MenuItem ?: return false
+        if (item.itemId != MENU_COPY_LINK && item.itemId != MENU_DOWNLOAD) return false
+        val media = findFinderMedia(receiver, args) ?: run {
             toast("未找到视频号媒体")
-            param.setResult(null)
-            return
+            return true
         }
-        if (item.itemId == MENU_COPY_LINK) {
-            copyMediaLinks(media)
-        } else {
-            downloadMedia(media)
-        }
-        param.setResult(null)
+        if (item.itemId == MENU_COPY_LINK) copyMediaLinks(media) else downloadMedia(media)
+        return true
     }
 
     private fun copyMediaLinks(media: FinderMediaDownloadSupport.FinderMedia) {
@@ -318,16 +305,16 @@ private class FinderMediaDownloadHooker(
     }
 
     private fun findFinderMedia(
-        param: XC_MethodHook.MethodHookParam
+        receiver: Any?, args: Array<Any?>
     ): FinderMediaDownloadSupport.FinderMedia? {
-        param.args?.forEach { arg ->
+        args.forEach { arg ->
             if (arg !is MenuItem) {
                 FinderMediaDownloadSupport.extractMedia(arg)
                     ?.takeIf { it.items.isNotEmpty() }
                     ?.let { return it }
             }
         }
-        return findFinderMediaFromOwner(param.thisObject)
+        return findFinderMediaFromOwner(receiver)
     }
 
     private fun findFinderMediaFromOwner(owner: Any?): FinderMediaDownloadSupport.FinderMedia? {
@@ -525,4 +512,25 @@ private class FinderMediaDownloadHooker(
         private const val MENU_CREATE_CACHE = "finder_menu_create_v2"
         private const val MENU_CLICK_CACHE = "finder_menu_click_v2"
     }
+
+    private class FinderMenuCreateHooker(private val owner: FinderMediaDownloadHooker) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val args = chain.args.toTypedArray()
+            val receiver = chain.thisObject
+            with(owner) {
+            run patch@{
+                findMenuObject(args)?.let { addMenuItems(it) }
+            }
+            return chain.proceed(args)
+            }
+        }
+    }
+
+    private class FinderMenuClickHooker(private val owner: FinderMediaDownloadHooker) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            if (owner.handleMenuClick(chain.thisObject, chain.args.toTypedArray())) return null
+            return chain.proceed()
+        }
+    }
+
 }

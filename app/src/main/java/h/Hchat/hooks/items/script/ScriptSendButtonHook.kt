@@ -12,7 +12,8 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
 import android.widget.TextView
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface.Chain
+import io.github.libxposed.api.XposedInterface.Hooker
 import h.Hchat.hooks.api.core.WeChatApis
 import h.Hchat.hooks.api.message.OutgoingTextDecoratorRegistry
 import h.Hchat.hooks.core.FeatureContext
@@ -30,8 +31,6 @@ import java.util.concurrent.CopyOnWriteArrayList
 object ScriptSendButtonHook {
     private const val TAG = "[Hchat:Script]"
     private const val CHAT_FOOTER = "com.tencent.mm.pluginsdk.ui.chat.ChatFooter"
-    private const val TEXT_DECORATION_EXTRA = "hchat_send_text_decoration"
-    private const val INPUT_SESSION_EXTRA = "hchat_send_input_session"
     @Volatile
     private var installed = false
     @Volatile
@@ -102,75 +101,7 @@ object ScriptSendButtonHook {
                 return false
             }
             if (!clickHookInstalled) {
-                HookRegistry.get().hook(method, object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        val footer = findChatFooter(param.thisObject) ?: return
-                        lastChatFooter = WeakReference(footer)
-                        rememberActivityFromFooter(footer)
-                        val input = findInputView(footer)
-                        trackInputView(input)
-                        val inputView = input as? View
-                        val talker = WeChatApis.chatPage()?.currentTalker().orEmpty()
-                        val inputStart = inputView?.let { currentInputStart(it, talker) }
-                        val inputDuration = inputStart
-                            ?.let { (SystemClock.elapsedRealtime() - it.startedAt).coerceAtLeast(0L) }
-                            ?: 0L
-                        param.setObjectExtra(
-                            INPUT_SESSION_EXTRA,
-                            InputSendSession(footer, inputView)
-                        )
-                        val text = readInputText(footer)
-                        val handled = OutgoingTextDecoratorRegistry.withInputDuration(inputDuration) {
-                            val handledByModule = dispatchHandlers(text)
-                            val handledByScript = if (handledByModule) {
-                                false
-                            } else {
-                                ScriptPluginRuntime.dispatchOnClickSendBtn(text).intercepted
-                            }
-                            handledByModule || handledByScript
-                        }
-                        if (!handled) {
-                            val currentText = readInputText(footer)
-                            runCatching {
-                                applyTextDecorators(
-                                    footer,
-                                    talker,
-                                    currentText,
-                                    inputDuration
-                                )
-                            }
-                                .onFailure {
-                                    h.Hchat.utils.HLog.e("$TAG 发送文字装饰失败: ${it.message}", it)
-                                }
-                                .getOrNull()
-                                ?.let { param.setObjectExtra(TEXT_DECORATION_EXTRA, it) }
-                            return
-                        }
-                        clearInputText(footer)
-                        inputView?.let { view ->
-                            rememberPendingInputStart(view, inputStart, talker, text)
-                            clearInputStart(view)
-                        }
-                        param.setResult(null)
-                    }
-
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        val decoration = param.getObjectExtra(TEXT_DECORATION_EXTRA)
-                            as? AppliedTextDecoration
-                        if (decoration != null) {
-                            runCatching { restoreRejectedDecoration(decoration) }
-                                .onFailure {
-                                    h.Hchat.utils.HLog.e("$TAG 恢复未发送文字失败: ${it.message}", it)
-                                }
-                        }
-                        val session = param.getObjectExtra(INPUT_SESSION_EXTRA) as? InputSendSession
-                            ?: return
-                        val inputView = session.inputView ?: return
-                        if (readInputText(session.footer).isEmpty()) {
-                            clearInputStart(inputView)
-                        }
-                    }
-                })
+                HookRegistry.get().hook(method, SendClickHooker())
                 clickHookInstalled = true
             }
             inputTrackingHookInstalled = installInputTrackingHook(context.hostClassLoader())
@@ -198,24 +129,7 @@ object ScriptSendButtonHook {
             return false
         }
         return runCatching {
-            HookRegistry.get().hook(attachMethod, object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    // 同样是 attach 期回调：先查缓存，未命中推到下一帧再扫，
-                    // 避免在 View 树挂载过程中做主线程反射全扫（会顶住输入分发）。
-                    val footer = param.thisObject ?: return
-                    val cached = findInputViewCached(footer)
-                    if (cached != null) {
-                        trackInputView(cached)
-                        return
-                    }
-                    val view = footer as? View
-                    if (view != null) {
-                        view.post { trackInputView(findInputView(footer)) }
-                    } else {
-                        trackInputView(findInputView(footer))
-                    }
-                }
-            })
+            HookRegistry.get().hook(attachMethod, InputAttachHooker())
             true
         }.getOrElse {
             h.Hchat.utils.HLog.e(
@@ -238,29 +152,7 @@ object ScriptSendButtonHook {
             return false
         }
         return runCatching {
-            HookRegistry.get().hook(method, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    // 极廉价 gate：本 hook 挂在全局 View.dispatchTouchEvent 上，
-                    // 全进程每个 View 的每次触摸都会进来。没有脚本注册长按回调时
-                    // （绝大多数用户）直接退出，避免白白做两次同步表查询。
-                    if (!h.Hchat.hooks.items.script.ScriptPluginRuntime.hasLongSendButtonCallbacks()) return
-                    if (dispatchingSyntheticCancel.get() == true) return
-                    runCatching {
-                        handleLongPressTouch(param, sendClickListenerClass)
-                    }.onFailure {
-                        h.Hchat.utils.HLog.e("$TAG 长按发送按钮触摸处理异常: ${it.message}", it)
-                    }
-                }
-
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    if (!h.Hchat.hooks.items.script.ScriptPluginRuntime.hasLongSendButtonCallbacks()) return
-                    val view = param.thisObject as? View ?: return
-                    val event = param.args?.getOrNull(0) as? MotionEvent ?: return
-                    if (event.actionMasked == MotionEvent.ACTION_DOWN && param.result != true) {
-                        cancelLongPressState(view)
-                    }
-                }
-            })
+            HookRegistry.get().hook(method, LongPressTouchHooker(sendClickListenerClass))
             true
         }.getOrElse {
             h.Hchat.utils.HLog.e(
@@ -271,75 +163,128 @@ object ScriptSendButtonHook {
         }
     }
 
+    private class SendClickHooker : Hooker {
+        override fun intercept(chain: Chain): Any? {
+            val footer = findChatFooter(chain.thisObject) ?: return chain.proceed()
+            lastChatFooter = WeakReference(footer)
+            rememberActivityFromFooter(footer)
+            val input = findInputView(footer)
+            trackInputView(input)
+            val inputView = input as? View
+            val talker = WeChatApis.chatPage()?.currentTalker().orEmpty()
+            val inputStart = inputView?.let { currentInputStart(it, talker) }
+            val inputDuration = inputStart
+                ?.let { (SystemClock.elapsedRealtime() - it.startedAt).coerceAtLeast(0L) } ?: 0L
+            var decoration: AppliedTextDecoration? = null
+            try {
+                val text = readInputText(footer)
+                val handled = OutgoingTextDecoratorRegistry.withInputDuration(inputDuration) {
+                    dispatchHandlers(text) || ScriptPluginRuntime.dispatchOnClickSendBtn(text).intercepted
+                }
+                if (!handled) {
+                    decoration = runCatching {
+                        applyTextDecorators(footer, talker, readInputText(footer), inputDuration)
+                    }.onFailure {
+                        h.Hchat.utils.HLog.e("$TAG 发送文字装饰失败: ${it.message}", it)
+                    }.getOrNull()
+                    return chain.proceed()
+                }
+                clearInputText(footer)
+                inputView?.let { view ->
+                    rememberPendingInputStart(view, inputStart, talker, text)
+                    clearInputStart(view)
+                }
+                return null
+            } finally {
+                decoration?.let { applied ->
+                    runCatching { restoreRejectedDecoration(applied) }.onFailure {
+                        h.Hchat.utils.HLog.e("$TAG 恢复未发送文字失败: ${it.message}", it)
+                    }
+                }
+                if (inputView != null && readInputText(footer).isEmpty()) clearInputStart(inputView)
+            }
+        }
+    }
+
+    private class InputAttachHooker : Hooker {
+        override fun intercept(chain: Chain): Any? {
+            val result = chain.proceed()
+            val footer = chain.thisObject ?: return result
+            // 挂载时只读缓存；未命中放到下一帧，避免阻塞输入分发。
+            val cached = findInputViewCached(footer)
+            if (cached != null) trackInputView(cached)
+            else if (footer is View) footer.post { trackInputView(findInputView(footer)) }
+            else trackInputView(findInputView(footer))
+            return result
+        }
+    }
+
+    private class LongPressTouchHooker(private val sendClickListenerClass: Class<*>) : Hooker {
+        override fun intercept(chain: Chain): Any? {
+            if (!ScriptPluginRuntime.hasLongSendButtonCallbacks() || dispatchingSyntheticCancel.get() == true) {
+                return chain.proceed()
+            }
+            val view = chain.thisObject as? View ?: return chain.proceed()
+            val event = chain.getArg(0) as? MotionEvent ?: return chain.proceed()
+            val consumed = runCatching {
+                handleLongPressTouch(view, event, sendClickListenerClass)
+            }.onFailure {
+                h.Hchat.utils.HLog.e("$TAG 长按发送按钮触摸处理异常: ${it.message}", it)
+            }.getOrDefault(false)
+            var result: Any? = null
+            try {
+                result = if (consumed) true else chain.proceed()
+                return result
+            } finally {
+                if (event.actionMasked == MotionEvent.ACTION_DOWN && result != true) cancelLongPressState(view)
+            }
+        }
+    }
+
     private fun handleLongPressTouch(
-        param: XC_MethodHook.MethodHookParam,
+        view: View,
+        event: MotionEvent,
         sendClickListenerClass: Class<*>
-    ) {
-        val view = param.thisObject as? View ?: return
-        val event = param.args?.getOrNull(0) as? MotionEvent ?: return
+    ): Boolean {
         val action = event.actionMasked
         if (isTrackedInputView(view)) {
             if (action == MotionEvent.ACTION_DOWN) beginInputSession(view)
-            return
+            return false
         }
         val current = longPressState(view)
         if (current?.consumed == true && action != MotionEvent.ACTION_DOWN) {
             if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL ||
                 action == MotionEvent.ACTION_OUTSIDE
-            ) {
-                cancelLongPressState(view, current)
-            }
+            ) cancelLongPressState(view, current)
             view.isPressed = false
-            param.result = true
-            return
+            return true
         }
-
         when (action) {
-            MotionEvent.ACTION_DOWN -> beginLongPress(
-                view,
-                event,
-                sendClickListenerClass
-            )
-
+            MotionEvent.ACTION_DOWN -> beginLongPress(view, event, sendClickListenerClass)
             MotionEvent.ACTION_MOVE -> {
-                val state = current ?: return
+                val state = current ?: return false
                 val pointerIndex = event.findPointerIndex(state.pointerId)
                 if (pointerIndex < 0 ||
                     kotlin.math.abs(event.getX(pointerIndex) - state.downX) > state.touchSlop ||
                     kotlin.math.abs(event.getY(pointerIndex) - state.downY) > state.touchSlop
-                ) {
-                    cancelLongPressState(view, state)
-                }
+                ) cancelLongPressState(view, state)
             }
-
-            MotionEvent.ACTION_POINTER_DOWN -> current?.let {
-                cancelLongPressState(view, it)
-            }
-
+            MotionEvent.ACTION_POINTER_DOWN -> current?.let { cancelLongPressState(view, it) }
             MotionEvent.ACTION_POINTER_UP -> current?.let { state ->
-                if (event.getPointerId(event.actionIndex) == state.pointerId) {
-                    cancelLongPressState(view, state)
-                }
+                if (event.getPointerId(event.actionIndex) == state.pointerId) cancelLongPressState(view, state)
             }
-
             MotionEvent.ACTION_UP -> current?.let { state ->
-                if (event.eventTime - state.downTime >= state.timeoutMs) {
-                    triggerLongPress(state, sendClickListenerClass)
-                }
+                if (event.eventTime - state.downTime >= state.timeoutMs) triggerLongPress(state, sendClickListenerClass)
                 if (state.consumed && longPressState(view) === state) {
                     cancelLongPressState(view, state)
                     view.isPressed = false
-                    param.result = true
-                } else {
-                    cancelLongPressState(view, state)
+                    return true
                 }
-            }
-
-            MotionEvent.ACTION_CANCEL,
-            MotionEvent.ACTION_OUTSIDE -> current?.let { state ->
                 cancelLongPressState(view, state)
             }
+            MotionEvent.ACTION_CANCEL, MotionEvent.ACTION_OUTSIDE -> current?.let { cancelLongPressState(view, it) }
         }
+        return false
     }
 
     private fun beginLongPress(
@@ -837,11 +782,6 @@ object ScriptSendButtonHook {
     private data class InputStart(
         val startedAt: Long,
         val talker: String
-    )
-
-    private data class InputSendSession(
-        val footer: Any,
-        val inputView: View?
     )
 
     private data class PendingInputStart(

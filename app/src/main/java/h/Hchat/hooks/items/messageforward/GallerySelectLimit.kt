@@ -2,7 +2,7 @@ package h.Hchat.hooks.items.messageforward
 
 import android.app.Activity
 import android.content.Intent
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.hooks.core.FeatureContext
 import h.Hchat.hooks.core.HookRegistry
 import h.Hchat.preferences.HchatStorage
@@ -54,17 +54,19 @@ internal class GallerySelectLimit(
         val clazz = KavaReflector.loadClass(className, context.hostClassLoader()) ?: return false
         val method = findMethod(clazz, methodName) ?: return false
         return runCatching {
-            HookRegistry.get().hook(KavaReflector.accessible(method) ?: method, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    if (!enabled()) return
-                    val activity = param.thisObject as? Activity ?: return
-                    rewrite(activity)
-                }
-            })
+            HookRegistry.get().hook(KavaReflector.accessible(method) ?: method, GalleryEntryHook(this))
             true
         }.onFailure {
             logger("$className#$methodName Hook 安装失败", it)
         }.getOrDefault(false)
+    }
+
+    private class GalleryEntryHook(private val owner: GallerySelectLimit) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val activity = chain.thisObject as? Activity
+            if (owner.enabled() && activity != null) owner.rewrite(activity)
+            return chain.proceed()
+        }
     }
 
     private fun findMethod(clazz: Class<*>, name: String): Method? {

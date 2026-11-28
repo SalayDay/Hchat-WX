@@ -3,7 +3,7 @@ package h.Hchat.hooks.items.selectedmessages
 import android.media.MediaMetadataRetriever
 import android.os.Handler
 import android.os.Looper
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.dexkit.DexMethodCache
 import h.Hchat.hooks.api.core.WeChatApis
 import h.Hchat.hooks.api.media.WeChatEmojiApi
@@ -45,16 +45,20 @@ class OfficialMassSendSender(
         runtime = resolved
         if (callbackHookInstalled) return true
         return runCatching {
-            HookRegistry.get().hook(resolved.sceneEndMethod, object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    handleSceneEnd(param.thisObject, param.args)
-                }
-            })
+            HookRegistry.get().hook(resolved.sceneEndMethod, SceneEndHook(this))
             callbackHookInstalled = true
             true
         }.onFailure {
             logger("微信原生群发助手完成回调Hook失败: ${resolved.sceneEndMethod.toGenericString()}", it)
         }.getOrDefault(false)
+    }
+
+    private class SceneEndHook(private val owner: OfficialMassSendSender) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val result = chain.proceed()
+            owner.handleSceneEnd(chain.thisObject, chain.args.toTypedArray())
+            return result
+        }
     }
 
     fun enqueue(

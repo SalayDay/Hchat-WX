@@ -1,7 +1,7 @@
 package h.Hchat.hooks.items.miniprogramvideoad
 
 import android.content.Context
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.hooks.core.BaseFeature
 import h.Hchat.hooks.core.FeatureContext
 import h.Hchat.hooks.core.HookRegistry
@@ -68,17 +68,7 @@ class SkipMiniProgramVideoAdsFeature : BaseFeature() {
                     return false
                 }
                 return runCatching {
-                    HookRegistry.get().hook(subscribeHandler, object : XC_MethodHook() {
-                        override fun beforeHookedMethod(param: MethodHookParam) {
-                            if (param.args.getOrNull(0) != EVENT_VIDEO_TIME_UPDATE) return
-                            if (!isEnabled(context)) return
-                            val payload = param.args.getOrNull(1) as? String ?: return
-                            val json = runCatching { JSONObject(payload) }.getOrNull() ?: return
-                            json.put("position", 60)
-                            json.put("duration", 1)
-                            param.args[1] = json.toString()
-                        }
-                    })
+                    HookRegistry.get().hook(subscribeHandler, VideoTimeHooker(context))
                     installedLoaders.add(loaderKey)
                     true
                 }.getOrElse {
@@ -88,4 +78,24 @@ class SkipMiniProgramVideoAdsFeature : BaseFeature() {
             }
         }
     }
+
+    private class VideoTimeHooker(private val context: Context) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val args = chain.args.toTypedArray()
+            val receiver = chain.thisObject
+            run {
+            run patch@{
+                if (args.getOrNull(0) != EVENT_VIDEO_TIME_UPDATE) return@patch
+                if (!isEnabled(context)) return@patch
+                val payload = args.getOrNull(1) as? String ?: return@patch
+                val json = runCatching { JSONObject(payload) }.getOrNull() ?: return@patch
+                json.put("position", 60)
+                json.put("duration", 1)
+                args[1] = json.toString()
+            }
+            return chain.proceed(args)
+            }
+        }
+    }
+
 }

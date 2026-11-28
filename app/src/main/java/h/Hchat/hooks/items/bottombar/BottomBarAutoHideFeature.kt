@@ -2,7 +2,7 @@ package h.Hchat.hooks.items.bottombar
 
 import android.app.Activity
 import android.view.View
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.dexkit.DexMethodCache
 import h.Hchat.event.Events
 import h.Hchat.hooks.core.BaseFeature
@@ -124,17 +124,21 @@ private class BottomBarAutoHideRuntime(
             return false
         }
         return runCatching {
-            HookRegistry.get().hook(method, object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    handleTouch(param)
-                }
-            })
+            HookRegistry.get().hook(method, RecyclerTouchHooker(this))
             installed = true
             logger("悬浮底栏滑动隐藏：已挂载 onTouchEvent，开关 ${if (enabled()) "开" else "关"}", null)
             true
         }.getOrElse {
             logger("悬浮底栏滑动隐藏 Hook 安装失败", it)
             false
+        }
+    }
+
+    private class RecyclerTouchHooker(private val runtime: BottomBarAutoHideRuntime) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val result = chain.proceed()
+            runtime.handleTouch(chain.thisObject, chain.args)
+            return result
         }
     }
 
@@ -181,11 +185,11 @@ private class BottomBarAutoHideRuntime(
      * 与上次记录的值比较即可得到「这一下滚了多少」。手指停下（无位移）就不动，
      * 所以不会因为惯性滚动反复收放。
      */
-    private fun handleTouch(param: XC_MethodHook.MethodHookParam) {
+    private fun handleTouch(owner: Any?, args: List<Any?>) {
         if (!enabled()) return
-        val view = param.thisObject as? View ?: return
+        val view = owner as? View ?: return
         if (!isConversationList(view)) return
-        val event = param.args?.getOrNull(0) as? android.view.MotionEvent ?: return
+        val event = args.getOrNull(0) as? android.view.MotionEvent ?: return
         when (event.actionMasked) {
             android.view.MotionEvent.ACTION_DOWN -> {
                 lastOffsets[view] = scrollOffset(view)

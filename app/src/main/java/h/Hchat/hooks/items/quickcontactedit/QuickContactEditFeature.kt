@@ -12,7 +12,7 @@ import android.view.MenuItem
 import android.view.View
 import android.widget.ImageView
 import android.widget.Toast
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.event.Events
 import h.Hchat.hooks.api.core.WeChatApis
 import h.Hchat.hooks.api.model.ContactLabelBean
@@ -139,11 +139,7 @@ private class QuickContactEditRuntime(
     @Synchronized
     fun installConversationMenuHook(): Boolean {
         val create = ConversationMenuLocator.menuCreateMethod(context, logger)
-        val createInstalled = create != null && hook(create, object : XC_MethodHook() {
-            override fun afterHookedMethod(param: MethodHookParam) {
-                addMenuItem(param)
-            }
-        })
+        val createInstalled = create != null && hook(create, ConversationMenuHook(this))
         if (!createInstalled) logger("快捷设置备注和标签菜单创建 Hook 未安装", null)
         return createInstalled
     }
@@ -161,48 +157,16 @@ private class QuickContactEditRuntime(
     fun installSnsAvatarMenuHook(): Boolean {
         val methods = SnsAvatarMenuLocator.locate(context, logger)
         val createInstalled = methods.createMethods.count { method ->
-            hook(method, object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    addSnsAvatarMenuItem(param)
-                }
-            })
+            hook(method, SnsAvatarMenuHook(this))
         }
         val clickInstalled = methods.clickMethods.count { method ->
-            hook(method, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    handleSnsAvatarMenuClick(param, method)
-                }
-            })
+            hook(method, SnsAvatarClickHook(this, method))
         }
         if (createInstalled <= 0) logger("朋友圈头像菜单创建 Hook 未安装", null)
         if (clickInstalled <= 0) logger("朋友圈头像菜单点击 Hook 未安装", null)
         return createInstalled > 0 && clickInstalled > 0
     }
 
-    private fun addSnsAvatarMenuItem(param: XC_MethodHook.MethodHookParam) {
-        if (!enabled()) return
-        val menu = param.args?.getOrNull(0) as? ContextMenu ?: return
-        val view = param.args?.getOrNull(1) as? View ?: return
-        val activity = findActivity(view.context) ?: return
-        val talker = snsAuthorFromCallback(param.thisObject) ?: return
-        menu.removeItem(SNS_MENU_ITEM_ID)
-        snsMenuBindings.clear()
-        pendingSnsMenuTarget = null
-        val target = MenuTarget(activity, talker, allowOpenIm = true)
-        val item = menu.add(0, SNS_MENU_ITEM_ID, menu.size(), MENU_TITLE)
-        snsMenuBindings[item] = target
-        pendingSnsMenuTarget = target
-    }
-
-    private fun handleSnsAvatarMenuClick(param: XC_MethodHook.MethodHookParam, method: Method) {
-        if (!enabled()) return
-        val item = param.args?.firstNotNullOfOrNull { it as? MenuItem } ?: return
-        if (item.itemId != SNS_MENU_ITEM_ID) return
-        val target = snsMenuBindings.remove(item) ?: pendingSnsMenuTarget ?: return
-        pendingSnsMenuTarget = null
-        param.setResult(if (method.returnType == Boolean::class.javaPrimitiveType) true else null)
-        main.post { showActions(target) }
-    }
 
     private fun snsAuthorFromCallback(callback: Any?): String? {
         val visited = Collections.newSetFromMap(IdentityHashMap<Any, Boolean>())
@@ -284,11 +248,7 @@ private class QuickContactEditRuntime(
             "setAvatarOnClickListener",
             View.OnClickListener::class.java
         ) ?: return false
-        return hook(method, object : XC_MethodHook() {
-            override fun afterHookedMethod(param: MethodHookParam) {
-                bindSnsAvatar(param.thisObject, param.args?.getOrNull(0) as? View.OnClickListener)
-            }
-        })
+        return hook(method, SnsAvatarBindHook(this))
     }
 
     private fun bindSnsAvatar(header: Any?, clickListener: View.OnClickListener?) {
@@ -381,7 +341,7 @@ private class QuickContactEditRuntime(
         }.getOrDefault(false)
     }
 
-    private fun hook(method: Method, callback: XC_MethodHook): Boolean {
+    private fun hook(method: Method, callback: XposedInterface.Hooker): Boolean {
         if (Modifier.isAbstract(method.modifiers) || method.declaringClass.isInterface) return false
         if (!hookedMethods.add(method)) return true
         return runCatching {
@@ -394,18 +354,6 @@ private class QuickContactEditRuntime(
         }
     }
 
-    private fun addMenuItem(param: XC_MethodHook.MethodHookParam) {
-        if (!enabled()) return
-        val menu = param.args?.getOrNull(0) as? ContextMenu ?: return
-        if (!installMenuClickHook(param.thisObject)) return
-        val target = resolveTarget(param.thisObject) ?: return
-        menu.removeItem(MENU_ITEM_ID)
-        val groupId = runCatching { menu.getItem(0).groupId }.getOrDefault(0)
-        val title = if (target.isGroup) GROUP_MENU_TITLE else MENU_TITLE
-        val item = menu.add(groupId, MENU_ITEM_ID, 0, title)
-        moveMenuItemToFront(menu, item, MENU_ITEM_ID)
-        bindings[item] = target
-    }
 
     private fun installMenuClickHook(listener: Any?): Boolean {
         listener ?: return false
@@ -425,21 +373,9 @@ private class QuickContactEditRuntime(
                 candidate.returnType == Void.TYPE &&
                     candidate.declaringClass.name.startsWith("com.tencent.mm.ui.conversation.")
             } ?: return false
-        return hook(method, object : XC_MethodHook() {
-            override fun beforeHookedMethod(param: MethodHookParam) {
-                handleMenuClick(param)
-            }
-        })
+        return hook(method, MenuClickHook(this))
     }
 
-    private fun handleMenuClick(param: XC_MethodHook.MethodHookParam) {
-        if (!enabled()) return
-        val item = param.args?.getOrNull(0) as? MenuItem ?: return
-        if (item.itemId != MENU_ITEM_ID) return
-        val target = bindings.remove(item) ?: return
-        param.setResult(null)
-        main.post { showActions(target) }
-    }
 
     private fun moveMenuItemToFront(menu: ContextMenu, item: MenuItem, targetItemId: Int) {
         var current: Class<*>? = menu.javaClass
@@ -720,5 +656,85 @@ private class QuickContactEditRuntime(
         private const val SNS_CALLBACK_SCAN_DEPTH = 3
         private const val LABEL_SYNC_ATTEMPTS = 15
         private const val LABEL_SYNC_INTERVAL_MS = 1_000L
+    }
+
+    private class ConversationMenuHook(private val owner: QuickContactEditRuntime) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            return with(owner) {
+                val outcome = chain.proceed()
+                val args = chain.args
+                if (!enabled()) return outcome
+                val menu = args.getOrNull(0) as? ContextMenu ?: return outcome
+                if (!installMenuClickHook(chain.thisObject)) return outcome
+                val target = resolveTarget(chain.thisObject) ?: return outcome
+                menu.removeItem(MENU_ITEM_ID)
+                val groupId = runCatching { menu.getItem(0).groupId }.getOrDefault(0)
+                val title = if (target.isGroup) GROUP_MENU_TITLE else MENU_TITLE
+                val item = menu.add(groupId, MENU_ITEM_ID, 0, title)
+                moveMenuItemToFront(menu, item, MENU_ITEM_ID)
+                bindings[item] = target
+                return outcome
+            }
+        }
+    }
+
+    private class SnsAvatarMenuHook(private val owner: QuickContactEditRuntime) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            return with(owner) {
+                val outcome = chain.proceed()
+                val args = chain.args
+                if (!enabled()) return outcome
+                val menu = args.getOrNull(0) as? ContextMenu ?: return outcome
+                val view = args.getOrNull(1) as? View ?: return outcome
+                val activity = findActivity(view.context) ?: return outcome
+                val talker = snsAuthorFromCallback(chain.thisObject) ?: return outcome
+                menu.removeItem(SNS_MENU_ITEM_ID)
+                snsMenuBindings.clear()
+                pendingSnsMenuTarget = null
+                val target = MenuTarget(activity, talker, allowOpenIm = true)
+                val item = menu.add(0, SNS_MENU_ITEM_ID, menu.size(), MENU_TITLE)
+                snsMenuBindings[item] = target
+                pendingSnsMenuTarget = target
+                return outcome
+            }
+        }
+    }
+
+    private class SnsAvatarClickHook(private val owner: QuickContactEditRuntime, private val method: Method) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            return with(owner) {
+                if (!enabled()) return chain.proceed()
+                val item = chain.args.firstNotNullOfOrNull { it as? MenuItem } ?: return chain.proceed()
+                if (item.itemId != SNS_MENU_ITEM_ID) return chain.proceed()
+                val target = snsMenuBindings.remove(item) ?: pendingSnsMenuTarget ?: return chain.proceed()
+                pendingSnsMenuTarget = null
+                main.post { showActions(target) }
+                return if (method.returnType == Boolean::class.javaPrimitiveType) true else null
+            }
+        }
+    }
+
+    private class SnsAvatarBindHook(private val owner: QuickContactEditRuntime) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            return with(owner) {
+                val outcome = chain.proceed()
+                val args = chain.args
+                bindSnsAvatar(chain.thisObject, args.getOrNull(0) as? View.OnClickListener)
+                return outcome
+            }
+        }
+    }
+
+    private class MenuClickHook(private val owner: QuickContactEditRuntime) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            return with(owner) {
+                if (!enabled()) return chain.proceed()
+                val item = chain.args.getOrNull(0) as? MenuItem ?: return chain.proceed()
+                if (item.itemId != MENU_ITEM_ID) return chain.proceed()
+                val target = bindings.remove(item) ?: return chain.proceed()
+                main.post { showActions(target) }
+                return null
+            }
+        }
     }
 }

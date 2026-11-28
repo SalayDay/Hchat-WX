@@ -11,7 +11,7 @@ import android.text.style.ClickableSpan
 import android.view.View
 import android.view.ViewGroup
 import android.widget.TextView
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.R
 import h.Hchat.dexkit.DexMethodCache
 import h.Hchat.hooks.api.core.WeChatApis
@@ -96,11 +96,7 @@ private class MessageTextColorRenderer(
             return false
         }
         return runCatching {
-            HookRegistry.get().hook(method, object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    applyTextColor(param)
-                }
-            })
+            HookRegistry.get().hook(method, MessageBindHooker(this))
             adapterBindInstalled = true
             true
         }.getOrElse {
@@ -109,8 +105,15 @@ private class MessageTextColorRenderer(
         }
     }
 
-    private fun applyTextColor(param: XC_MethodHook.MethodHookParam) {
-        val args = param.args ?: return
+    private class MessageBindHooker(private val runtime: MessageTextColorRenderer) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val result = chain.proceed()
+            runtime.applyTextColor(chain.thisObject, chain.args.toTypedArray())
+            return result
+        }
+    }
+
+    private fun applyTextColor(owner: Any?, args: Array<Any?>) {
         if (args.size < 2) return
         // 关闭状态下：只有当确实有行应用过样式（需要还原）时才继续，
         // 否则直接退出，避免每条消息都做一次 findRootView 反射。
@@ -123,7 +126,7 @@ private class MessageTextColorRenderer(
             return
         }
 
-        val adapter = param.thisObject ?: run {
+        val adapter = owner ?: run {
             clearBinding(root)
             return
         }

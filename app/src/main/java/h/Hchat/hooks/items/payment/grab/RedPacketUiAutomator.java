@@ -25,7 +25,7 @@ import java.util.WeakHashMap;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-import de.robv.android.xposed.XC_MethodHook;
+import io.github.libxposed.api.XposedInterface;
 
 /**
  * UI 抢包模式兜底。
@@ -112,39 +112,19 @@ public class RedPacketUiAutomator {
 
     private void hookReceiveLifecycle(Class<?> clazz, String className) {
         if (clazz == null) return;
-        if (hookDeclaredAfter(clazz, "initView", null, new XC_MethodHook() {
-            @Override
-            public void afterHookedMethod(MethodHookParam param) {
-                handleReceivePage(param.thisObject, "initView", true);
-            }
-        })) {
+        if (hookDeclaredMethod(clazz, "initView", null, new ReceiveInitHooker(this))) {
             log("Hook领取页: " + className + ".initView");
         }
 
-        hookDeclaredAfter(clazz, "onCreate", new Class<?>[]{Bundle.class}, new XC_MethodHook() {
-            @Override
-            public void afterHookedMethod(MethodHookParam param) {
-                handleReceivePage(param.thisObject, "onCreate", false);
-            }
-        });
+        hookDeclaredMethod(clazz, "onCreate", new Class<?>[]{Bundle.class}, new ReceiveCreatedHooker(this));
 
-        hookDeclaredAfter(clazz, "onResume", null, new XC_MethodHook() {
-            @Override
-            public void afterHookedMethod(MethodHookParam param) {
-                handleReceivePage(param.thisObject, "onResume", true);
-            }
-        });
+        hookDeclaredMethod(clazz, "onResume", null, new ReceiveResumedHooker(this));
 
         try {
             for (Method method : KavaReflector.declaredMethods(clazz)) {
                 if (!"onSceneEnd".equals(method.getName())) continue;
                 if (method.getParameterTypes().length != 4) continue;
-                HookRegistry.get().hook(method, new XC_MethodHook() {
-                    @Override
-                    public void afterHookedMethod(MethodHookParam param) {
-                        handleReceivePage(param.thisObject, "onSceneEnd", true);
-                    }
-                });
+                HookRegistry.get().hook(method, new ReceiveSceneHooker(this));
                 log("Hook领取页: " + className + ".onSceneEnd");
                 break;
             }
@@ -153,14 +133,7 @@ public class RedPacketUiAutomator {
         }
 
         try {
-            hookDeclaredAfter(clazz, "onDestroy", null, new XC_MethodHook() {
-                @Override
-                public void afterHookedMethod(MethodHookParam param) {
-                    if (param.thisObject instanceof Activity) {
-                        clickedActivities.remove((Activity) param.thisObject);
-                    }
-                }
-            });
+            hookDeclaredMethod(clazz, "onDestroy", null, new ReceiveDestroyedHooker(this));
         } catch (Throwable ignored) {}
     }
 
@@ -194,29 +167,15 @@ public class RedPacketUiAutomator {
 
     private void hookDetailLifecycle(Class<?> clazz, String className) {
         if (clazz == null) return;
-        if (hookDeclaredAfter(clazz, "onCreate", new Class<?>[]{Bundle.class}, new XC_MethodHook() {
-            @Override
-            public void afterHookedMethod(MethodHookParam param) {
-                if (param.thisObject instanceof Activity) {
-                    scheduleDetailSuccessCheck((Activity) param.thisObject);
-                }
-            }
-        })) {
+        if (hookDeclaredMethod(clazz, "onCreate", new Class<?>[]{Bundle.class}, new DetailCreatedHooker(this))) {
             log("Hook详情页: " + className + ".onCreate");
         }
-        if (hookDeclaredAfter(clazz, "onResume", null, new XC_MethodHook() {
-            @Override
-            public void afterHookedMethod(MethodHookParam param) {
-                if (param.thisObject instanceof Activity) {
-                    scheduleDetailSuccessCheck((Activity) param.thisObject);
-                }
-            }
-        })) {
+        if (hookDeclaredMethod(clazz, "onResume", null, new DetailResumedHooker(this))) {
             log("Hook详情页: " + className + ".onResume");
         }
     }
 
-    private boolean hookDeclaredAfter(Class<?> clazz, String methodName, Class<?>[] parameterTypes, XC_MethodHook callback) {
+    private boolean hookDeclaredMethod(Class<?> clazz, String methodName, Class<?>[] parameterTypes, XposedInterface.Hooker callback) {
         try {
             Method method = parameterTypes == null
                     ? KavaReflector.findDeclaredMethod(clazz, methodName)
@@ -533,4 +492,158 @@ public class RedPacketUiAutomator {
     private void log(String message) {
         if (logger != null) logger.log(message);
     }
+
+    private void receiveViewInitialized(Object receiver, Object[] args) {
+        handleReceivePage(receiver, "initView", true);
+    }
+
+    private static final class ReceiveInitHooker implements XposedInterface.Hooker {
+        private final RedPacketUiAutomator owner;
+
+        ReceiveInitHooker(RedPacketUiAutomator owner) {
+            this.owner = owner;
+        }
+
+        @Override
+        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+            Object receiver = chain.getThisObject();
+            Object[] args = chain.getArgs().toArray();
+            Object result = chain.proceed();
+            owner.receiveViewInitialized(receiver, args);
+            return result;
+        }
+    }
+
+    private void receiveActivityCreated(Object receiver, Object[] args) {
+        handleReceivePage(receiver, "onCreate", false);
+    }
+
+    private static final class ReceiveCreatedHooker implements XposedInterface.Hooker {
+        private final RedPacketUiAutomator owner;
+
+        ReceiveCreatedHooker(RedPacketUiAutomator owner) {
+            this.owner = owner;
+        }
+
+        @Override
+        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+            Object receiver = chain.getThisObject();
+            Object[] args = chain.getArgs().toArray();
+            Object result = chain.proceed();
+            owner.receiveActivityCreated(receiver, args);
+            return result;
+        }
+    }
+
+    private void receiveActivityResumed(Object receiver, Object[] args) {
+        handleReceivePage(receiver, "onResume", true);
+    }
+
+    private static final class ReceiveResumedHooker implements XposedInterface.Hooker {
+        private final RedPacketUiAutomator owner;
+
+        ReceiveResumedHooker(RedPacketUiAutomator owner) {
+            this.owner = owner;
+        }
+
+        @Override
+        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+            Object receiver = chain.getThisObject();
+            Object[] args = chain.getArgs().toArray();
+            Object result = chain.proceed();
+            owner.receiveActivityResumed(receiver, args);
+            return result;
+        }
+    }
+
+    private void receiveSceneFinished(Object receiver, Object[] args) {
+        handleReceivePage(receiver, "onSceneEnd", true);
+    }
+
+    private static final class ReceiveSceneHooker implements XposedInterface.Hooker {
+        private final RedPacketUiAutomator owner;
+
+        ReceiveSceneHooker(RedPacketUiAutomator owner) {
+            this.owner = owner;
+        }
+
+        @Override
+        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+            Object receiver = chain.getThisObject();
+            Object[] args = chain.getArgs().toArray();
+            Object result = chain.proceed();
+            owner.receiveSceneFinished(receiver, args);
+            return result;
+        }
+    }
+
+    private void receiveActivityDestroyed(Object receiver, Object[] args) {
+        if (receiver instanceof Activity) {
+            clickedActivities.remove((Activity) receiver);
+        }
+    }
+
+    private static final class ReceiveDestroyedHooker implements XposedInterface.Hooker {
+        private final RedPacketUiAutomator owner;
+
+        ReceiveDestroyedHooker(RedPacketUiAutomator owner) {
+            this.owner = owner;
+        }
+
+        @Override
+        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+            Object receiver = chain.getThisObject();
+            Object[] args = chain.getArgs().toArray();
+            Object result = chain.proceed();
+            owner.receiveActivityDestroyed(receiver, args);
+            return result;
+        }
+    }
+
+    private void detailActivityCreated(Object receiver, Object[] args) {
+        if (receiver instanceof Activity) {
+            scheduleDetailSuccessCheck((Activity) receiver);
+        }
+    }
+
+    private static final class DetailCreatedHooker implements XposedInterface.Hooker {
+        private final RedPacketUiAutomator owner;
+
+        DetailCreatedHooker(RedPacketUiAutomator owner) {
+            this.owner = owner;
+        }
+
+        @Override
+        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+            Object receiver = chain.getThisObject();
+            Object[] args = chain.getArgs().toArray();
+            Object result = chain.proceed();
+            owner.detailActivityCreated(receiver, args);
+            return result;
+        }
+    }
+
+    private void detailActivityResumed(Object receiver, Object[] args) {
+        if (receiver instanceof Activity) {
+            scheduleDetailSuccessCheck((Activity) receiver);
+        }
+    }
+
+    private static final class DetailResumedHooker implements XposedInterface.Hooker {
+        private final RedPacketUiAutomator owner;
+
+        DetailResumedHooker(RedPacketUiAutomator owner) {
+            this.owner = owner;
+        }
+
+        @Override
+        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+            Object receiver = chain.getThisObject();
+            Object[] args = chain.getArgs().toArray();
+            Object result = chain.proceed();
+            owner.detailActivityResumed(receiver, args);
+            return result;
+        }
+    }
+
 }

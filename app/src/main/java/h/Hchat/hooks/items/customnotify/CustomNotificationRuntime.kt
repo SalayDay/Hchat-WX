@@ -22,8 +22,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.text.TextUtils
-import de.robv.android.xposed.XC_MethodHook
-import de.robv.android.xposed.XposedBridge
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.dexkit.DexMethodCache
 import h.Hchat.hooks.api.core.WeChatApis
 import h.Hchat.hooks.api.message.WeChatMessageObserveApi
@@ -174,59 +173,10 @@ object CustomNotificationRuntime {
         installNativeNotificationCleanupGuard(context)
         installNativeNotificationPayloadHook(context)
         installNativeNotificationMarker(context)
-        for (method in NotificationManager::class.java.declaredMethods) {
+        for (method in KavaReflector.declaredMethods(NotificationManager::class.java)) {
             val types = method.parameterTypes ?: continue
             if (method.name != "notify" || types.isEmpty() || types.last() != Notification::class.java) continue
-            HookRegistry.get().hook(method, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    val notification = param.args?.lastOrNull() as? Notification ?: return
-                    val hostContext = context.hostContext()
-                    val hchatNotification = isHchatNotification(notification)
-                    val talker = notification.extras?.getString(EXTRA_TALKER).orEmpty()
-                    val msgSvrId = notification.extras?.getLong(EXTRA_NATIVE_MSG_SVR_ID, 0L) ?: 0L
-                    if (hchatNotification) return
-                    if (talker.isBlank()) return
-                    if (AtAllNotificationBlockRuntime.shouldSuppress(
-                            hostContext,
-                            talker,
-                            msgSvrId
-                        )
-                    ) {
-                        param.setResult(null)
-                        return
-                    }
-                    val settings = CustomNotificationSettings(hostContext)
-                    if (!settings.isEnabled()) return
-                    val rule = settings.effectiveRule(talker) ?: return
-                    if (!rule.enabled) return
-                    // A native notification without a reliable message id must stay untouched, but it
-                    // still owns this notification cycle and must suppress the observed-message fallback.
-                    markNativeHandled(talker, msgSvrId)
-                    if (msgSvrId <= 0L) return
-                    if (rule.mode == CustomNotificationSettings.MODE_DND || isInMuteWindow(rule)) {
-                        param.setResult(null)
-                        return
-                    }
-                    when (wechatDoNotDisturbState(rule, talker)) {
-                        true -> {
-                            param.setResult(null)
-                            return
-                        }
-                        null -> return
-                        false -> Unit
-                    }
-                    if (shouldSuppressNativeByRule(rule, talker, msgSvrId)) {
-                        param.setResult(null)
-                        return
-                    }
-                    param.setResult(null)
-                    val payload = buildNativePayload(hostContext, rule, notification)
-                    executor.execute {
-                        runCatching { sendNotification(hostContext, rule, payload) }
-                            .onFailure { HLog.e("$TAG 转发微信原生通知失败: ${it.message}", it) }
-                    }
-                }
-            })
+            HookRegistry.get().hook(method, NotificationPostHook(context))
         }
     }
 
@@ -251,36 +201,10 @@ object CustomNotificationRuntime {
             HLog.e("$TAG 未定位微信前台通知提示音方法，仅免打扰规则可提前拦截")
         }
         processors.forEach { method ->
-            HookRegistry.get().hook(method, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    val stack = nativeForegroundSoundBlockStack.get()
-                        ?: ArrayDeque<Boolean>().also(nativeForegroundSoundBlockStack::set)
-                    val rule = nativeForegroundRule(
-                        context.hostContext(),
-                        param.args ?: emptyArray()
-                    )
-                    val suppressAll = rule != null && (
-                        rule.mode == CustomNotificationSettings.MODE_DND || isInMuteWindow(rule)
-                    )
-                    stack.addLast(soundPlayers.isNotEmpty() && rule?.sound == false)
-                    if (suppressAll) param.setResult(null)
-                }
-
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    val stack = nativeForegroundSoundBlockStack.get() ?: return
-                    if (stack.isNotEmpty()) stack.removeLast()
-                    if (stack.isEmpty()) nativeForegroundSoundBlockStack.remove()
-                }
-            })
+            HookRegistry.get().hook(method, ForegroundFeedbackHook(context, soundPlayers.isNotEmpty()))
         }
         soundPlayers.forEach { method ->
-            HookRegistry.get().hook(method, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    if (nativeForegroundSoundBlockStack.get()?.peekLast() == true) {
-                        param.setResult(null)
-                    }
-                }
-            })
+            HookRegistry.get().hook(method, ForegroundSoundHook())
         }
     }
 
@@ -333,30 +257,10 @@ object CustomNotificationRuntime {
             return
         }
         processors.forEach { method ->
-            HookRegistry.get().hook(method, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    val stack = nativeNotificationBuildStack.get()
-                        ?: ArrayDeque<Boolean>().also(nativeNotificationBuildStack::set)
-                    stack.addLast(shouldPreserveNativeNotificationCleanup(
-                        context.hostContext(),
-                        param.args ?: emptyArray()
-                    ))
-                }
-
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    val stack = nativeNotificationBuildStack.get() ?: return
-                    if (stack.isNotEmpty()) stack.removeLast()
-                    if (stack.isEmpty()) nativeNotificationBuildStack.remove()
-                }
-            })
+            HookRegistry.get().hook(method, NotificationCleanupScopeHook(context))
         }
         cleanups.forEach { method ->
-            HookRegistry.get().hook(method, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    if (nativeNotificationBuildStack.get()?.peekLast() != true) return
-                    param.setResult(null)
-                }
-            })
+            HookRegistry.get().hook(method, NotificationCleanupHook())
         }
     }
 
@@ -386,11 +290,7 @@ object CustomNotificationRuntime {
         processors: List<Method>
     ) {
         processors.forEach { method ->
-            HookRegistry.get().hook(method, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    recordNativeMention(context.hostContext(), param.args ?: emptyArray())
-                }
-            })
+            HookRegistry.get().hook(method, MentionRecordHook(context))
         }
     }
 
@@ -533,13 +433,7 @@ object CustomNotificationRuntime {
     private fun installNativeNotificationPayloadHook(context: FeatureContext) {
         val methods = locateNativeNotificationBuilderMethods(context)
         methods.forEach { method ->
-            HookRegistry.get().hook(method, object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    val notification = param.result as? Notification ?: return
-                    val payload = nativePayloadFromBuilder(method, param.args ?: emptyArray()) ?: return
-                    writeNativePayloadExtras(notification, payload)
-                }
-            })
+            HookRegistry.get().hook(method, NotificationPayloadHook(method))
         }
     }
 
@@ -654,20 +548,11 @@ object CustomNotificationRuntime {
 
     private fun installNativeNotificationMarker(context: FeatureContext) {
         val clazz = findNotificationItemClass(context) ?: return
-        val constructorHooks = XposedBridge.hookAllConstructors(clazz, object : XC_MethodHook() {
-            override fun afterHookedMethod(param: MethodHookParam) {
-                markNotificationItem(param.thisObject, context.hostContext())
-            }
-        })
-        constructorHooks?.forEach { HookRegistry.get().add(it) }
+        HookRegistry.get().hookAllConstructors(clazz, NotificationItemConstructorHook(context))
         for (method in KavaReflector.declaredMethods(clazz)) {
             val types = method.parameterTypes ?: continue
             if (types.size == 1 && Context::class.java.isAssignableFrom(types[0])) {
-                HookRegistry.get().hook(method, object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        markNotificationItem(param.thisObject, context.hostContext())
-                    }
-                })
+                HookRegistry.get().hook(method, NotificationItemContextHook(context))
             }
         }
     }
@@ -1750,4 +1635,115 @@ object CustomNotificationRuntime {
         val type: WeChatMessage.AtMentionType,
         val createdAt: Long
     )
+
+    private class NotificationPostHook(private val context: FeatureContext) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val notification = chain.args.lastOrNull() as? Notification ?: return chain.proceed()
+            val hostContext = context.hostContext()
+            val talker = notification.extras?.getString(EXTRA_TALKER).orEmpty()
+            val msgSvrId = notification.extras?.getLong(EXTRA_NATIVE_MSG_SVR_ID, 0L) ?: 0L
+            if (isHchatNotification(notification) || talker.isBlank()) return chain.proceed()
+            if (AtAllNotificationBlockRuntime.shouldSuppress(hostContext, talker, msgSvrId)) return null
+            val settings = CustomNotificationSettings(hostContext)
+            if (!settings.isEnabled()) return chain.proceed()
+            val rule = settings.effectiveRule(talker) ?: return chain.proceed()
+            if (!rule.enabled) return chain.proceed()
+            // 无可靠消息 ID 时保留原生通知，但仍占有本次通知周期。
+            markNativeHandled(talker, msgSvrId)
+            if (msgSvrId <= 0L) return chain.proceed()
+            if (rule.mode == CustomNotificationSettings.MODE_DND || isInMuteWindow(rule)) return null
+            when (wechatDoNotDisturbState(rule, talker)) {
+                true -> return null
+                null -> return chain.proceed()
+                false -> Unit
+            }
+            if (shouldSuppressNativeByRule(rule, talker, msgSvrId)) return null
+            val payload = buildNativePayload(hostContext, rule, notification)
+            executor.execute {
+                runCatching { sendNotification(hostContext, rule, payload) }
+                    .onFailure { HLog.e("$TAG 转发微信原生通知失败: ${it.message}", it) }
+            }
+            return null
+        }
+    }
+
+    private class ForegroundFeedbackHook(private val context: FeatureContext, private val hasSoundPlayers: Boolean) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val rule = nativeForegroundRule(context.hostContext(), chain.args.toTypedArray())
+            val suppressAll = rule != null && (rule.mode == CustomNotificationSettings.MODE_DND || isInMuteWindow(rule))
+            val stack = nativeForegroundSoundBlockStack.get()
+                ?: ArrayDeque<Boolean>().also(nativeForegroundSoundBlockStack::set)
+            stack.addLast(hasSoundPlayers && rule?.sound == false)
+            try {
+                if (suppressAll) return null
+                return chain.proceed()
+            } finally {
+                if (stack.isNotEmpty()) stack.removeLast()
+                if (stack.isEmpty()) nativeForegroundSoundBlockStack.remove()
+            }
+        }
+    }
+
+    private class ForegroundSoundHook : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            if (nativeForegroundSoundBlockStack.get()?.peekLast() == true) return null
+            return chain.proceed()
+        }
+    }
+
+    private class NotificationCleanupScopeHook(private val context: FeatureContext) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val preserve = shouldPreserveNativeNotificationCleanup(context.hostContext(), chain.args.toTypedArray())
+            val stack = nativeNotificationBuildStack.get()
+                ?: ArrayDeque<Boolean>().also(nativeNotificationBuildStack::set)
+            stack.addLast(preserve)
+            try {
+                return chain.proceed()
+            } finally {
+                if (stack.isNotEmpty()) stack.removeLast()
+                if (stack.isEmpty()) nativeNotificationBuildStack.remove()
+            }
+        }
+    }
+
+    private class NotificationCleanupHook : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            if (nativeNotificationBuildStack.get()?.peekLast() == true) return null
+            return chain.proceed()
+        }
+    }
+
+    private class MentionRecordHook(private val context: FeatureContext) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            recordNativeMention(context.hostContext(), chain.args.toTypedArray())
+            return chain.proceed()
+        }
+    }
+
+    private class NotificationPayloadHook(private val method: Method) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val outcome = chain.proceed()
+            val notification = outcome as? Notification ?: return outcome
+            val payload = nativePayloadFromBuilder(method, chain.args.toTypedArray()) ?: return outcome
+            writeNativePayloadExtras(notification, payload)
+            return outcome
+        }
+    }
+
+    private class NotificationItemConstructorHook(private val context: FeatureContext) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val outcome = chain.proceed()
+
+            markNotificationItem(chain.thisObject, context.hostContext())
+            return outcome
+        }
+    }
+
+    private class NotificationItemContextHook(private val context: FeatureContext) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+
+            markNotificationItem(chain.thisObject, context.hostContext())
+            return chain.proceed()
+        }
+    }
 }

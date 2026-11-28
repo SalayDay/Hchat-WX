@@ -1,8 +1,7 @@
 package h.Hchat.hooks.items.hotupdate
 
 import android.content.Context
-import de.robv.android.xposed.XC_MethodHook
-import de.robv.android.xposed.XposedBridge
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.dexkit.DexMethodCache
 import h.Hchat.hooks.core.BaseFeature
 import h.Hchat.hooks.core.FeatureContext
@@ -106,11 +105,7 @@ class DisableHotUpdateFeature : BaseFeature() {
                     HLog.e("$TAG 未找到 TinkerApplication.getTinkerFlags")
                     return@runCatching false
                 }
-                HookRegistry.get().hook(method, object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        param.setResult(0)
-                    }
-                })
+                HookRegistry.get().hook(method, TinkerFlagsHooker())
                 true
             }.onFailure {
                 HLog.e("$TAG Hook getTinkerFlags 失败: ${it.message}", it)
@@ -131,24 +126,7 @@ class DisableHotUpdateFeature : BaseFeature() {
                     return@runCatching false
                 }
                 methods.forEach { method ->
-                    HookRegistry.get().hook(method, object : XC_MethodHook() {
-                        override fun beforeHookedMethod(param: MethodHookParam) {
-                            val intent = param.args.getOrNull(1) as? android.content.Intent
-                            runCatching {
-                                val shareIntentUtil = classLoader.loadClass("com.tencent.tinker.loader.shareutil.ShareIntentUtil")
-                                val setReturnCode = shareIntentUtil.getDeclaredMethod(
-                                    "setIntentReturnCode",
-                                    android.content.Intent::class.java,
-                                    Int::class.javaPrimitiveType
-                                )
-                                setReturnCode.isAccessible = true
-                                if (intent != null) {
-                                    setReturnCode.invoke(null, intent, -1)
-                                }
-                            }
-                            param.setResult(blockedReturnValue(method))
-                        }
-                    })
+                    HookRegistry.get().hook(method, TinkerLoaderHooker(classLoader, method))
                 }
                 true
             }.onFailure {
@@ -168,11 +146,7 @@ class DisableHotUpdateFeature : BaseFeature() {
                 return
             }
             runCatching {
-                HookRegistry.get().hook(method, object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        param.setResult(blockedReturnValue(method))
-                    }
-                })
+                HookRegistry.get().hook(method, ManualUpdaterHooker(method))
             }.onFailure {
                 HLog.e("$TAG Hook 补丁应用入口失败: ${it.message}", it)
             }
@@ -215,11 +189,7 @@ class DisableHotUpdateFeature : BaseFeature() {
                     else DexMethodCache.clear(cache, runtimeKey, "sync_response_consumer")
                 }
                 methods.forEach { method ->
-                    HookRegistry.get().hook(method, object : XC_MethodHook() {
-                        override fun beforeHookedMethod(param: MethodHookParam) {
-                            param.setResult(blockedReturnValue(method))
-                        }
-                    })
+                    HookRegistry.get().hook(method, SyncResponseHooker(method))
                     count++
                 }
                 if (count == 0) {
@@ -255,11 +225,7 @@ class DisableHotUpdateFeature : BaseFeature() {
                     else DexMethodCache.clear(cache, runtimeKey, "upgrade_response")
                 }
                 methods.forEach { method ->
-                    HookRegistry.get().hook(method, object : XC_MethodHook() {
-                        override fun beforeHookedMethod(param: MethodHookParam) {
-                            param.setResult(blockedReturnValue(method))
-                        }
-                    })
+                    HookRegistry.get().hook(method, UpgradeResponseHooker(method))
                 }
             }.onFailure {
                 HLog.e("$TAG Hook 热更新响应处理失败: ${it.message}", it)
@@ -324,11 +290,7 @@ class DisableHotUpdateFeature : BaseFeature() {
                         method.returnType == Void.TYPE
                 }
                 methods.forEach { method ->
-                    HookRegistry.get().hook(method, object : XC_MethodHook() {
-                        override fun beforeHookedMethod(param: MethodHookParam) {
-                            param.setResult(blockedReturnValue(method))
-                        }
-                    })
+                    HookRegistry.get().hook(method, LegacyPatchHooker(method))
                 }
             }.onFailure {
                 if (it is ClassNotFoundException) return@onFailure
@@ -349,4 +311,96 @@ class DisableHotUpdateFeature : BaseFeature() {
             return "${System.identityHashCode(classLoader)}:${classLoader}"
         }
     }
+
+    private class TinkerFlagsHooker() : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val args = chain.args.toTypedArray()
+            val receiver = chain.thisObject
+            run {
+            run patch@{
+                return 0
+            }
+            return chain.proceed(args)
+            }
+        }
+    }
+
+    private class TinkerLoaderHooker(private val classLoader: ClassLoader, private val method: Method) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val args = chain.args.toTypedArray()
+            val receiver = chain.thisObject
+            run {
+            run patch@{
+                val intent = args.getOrNull(1) as? android.content.Intent
+                runCatching {
+                    val shareIntentUtil = classLoader.loadClass("com.tencent.tinker.loader.shareutil.ShareIntentUtil")
+                    val setReturnCode = shareIntentUtil.getDeclaredMethod(
+                        "setIntentReturnCode",
+                        android.content.Intent::class.java,
+                        Int::class.javaPrimitiveType
+                    )
+                    setReturnCode.isAccessible = true
+                    if (intent != null) {
+                        setReturnCode.invoke(null, intent, -1)
+                    }
+                }
+                return blockedReturnValue(method)
+            }
+            return chain.proceed(args)
+            }
+        }
+    }
+
+    private class ManualUpdaterHooker(private val method: Method) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val args = chain.args.toTypedArray()
+            val receiver = chain.thisObject
+            run {
+            run patch@{
+                return blockedReturnValue(method)
+            }
+            return chain.proceed(args)
+            }
+        }
+    }
+
+    private class SyncResponseHooker(private val method: Method) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val args = chain.args.toTypedArray()
+            val receiver = chain.thisObject
+            run {
+            run patch@{
+                return blockedReturnValue(method)
+            }
+            return chain.proceed(args)
+            }
+        }
+    }
+
+    private class UpgradeResponseHooker(private val method: Method) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val args = chain.args.toTypedArray()
+            val receiver = chain.thisObject
+            run {
+            run patch@{
+                return blockedReturnValue(method)
+            }
+            return chain.proceed(args)
+            }
+        }
+    }
+
+    private class LegacyPatchHooker(private val method: Method) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val args = chain.args.toTypedArray()
+            val receiver = chain.thisObject
+            run {
+            run patch@{
+                return blockedReturnValue(method)
+            }
+            return chain.proceed(args)
+            }
+        }
+    }
+
 }

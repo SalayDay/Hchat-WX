@@ -3,8 +3,8 @@ package h.Hchat.hooks.items.messagebubble
 import android.app.Activity
 import android.content.Intent
 import android.net.Uri
-import de.robv.android.xposed.XC_MethodHook
-import de.robv.android.xposed.XposedBridge
+import io.github.libxposed.api.XposedInterface
+import h.Hchat.hooks.core.HookRegistry
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -59,29 +59,31 @@ object MessageBubblePicker {
     private fun hookActivityResult(clazz: Class<*>) {
         if (!hookedClasses.add(clazz)) return
         runCatching {
-            XposedBridge.hookAllMethods(clazz, "onActivityResult", object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    val requestCode = param.args.getOrNull(0) as? Int ?: return
-                    val result = pending.remove(requestCode) ?: return
-                    val resultCode = param.args.getOrNull(1) as? Int ?: return
-                    val data = param.args.getOrNull(2) as? Intent
-                    val uri = data?.data
-                    if (resultCode != Activity.RESULT_OK || uri == null) {
-                        result.callback(MessageBubblePickResult.CANCELLED)
-                        return
-                    }
-                    takeReadPermission(result.activity, data, uri)
-                    Thread({
-                        val success = MessageBubbleStore.saveFromUri(result.activity, result.slot, uri)
-                        result.activity.runOnUiThread {
-                            result.callback(
-                                if (success) MessageBubblePickResult.SAVED else MessageBubblePickResult.FAILED
-                            )
-                        }
-                    }, "Hchat-MessageBubbleSave").start()
-                }
-            })
+            HookRegistry.get().hookAllMethods(clazz, "onActivityResult", ActivityResultHook())
         }.onFailure { hookedClasses.remove(clazz) }
+    }
+
+    private class ActivityResultHook : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val original = chain.proceed()
+            val requestCode = chain.args.getOrNull(0) as? Int ?: return original
+            val result = pending.remove(requestCode) ?: return original
+            val resultCode = chain.args.getOrNull(1) as? Int ?: return original
+            val data = chain.args.getOrNull(2) as? Intent
+            val uri = data?.data
+            if (resultCode != Activity.RESULT_OK || uri == null) {
+                result.callback(MessageBubblePickResult.CANCELLED)
+                return original
+            }
+            takeReadPermission(result.activity, data, uri)
+            Thread({
+                val success = MessageBubbleStore.saveFromUri(result.activity, result.slot, uri)
+                result.activity.runOnUiThread {
+                    result.callback(if (success) MessageBubblePickResult.SAVED else MessageBubblePickResult.FAILED)
+                }
+            }, "Hchat-MessageBubbleSave").start()
+            return original
+        }
     }
 
     private fun takeReadPermission(activity: Activity, data: Intent, uri: Uri) {

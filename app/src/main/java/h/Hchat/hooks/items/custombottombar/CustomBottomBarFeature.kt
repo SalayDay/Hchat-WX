@@ -38,7 +38,7 @@ import androidx.navigationevent.compose.LocalNavigationEventDispatcherOwner
 import androidx.savedstate.SavedStateRegistry
 import androidx.savedstate.SavedStateRegistryController
 import androidx.savedstate.SavedStateRegistryOwner
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.dexkit.DexMethodCache
 import h.Hchat.event.Events
 import h.Hchat.hooks.api.core.WeChatApis
@@ -297,11 +297,7 @@ private class CustomBottomBarRuntime(
         if (constructors.isEmpty()) return false
         return runCatching {
             constructors.forEach { constructor ->
-                HookRegistry.get().hook(constructor, object : XC_MethodHook() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        observeBottomTab(param.thisObject as? ViewGroup)
-                    }
-                })
+                HookRegistry.get().hook(constructor, BottomTabConstructorHook(this))
             }
             bottomTabConstructorHooksInstalled = true
             true
@@ -319,16 +315,7 @@ private class CustomBottomBarRuntime(
             return
         }
         runCatching {
-            HookRegistry.get().hook(method, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    // 每个绘制帧都会进来：空表是常态（只有主动抑制模糊的页面才非空），
-                    // 所以先读 volatile 计数直接返回，连 `view.rootView` 的父链遍历都省掉。
-                    if (suppressedRootCount == 0) return
-                    val view = param.thisObject as? View ?: return
-                    if (!isBottomBlurSuppressed(view.rootView)) return
-                    clearBottomBlurView(view, invalidate = false)
-                }
-            })
+            HookRegistry.get().hook(method, FrostedDrawHook(this))
             frostedDrawHookInstalled = true
         }.onFailure {
             logger("微信底部磨砂绘制 Hook 安装失败: ${method.toGenericString()}", it)
@@ -343,16 +330,7 @@ private class CustomBottomBarRuntime(
             exactSetTo).distinctBy(Method::toGenericString)
         return runCatching {
             methods.forEach { method ->
-                HookRegistry.get().hook(method, object : XC_MethodHook() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        val selectedIndex = if (method == exactSetTo) {
-                            param.args.getOrNull(0) as? Int
-                        } else {
-                            null
-                        }
-                        syncFloatingHost(param.thisObject as? ViewGroup, selectedIndex)
-                    }
-                })
+                HookRegistry.get().hook(method, BottomTabStateHook(this, method, exactSetTo))
             }
             bottomTabStateHooksInstalled = true
             true
@@ -405,11 +383,7 @@ private class CustomBottomBarRuntime(
                 !Modifier.isAbstract(it.modifiers)
         } ?: return false
         return runCatching {
-            HookRegistry.get().hook(onResume, object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    applyFromActivity(param.thisObject as? Activity)
-                }
-            })
+            HookRegistry.get().hook(onResume, LauncherResumeHook(this))
             resumeHookInstalled = true
             true
         }.getOrElse {
@@ -422,11 +396,7 @@ private class CustomBottomBarRuntime(
         if (createHookInstalled) return true
         val method = locateMainTabCreateMethod(allowDexSearch) ?: return false
         return runCatching {
-            HookRegistry.get().hook(method, object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    applyFromActivity(findActivity(param.thisObject))
-                }
-            })
+            HookRegistry.get().hook(method, MainTabCreateHook(this))
             createHookInstalled = true
             true
         }.getOrElse {
@@ -1022,6 +992,70 @@ private class CustomBottomBarRuntime(
             FloatingBottomBarSettings.KEY_VIBRATION_ENABLED,
             FloatingBottomBarSettings.KEY_VIBRATION_STRENGTH
         )
+    }
+
+    private class BottomTabConstructorHook(private val owner: CustomBottomBarRuntime) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            return with(owner) {
+                val outcome = chain.proceed()
+
+                observeBottomTab(chain.thisObject as? ViewGroup)
+                return outcome
+            }
+        }
+    }
+
+    private class FrostedDrawHook(private val owner: CustomBottomBarRuntime) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            return with(owner) {
+
+                // 每个绘制帧都会进来：空表是常态（只有主动抑制模糊的页面才非空），
+                // 所以先读 volatile 计数直接返回，连 `view.rootView` 的父链遍历都省掉。
+                if (suppressedRootCount == 0) return chain.proceed()
+                val view = chain.thisObject as? View ?: return chain.proceed()
+                if (!isBottomBlurSuppressed(view.rootView)) return chain.proceed()
+                clearBottomBlurView(view, invalidate = false)
+                return chain.proceed()
+            }
+        }
+    }
+
+    private class BottomTabStateHook(private val owner: CustomBottomBarRuntime, private val method: Method, private val exactSetTo: Method) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            return with(owner) {
+                val outcome = chain.proceed()
+                val args = chain.args
+                val selectedIndex = if (method == exactSetTo) {
+                    args.getOrNull(0) as? Int
+                } else {
+                    null
+                }
+                syncFloatingHost(chain.thisObject as? ViewGroup, selectedIndex)
+                return outcome
+            }
+        }
+    }
+
+    private class LauncherResumeHook(private val owner: CustomBottomBarRuntime) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            return with(owner) {
+                val outcome = chain.proceed()
+
+                applyFromActivity(chain.thisObject as? Activity)
+                return outcome
+            }
+        }
+    }
+
+    private class MainTabCreateHook(private val owner: CustomBottomBarRuntime) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            return with(owner) {
+                val outcome = chain.proceed()
+
+                applyFromActivity(findActivity(chain.thisObject))
+                return outcome
+            }
+        }
     }
 }
 

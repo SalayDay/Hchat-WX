@@ -3,8 +3,10 @@ package h.Hchat.hooks.items.customfriendavatar
 import android.app.Activity
 import android.content.Intent
 import android.net.Uri
-import de.robv.android.xposed.XC_MethodHook
-import de.robv.android.xposed.XposedBridge
+import io.github.libxposed.api.XposedInterface
+import h.Hchat.hooks.core.HookRegistry
+import h.Hchat.utils.HLog
+import h.Hchat.utils.KavaReflector
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -75,28 +77,18 @@ object CustomFriendAvatarPicker {
     private fun hookActivityResult(clazz: Class<*>) {
         if (!hookedClasses.add(clazz)) return
         runCatching {
-            XposedBridge.hookAllMethods(clazz, "onActivityResult", object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    val requestCode = param.args.getOrNull(0) as? Int ?: return
-                    val result = pending.remove(requestCode) ?: return
-                    val resultCode = param.args.getOrNull(1) as? Int ?: return
-                    val data = param.args.getOrNull(2) as? Intent
-                    val uri = data?.data
-                    if (resultCode != Activity.RESULT_OK || uri == null) {
-                        return
-                    }
-                    takeReadPermission(result.activity, data, uri)
-                    Thread({
-                        val success = CustomFriendAvatarStore.saveFromUri(
-                            result.activity,
-                            result.wxid,
-                            uri,
-                            result.trackConfiguredFriend
-                        )
-                        result.activity.runOnUiThread { result.callback(success) }
-                    }, "Hchat-CustomAvatarSave").start()
+            val handles = HookRegistry.get().hookAllMethods(clazz, "onActivityResult", AvatarResultHook())
+            val expected = KavaReflector.declaredMethods(clazz).count { it.name == "onActivityResult" }
+            if (handles.size != expected) {
+                handles.forEach { handle ->
+                    runCatching { HookRegistry.get().unhook(handle) }
+                        .onFailure { error ->
+                            HookRegistry.get().add(handle)
+                            HLog.e("[Hchat] 回滚结果 Hook 失败: ${clazz.name}#onActivityResult", error)
+                        }
                 }
-            })
+                error("结果 Hook 安装不完整: ${clazz.name}#onActivityResult ${handles.size}/$expected")
+            }
         }.onFailure { hookedClasses.remove(clazz) }
     }
 
@@ -116,4 +108,30 @@ object CustomFriendAvatarPicker {
 
     private const val REQUEST_CODE_START = 0x6A10
     private const val REQUEST_CODE_END = 0x6AFF
+
+    private class AvatarResultHook : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val outcome = chain.proceed()
+            val args = chain.args
+            val requestCode = args.getOrNull(0) as? Int ?: return outcome
+            val result = pending.remove(requestCode) ?: return outcome
+            val resultCode = args.getOrNull(1) as? Int ?: return outcome
+            val data = args.getOrNull(2) as? Intent
+            val uri = data?.data
+            if (resultCode != Activity.RESULT_OK || uri == null) {
+                return outcome
+            }
+            takeReadPermission(result.activity, data, uri)
+            Thread({
+                val success = CustomFriendAvatarStore.saveFromUri(
+                    result.activity,
+                    result.wxid,
+                    uri,
+                    result.trackConfiguredFriend
+                )
+                result.activity.runOnUiThread { result.callback(success) }
+            }, "Hchat-CustomAvatarSave").start()
+            return outcome
+        }
+    }
 }

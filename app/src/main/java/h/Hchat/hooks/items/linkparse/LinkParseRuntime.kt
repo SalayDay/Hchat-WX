@@ -13,7 +13,7 @@ import h.Hchat.hooks.api.model.WeChatMessage
 import h.Hchat.dexkit.DexMethodCache
 import h.Hchat.utils.KavaReflector
 import h.Hchat.utils.HLog
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.preferences.HchatStorage
 import java.io.File
 import java.lang.reflect.Method
@@ -124,33 +124,34 @@ internal class LinkParseRuntime(private val context: FeatureContext) {
             return false
         }
         if (cached == null) DexMethodCache.save(methodPrefs, runtimeKey, CACHE_MESSAGE_WRITE, method)
-        HookRegistry.get().hook(method, object : XC_MethodHook() {
-            override fun beforeHookedMethod(param: MethodHookParam) {
-                if (stopped) return
-                runCatching {
-                    LinkParseWriteGate.capture(settings.enabled(), param.args)?.let {
-                        param.setObjectExtra(WRITE_CAPTURE_KEY, it)
-                    }
-                }.onFailure { HLog.e("[Hchat:LinkParse] 消息写入捕获失败", it) }
-            }
-
-            override fun afterHookedMethod(param: MethodHookParam) {
-                if (param.hasThrowable() || stopped) return
-                runCatching {
-                    val capture = param.getObjectExtra(WRITE_CAPTURE_KEY) as? LinkParseWriteGate.Capture ?: return
-                    LinkParseWriteGate.observe(
-                        result = (param.result as? Number)?.toInt(),
-                        capture = capture,
-                        lookup = { id -> WeChatApis.message().store()?.getMessageById(id) },
-                        accept = ::handleMessage,
-                        onError = { HLog.e("[Hchat:LinkParse] 消息写入观察失败") }
-                    )
-                }.onFailure { HLog.e("[Hchat:LinkParse] 消息写入观察失败", it) }
-            }
-        })
+        HookRegistry.get().hook(method, MessageWriteHooker(this))
         messageWriteHookInstalled = true
         info("[Hchat:LinkParse] 消息写入观察已安装")
         return true
+    }
+
+    private class MessageWriteHooker(private val owner: LinkParseRuntime) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            if (owner.stopped) return chain.proceed()
+            val capture = runCatching {
+                LinkParseWriteGate.capture(owner.settings.enabled(), chain.args.toTypedArray())
+            }.onFailure {
+                HLog.e("[Hchat:LinkParse] 消息写入捕获失败", it)
+            }.getOrNull()
+            val result = chain.proceed()
+            if (owner.stopped) return result
+            runCatching {
+                if (capture == null) return result
+                LinkParseWriteGate.observe(
+                    result = (result as? Number)?.toInt(),
+                    capture = capture,
+                    lookup = { id -> WeChatApis.message().store()?.getMessageById(id) },
+                    accept = owner::handleMessage,
+                    onError = { HLog.e("[Hchat:LinkParse] 消息写入观察失败") }
+                )
+            }.onFailure { HLog.e("[Hchat:LinkParse] 消息写入观察失败", it) }
+            return result
+        }
     }
 
     private fun findMessageWriteMethod(): Method? {
@@ -531,7 +532,6 @@ internal class LinkParseRuntime(private val context: FeatureContext) {
         private const val HISTORY_PREFS = "Hchat_link_parse_history"
         private const val METHOD_CACHE_PREFS = "Hchat_link_parse_method_cache"
         private const val CACHE_MESSAGE_WRITE = "message_write_v1"
-        private const val WRITE_CAPTURE_KEY = "h.Hchat.link_parse.message_write_capture"
         private const val CACHE_DIR = "Hchat_link_parse"
         private const val CACHE_TTL = 6 * 60 * 60 * 1000L
         private const val MAX_CACHE_BYTES = 256L * 1024 * 1024

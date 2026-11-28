@@ -28,9 +28,7 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.Map;
 
-import de.robv.android.xposed.XC_MethodHook;
-import de.robv.android.xposed.XposedBridge;
-import de.robv.android.xposed.XposedHelpers;
+import io.github.libxposed.api.XposedInterface;
 
 import h.Hchat.dexkit.SettingsDexFinder;
 import h.Hchat.hooks.core.HookRegistry;
@@ -87,7 +85,7 @@ public class SettingsInjector {
     private final SettingsEntrySettings entrySettings;
     private final File dexCacheDir;
     private final HashSet<Class<?>> plusMenuAdapterViewHookedClasses = new HashSet<>();
-    private XC_MethodHook.Unhook contextGetStringUnhook;
+    private XposedInterface.HookHandle contextGetStringUnhook;
     private volatile Class<?> modernLocationParentClass;
     private volatile Class<?> modernLocationFrontClass;
 
@@ -174,41 +172,19 @@ public class SettingsInjector {
         try {
             // Hook SettingsUI.initView()
             // 8.0.80 起设置界面已换成 MainSettingsUI，SettingsUI 可能整个不存在；
-            // 这里判空 + 沿继承链查找（对齐旧 XposedHelpers.findMethodExact 语义），
+            // 这里判空并沿继承链查找，
             // 避免直接 getDeclaredMethod 抛异常被外层 catch 吞掉、看不出到底跳在哪一步。
             if (dex.settingsUIClass == null) {
                 logDetail("[Legacy] SettingsUI 类不存在，跳过 Legacy 注入");
                 return;
             }
-            Method initView = h.Hchat.compat.CompatHelpers.findMethodInHierarchy(
-                    dex.settingsUIClass, "initView", new Class<?>[0]);
+            Method initView = KavaReflector.findMethodRecursive(dex.settingsUIClass, "initView");
             if (initView == null) {
                 logDetail("[Legacy] SettingsUI.initView 未找到，跳过 Legacy 注入");
                 return;
             }
             initView.setAccessible(true);
-            HookRegistry.get().add(HookRegistry.get().hook(initView,
-                    new XC_MethodHook() {
-                        @Override
-                        public void afterHookedMethod(MethodHookParam param) {
-                            Activity activity = (Activity) param.thisObject;
-                            try {
-                                Constructor<?> ctor = KavaReflector.findConstructor(
-                                        dex.iconPreferenceClass, Context.class);
-                                Object prefInstance = KavaReflector.newInstance(ctor, activity);
-
-                                KavaReflector.invoke(dex.methodSetKey, prefInstance, PREFS_KEY);
-                                KavaReflector.invoke(dex.methodSetTitle, prefInstance, PREFS_TITLE);
-
-                                Object prefScreen = KavaReflector.invokeMethod(activity, "getPreferenceScreen");
-                                KavaReflector.invoke(dex.methodAddPref, prefScreen, prefInstance, 0);
-
-                                logDetail("[Legacy] 设置条目已插入");
-                            } catch (Throwable e) {
-                                h.Hchat.utils.HLog.e(TAG + " [Legacy] 插入失败: " + e.getMessage(), e);
-                            }
-                        }
-                    }));
+            HookRegistry.get().hook(initView, new LegacyInitHooker(this));
 
             // Hook onPreferenceTreeClick
             // WeKit 用 resolve().firstMethod { name = "onPreferenceTreeClick" }
@@ -222,24 +198,7 @@ public class SettingsInjector {
             }
             if (targetTreeClick != null) {
                 final Method finalTarget = targetTreeClick;
-                HookRegistry.get().hook(finalTarget, new XC_MethodHook() {
-                    @Override
-                    public void beforeHookedMethod(MethodHookParam param) {
-                        try {
-                            // WeKit: if (args.size < 2) return; val preference = args[1]
-                            if (param.args.length < 2) return;
-                            Object preference = param.args[1];
-                            if (preference == null) return;
-
-                            String key = (String) KavaReflector.invoke(dex.methodGetKey, preference);
-                            if (PREFS_KEY.equals(key)) {
-                                Activity activity = (Activity) param.thisObject;
-                                showModuleSettingsPage(activity);
-                                param.setResult(true);
-                            }
-                        } catch (Throwable ignored) {}
-                    }
-                });
+                HookRegistry.get().hook(finalTarget, new LegacyPreferenceClickHooker(this));
                 logDetail("[Legacy] onPreferenceTreeClick Hook 已安装: " + finalTarget);
             } else {
                 logDetail("[Legacy] onPreferenceTreeClick 方法未找到");
@@ -430,12 +389,7 @@ public class SettingsInjector {
             // hook proxy class 构造函数，确保 handler 被设置
             Constructor<?> proxyConstructor = KavaReflector.findConstructor(proxyClass, activityClass);
             final Constructor<?> finalProxyConstructor = proxyConstructor;
-            HookRegistry.get().hook(proxyConstructor, new XC_MethodHook() {
-                @Override
-                public void afterHookedMethod(MethodHookParam param) {
-                    ProxyBuilder.setInvocationHandler(param.thisObject, handler);
-                }
-            });
+            HookRegistry.get().hook(proxyConstructor, new SettingProxyConstructedHooker(handler));
 
             logDetail("[Modern] ProxyBuilder 代理类已创建: " + proxyClass.getName());
             modernLocationParentClass = groupSettingItemClass;
@@ -445,28 +399,9 @@ public class SettingsInjector {
             // 找到返回 SettingLocation 的方法
             for (Method m : KavaReflector.declaredMethods(childSettingItemClass)) {
                 if (m.getReturnType() == dex.settingLocationClass) {
-                    HookRegistry.get().hook(m, new XC_MethodHook(
-                            de.robv.android.xposed.callbacks.XCallback.PRIORITY_HIGHEST) {
-                        @Override
-                        public void afterHookedMethod(MethodHookParam param) {
-                            try {
-                                Object oldLocation = param.getResult();
-                                Class<?> parentClass = readSettingLocationClass(oldLocation, 0, groupSettingItemClass);
-                                Class<?> frontClass = readSettingLocationClass(oldLocation, 1, parentSettingItemClass);
-                                if (frontClass == proxyClass) {
-                                    return;
-                                }
-                                modernLocationParentClass = parentClass;
-                                modernLocationFrontClass = frontClass;
-                                logDetail("[Modern] 接入设置入口链: front="
-                                        + frontClass.getName());
-                                Object location = newSettingLocation(parentClass, proxyClass);
-                                param.setResult(location);
-                            } catch (Throwable e) {
-                                h.Hchat.utils.HLog.e(TAG + " [Modern] SettingLocation 构造失败: " + e.getMessage(), e);
-                            }
-                        }
-                    });
+                    HookRegistry.get().hook(m,
+                            new SettingLocationHooker(this, groupSettingItemClass, parentSettingItemClass, proxyClass),
+                            XposedInterface.PRIORITY_HIGHEST);
                     logDetail("[Modern] SettingGroupPersonalInfo.hook: " + m.getName());
                     break;
                 }
@@ -478,52 +413,9 @@ public class SettingsInjector {
             if (providerMethod == null) {
                 logDetail("[Modern] ClassesProvider 方法未找到，跳过 Provider 注入");
             } else {
-                HookRegistry.get().hook(providerMethod, new XC_MethodHook() {
-                    @Override
-                    public void afterHookedMethod(MethodHookParam param) {
-                        try {
-                            Map<?, ?> map = (Map<?, ?>) param.getResult();
-                            if (map == null) return;
-
-                            Map<Object, Object> patched = new LinkedHashMap<>();
-                            patched.putAll((Map<?, ?>) map);
-
-                            if (hasBaseSettingItemValue(map)) {
-                                Object activity = param.args != null && param.args.length > 0 ? param.args[0] : null;
-                                if (activity == null) return;
-                                Object item = KavaReflector.newInstance(finalProxyConstructor, activity);
-                                ProxyBuilder.setInvocationHandler(item, handler);
-                                patched.put(SETTING_ITEM_ID, item);
-                                param.setResult(patched);
-                                return;
-                            }
-
-                            Object pageKey = findSettingsPageKey(
-                                    map,
-                                    groupSettingItemClass,
-                                    parentSettingItemClass,
-                                    childSettingItemClass);
-                            if (pageKey == null) {
-                                logDetail("[Modern] 主设置页集合未找到，跳过 Provider 注入");
-                                return;
-                            }
-                            Object value = pageKey != null ? map.get(pageKey) : null;
-                            if (!(value instanceof Iterable<?>)) {
-                                logDetail("[Modern] 主设置页集合不是 Iterable，跳过 Provider 注入");
-                                return;
-                            }
-                            LinkedHashSet<Object> newSet = new LinkedHashSet<>();
-                            for (Object item : (Iterable<?>) value) {
-                                newSet.add(item);
-                            }
-                            newSet.add(finalProxyClass);
-                            patched.put(pageKey, newSet);
-                            param.setResult(patched);
-                        } catch (Throwable e) {
-                            h.Hchat.utils.HLog.e(TAG + " [Modern] ClassesProvider 注入失败: " + e.getMessage(), e);
-                        }
-                    }
-                });
+                HookRegistry.get().hook(providerMethod, new SettingClassesProviderHooker(
+                        this, finalProxyConstructor, handler, finalProxyClass,
+                        groupSettingItemClass, parentSettingItemClass, childSettingItemClass));
 
                 logDetail("[Modern] SettingItemClassesProvider 已 Hook");
             }
@@ -595,45 +487,20 @@ public class SettingsInjector {
             return;
         }
 
-        HookRegistry.get().hook(superImportMethod, new XC_MethodHook() {
-            @Override
-            public void afterHookedMethod(MethodHookParam param) {
-                try {
-                    if (mainOnly
-                            && dex.mainSettingsUIClass != null
-                            && !dex.mainSettingsUIClass.isInstance(param.thisObject)) {
-                        return;
-                    }
-
-                    @SuppressWarnings("unchecked")
-                    HashSet<Class<?>> itemClasses = (HashSet<Class<?>>) param.args[0];
-                    itemClasses.add(proxyClass);
-
-                    logDetail("[Modern] superImportUIComponents 注入完成: "
-                            + ownerClass.getName());
-                } catch (Throwable e) {
-                    h.Hchat.utils.HLog.e(TAG + " [Modern] superImportUIComponents 失败: "
-                            + ownerClass.getName() + ", " + e.getMessage(), e);
-                }
-            }
-        });
+        HookRegistry.get().hook(superImportMethod,
+                new SuperImportComponentsHooker(this, proxyClass, mainOnly, ownerClass));
         logDetail("[Modern] superImportUIComponents Hook 已安装: "
                 + ownerClass.getName());
     }
 
     private void hookTitleStringResource() {
         if (contextGetStringUnhook != null) return;
-        contextGetStringUnhook = XposedHelpers.findAndHookMethod(
-                Context.class, "getString", int.class,
-                new XC_MethodHook() {
-                    @Override
-                    public void beforeHookedMethod(MethodHookParam param) {
-                        if ((int) param.args[0] == HCHAT_SETTING_ITEM_NAME_RES_ID) {
-                            param.setResult(PREFS_TITLE);
-                        }
-                    }
-                });
-        HookRegistry.get().add(contextGetStringUnhook);
+        Method getString = KavaReflector.findMethodRecursive(Context.class, "getString", int.class);
+        if (getString == null) {
+            h.Hchat.utils.HLog.e(TAG + " Context.getString(int) 未找到");
+            return;
+        }
+        contextGetStringUnhook = HookRegistry.get().hook(getString, new SettingTitleHooker());
         logDetail("[Modern] Context.getString 标题资源 Hook 已安装");
     }
 
@@ -710,37 +577,12 @@ public class SettingsInjector {
             if (launcherClass == null) return;
 
             // Hook onCreate
-            HookRegistry.get().add(XposedHelpers.findAndHookMethod(launcherClass, "onCreate",
-                    android.os.Bundle.class,
-                    new XC_MethodHook() {
-                        @Override
-                        public void beforeHookedMethod(MethodHookParam param) {
-                            try {
-                                Activity activity = (Activity) param.thisObject;
-                                Intent intent = activity.getIntent();
-                                if (intent != null && intent.hasExtra(MODULE_TAG)) {
-                                    new Handler(Looper.getMainLooper()).postDelayed(
-                                            () -> showModuleSettingsPage(activity), 500);
-                                }
-                            } catch (Throwable ignored) {}
-                        }
-                    }));
+            Method onCreate = KavaReflector.findMethodRecursive(launcherClass, "onCreate", android.os.Bundle.class);
+            if (onCreate != null) HookRegistry.get().hook(onCreate, new LauncherCreateHooker(this));
 
             // Hook onNewIntent
-            HookRegistry.get().add(XposedHelpers.findAndHookMethod(launcherClass, "onNewIntent",
-                    Intent.class,
-                    new XC_MethodHook() {
-                        @Override
-                        public void beforeHookedMethod(MethodHookParam param) {
-                            try {
-                                Activity activity = (Activity) param.thisObject;
-                                Intent intent = (Intent) param.args[0];
-                                if (intent != null && intent.hasExtra(MODULE_TAG)) {
-                                    showModuleSettingsPage(activity);
-                                }
-                            } catch (Throwable ignored) {}
-                        }
-                    }));
+            Method onNewIntent = KavaReflector.findMethodRecursive(launcherClass, "onNewIntent", Intent.class);
+            if (onNewIntent != null) HookRegistry.get().hook(onNewIntent, new LauncherIntentHooker(this));
 
             logDetail("[LauncherUI] 已安装");
         } catch (Throwable e) {
@@ -769,20 +611,7 @@ public class SettingsInjector {
             Class<?> plusActionViewClass = KavaReflector.loadClass(
                     "com.tencent.mm.ui.HomeUI$PlusActionView", classLoader);
             if (plusActionViewClass == null) return false;
-            for (XC_MethodHook.Unhook unhook : XposedBridge.hookAllConstructors(
-                    plusActionViewClass,
-                    new XC_MethodHook() {
-                        @Override
-                        public void afterHookedMethod(MethodHookParam param) {
-                            try {
-                                markPlusView(resolvePlusActionRealView(param.thisObject));
-                            } catch (Throwable e) {
-                                h.Hchat.utils.HLog.e(TAG + " [PlusLongPress] 绑定加号入口失败: " + e.getMessage(), e);
-                            }
-                        }
-                    })) {
-                HookRegistry.get().add(unhook);
-            }
+            HookRegistry.get().hookAllConstructors(plusActionViewClass, new PlusActionConstructedHooker(this));
             return true;
         } catch (Throwable e) {
             logDetail("[PlusLongPress] PlusActionView 直接 Hook 不可用: " + e.getMessage());
@@ -856,52 +685,9 @@ public class SettingsInjector {
         }
 
         try {
-            HookRegistry.get().hook(dex.plusSubMenuAdapterMethod, new XC_MethodHook() {
-                @Override
-                public void afterHookedMethod(MethodHookParam param) {
-                    try {
-                        BaseAdapter adapter = param.getResult() instanceof BaseAdapter
-                                ? (BaseAdapter) param.getResult()
-                                : null;
-                        appendEnabledPlusMenuItems(param.thisObject, adapter);
-                    } catch (Throwable e) {
-                        h.Hchat.utils.HLog.e(TAG + " [PlusMenu] 添加入口失败: " + e.getMessage(), e);
-                    }
-                }
-            });
+            HookRegistry.get().hook(dex.plusSubMenuAdapterMethod, new PlusMenuAdapterHooker(this));
 
-            HookRegistry.get().hook(dex.plusSubMenuOnItemClickMethod, new XC_MethodHook() {
-                @Override
-                public void beforeHookedMethod(MethodHookParam param) {
-                    try {
-                        if (param.args == null || param.args.length < 3) return;
-                        int position = (int) param.args[2];
-                        int itemId = readPlusMenuItemId(param.thisObject, position);
-                        if (itemId == Integer.MIN_VALUE) {
-                            return;
-                        }
-
-                        param.setResult(null);
-                        dismissPlusMenu(param.thisObject);
-                        if (itemId == QUICK_TERMINATE_PLUS_MENU_ID) {
-                            QuickTerminateRuntime.terminateCurrentProcess();
-                            return;
-                        }
-
-                        Context context = findContextFieldValue(param.thisObject);
-                        if (context == null) return;
-                        if (itemId == HCHAT_PLUS_MENU_ID) {
-                            showModuleSettingsPage(context);
-                        } else if (itemId == PLUGIN_AGENT_PLUS_MENU_ID) {
-                            showScriptPluginAgentPage(context);
-                        } else if (itemId == QUICK_READ_PLUS_MENU_ID) {
-                            QuickMarkReadRuntime.markAllRead(context, true);
-                        }
-                    } catch (Throwable e) {
-                        h.Hchat.utils.HLog.e(TAG + " [PlusMenu] 处理菜单点击失败: " + e.getMessage(), e);
-                    }
-                }
-            });
+            HookRegistry.get().hook(dex.plusSubMenuOnItemClickMethod, new PlusMenuClickHooker(this));
 
             hookPlusMenuPopulateAndShowMethods(dex.plusSubMenuHelperClass);
 
@@ -1229,23 +1015,7 @@ public class SettingsInjector {
             if (plusMenuAdapterViewHookedClasses.contains(adapterClass)) return;
             Method getViewMethod = findAdapterGetViewMethod(adapterClass);
             if (getViewMethod == null) return;
-            HookRegistry.get().hook(getViewMethod, new XC_MethodHook() {
-                @Override
-                public void afterHookedMethod(MethodHookParam param) {
-                    try {
-                        if (param.args == null || param.args.length < 1) return;
-                        Object result = param.getResult();
-                        if (!(result instanceof View)) return;
-                        int position = (int) param.args[0];
-                        Object helper = findPlusMenuHelperFieldValue(param.thisObject);
-                        int itemId = readPlusMenuItemId(helper, position);
-                        if (itemId == Integer.MIN_VALUE) return;
-                        applyPlusMenuIcon((View) result, itemId);
-                    } catch (Throwable e) {
-                        h.Hchat.utils.HLog.e(TAG + " [PlusMenu] 设置菜单图标失败: " + e.getMessage(), e);
-                    }
-                }
-            });
+            HookRegistry.get().hook(getViewMethod, new PlusMenuRowHooker(this));
             plusMenuAdapterViewHookedClasses.add(adapterClass);
         }
     }
@@ -1308,22 +1078,12 @@ public class SettingsInjector {
         HashSet<Method> methods = new HashSet<>();
         for (Method populateMethod : findPlusMenuPopulateMethods(helperClass)) {
             if (!methods.add(populateMethod)) continue;
-            HookRegistry.get().hook(populateMethod, new XC_MethodHook() {
-                @Override
-                public void afterHookedMethod(MethodHookParam param) {
-                    appendPlusMenuItemSafely(param.thisObject);
-                }
-            });
+            HookRegistry.get().hook(populateMethod, new PlusMenuPopulateHooker(this));
         }
 
         for (Method showMethod : findPlusMenuBaseShowMethods(helperClass)) {
             if (!methods.add(showMethod)) continue;
-            HookRegistry.get().hook(showMethod, new XC_MethodHook() {
-                @Override
-                public void beforeHookedMethod(MethodHookParam param) {
-                    appendPlusMenuItemSafely(param.thisObject);
-                }
-            });
+            HookRegistry.get().hook(showMethod, new PlusMenuShowHooker(this));
         }
     }
 
@@ -1451,9 +1211,310 @@ public class SettingsInjector {
         SettingsUI.showScriptPluginAgent(context);
     }
 
+    private static final class LegacyInitHooker implements XposedInterface.Hooker {
+        private final SettingsInjector owner;
+        private LegacyInitHooker(SettingsInjector owner) { this.owner = owner; }
+        @Override
+        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+            Object result = chain.proceed();
+            try {
+                Activity activity = (Activity) chain.getThisObject();
+                Constructor<?> ctor = KavaReflector.findConstructor(owner.dex.iconPreferenceClass, Context.class);
+                Object preference = KavaReflector.newInstance(ctor, activity);
+                KavaReflector.invoke(owner.dex.methodSetKey, preference, PREFS_KEY);
+                KavaReflector.invoke(owner.dex.methodSetTitle, preference, PREFS_TITLE);
+                Object screen = KavaReflector.invokeMethod(activity, "getPreferenceScreen");
+                KavaReflector.invoke(owner.dex.methodAddPref, screen, preference, 0);
+                owner.logDetail("[Legacy] 设置条目已插入");
+            } catch (Throwable e) {
+                h.Hchat.utils.HLog.e(TAG + " [Legacy] 插入失败: " + e.getMessage(), e);
+            }
+            return result;
+        }
+    }
+
+    private static final class LegacyPreferenceClickHooker implements XposedInterface.Hooker {
+        private final SettingsInjector owner;
+        private LegacyPreferenceClickHooker(SettingsInjector owner) { this.owner = owner; }
+        @Override
+        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+            try {
+                if (chain.getArgs().size() >= 2) {
+                    Object preference = chain.getArg(1);
+                    if (preference != null) {
+                        String key = (String) KavaReflector.invoke(owner.dex.methodGetKey, preference);
+                        if (PREFS_KEY.equals(key)) {
+                            owner.showModuleSettingsPage((Activity) chain.getThisObject());
+                            return Boolean.TRUE;
+                        }
+                    }
+                }
+            } catch (Throwable e) {
+                h.Hchat.utils.HLog.e(TAG + " [Legacy] 处理设置点击失败", e);
+            }
+            return chain.proceed();
+        }
+    }
+
+    private static final class SettingProxyConstructedHooker implements XposedInterface.Hooker {
+        private final InvocationHandler handler;
+        private SettingProxyConstructedHooker(InvocationHandler handler) { this.handler = handler; }
+        @Override
+        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+            Object result = chain.proceed();
+            ProxyBuilder.setInvocationHandler(chain.getThisObject(), handler);
+            return result;
+        }
+    }
+
+    private static final class SettingLocationHooker implements XposedInterface.Hooker {
+        private final SettingsInjector owner;
+        private final Class<?> groupClass;
+        private final Class<?> parentClass;
+        private final Class<?> proxyClass;
+        private SettingLocationHooker(SettingsInjector owner, Class<?> groupClass, Class<?> parentClass, Class<?> proxyClass) {
+            this.owner = owner; this.groupClass = groupClass; this.parentClass = parentClass; this.proxyClass = proxyClass;
+        }
+        @Override
+        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+            Object result = chain.proceed();
+            try {
+                Class<?> parent = owner.readSettingLocationClass(result, 0, groupClass);
+                Class<?> front = owner.readSettingLocationClass(result, 1, parentClass);
+                if (front == proxyClass) return result;
+                owner.modernLocationParentClass = parent;
+                owner.modernLocationFrontClass = front;
+                owner.logDetail("[Modern] 接入设置入口链: front=" + front.getName());
+                return owner.newSettingLocation(parent, proxyClass);
+            } catch (Throwable e) {
+                h.Hchat.utils.HLog.e(TAG + " [Modern] SettingLocation 构造失败: " + e.getMessage(), e);
+                return result;
+            }
+        }
+    }
+
+    private static final class SettingClassesProviderHooker implements XposedInterface.Hooker {
+        private final SettingsInjector owner;
+        private final Constructor<?> constructor;
+        private final InvocationHandler handler;
+        private final Class<?> proxyClass;
+        private final Class<?> groupClass;
+        private final Class<?> parentClass;
+        private final Class<?> childClass;
+        private SettingClassesProviderHooker(SettingsInjector owner, Constructor<?> constructor,
+                InvocationHandler handler, Class<?> proxyClass, Class<?> groupClass, Class<?> parentClass, Class<?> childClass) {
+            this.owner = owner; this.constructor = constructor; this.handler = handler; this.proxyClass = proxyClass;
+            this.groupClass = groupClass; this.parentClass = parentClass; this.childClass = childClass;
+        }
+        @Override
+        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+            Object result = chain.proceed();
+            try {
+                if (!(result instanceof Map<?, ?>)) return result;
+                Map<?, ?> map = (Map<?, ?>) result;
+                Map<Object, Object> patched = new LinkedHashMap<>();
+                patched.putAll(map);
+                if (owner.hasBaseSettingItemValue(map)) {
+                    Object activity = chain.getArgs().isEmpty() ? null : chain.getArg(0);
+                    if (activity == null) return result;
+                    Object item = KavaReflector.newInstance(constructor, activity);
+                    ProxyBuilder.setInvocationHandler(item, handler);
+                    patched.put(SETTING_ITEM_ID, item);
+                    return patched;
+                }
+                Object pageKey = owner.findSettingsPageKey(map, groupClass, parentClass, childClass);
+                if (pageKey == null) {
+                    owner.logDetail("[Modern] 主设置页集合未找到，跳过 Provider 注入");
+                    return result;
+                }
+                Object value = map.get(pageKey);
+                if (!(value instanceof Iterable<?>)) {
+                    owner.logDetail("[Modern] 主设置页集合不是 Iterable，跳过 Provider 注入");
+                    return result;
+                }
+                LinkedHashSet<Object> newSet = new LinkedHashSet<>();
+                for (Object item : (Iterable<?>) value) newSet.add(item);
+                newSet.add(proxyClass);
+                patched.put(pageKey, newSet);
+                return patched;
+            } catch (Throwable e) {
+                h.Hchat.utils.HLog.e(TAG + " [Modern] ClassesProvider 注入失败: " + e.getMessage(), e);
+                return result;
+            }
+        }
+    }
+
+    private static final class SuperImportComponentsHooker implements XposedInterface.Hooker {
+        private final SettingsInjector owner;
+        private final Class<?> proxyClass;
+        private final boolean mainOnly;
+        private final Class<?> ownerClass;
+        private SuperImportComponentsHooker(SettingsInjector owner, Class<?> proxyClass, boolean mainOnly, Class<?> ownerClass) {
+            this.owner = owner; this.proxyClass = proxyClass; this.mainOnly = mainOnly; this.ownerClass = ownerClass;
+        }
+        @Override
+        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+            Object result = chain.proceed();
+            try {
+                if (mainOnly && owner.dex.mainSettingsUIClass != null
+                        && !owner.dex.mainSettingsUIClass.isInstance(chain.getThisObject())) return result;
+                @SuppressWarnings("unchecked")
+                HashSet<Class<?>> itemClasses = (HashSet<Class<?>>) chain.getArg(0);
+                itemClasses.add(proxyClass);
+                owner.logDetail("[Modern] superImportUIComponents 注入完成: " + ownerClass.getName());
+            } catch (Throwable e) {
+                h.Hchat.utils.HLog.e(TAG + " [Modern] superImportUIComponents 失败: " + ownerClass.getName(), e);
+            }
+            return result;
+        }
+    }
+
+    private static final class SettingTitleHooker implements XposedInterface.Hooker {
+        @Override
+        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+            if ((int) chain.getArg(0) == HCHAT_SETTING_ITEM_NAME_RES_ID) return PREFS_TITLE;
+            return chain.proceed();
+        }
+    }
+
+    private static final class LauncherCreateHooker implements XposedInterface.Hooker {
+        private final SettingsInjector owner;
+        private LauncherCreateHooker(SettingsInjector owner) { this.owner = owner; }
+        @Override
+        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+            try {
+                Activity activity = (Activity) chain.getThisObject();
+                Intent intent = activity.getIntent();
+                if (intent != null && intent.hasExtra(MODULE_TAG)) {
+                    new Handler(Looper.getMainLooper()).postDelayed(() -> owner.showModuleSettingsPage(activity), 500);
+                }
+            } catch (Throwable e) {
+                h.Hchat.utils.HLog.e(TAG + " [LauncherUI] 处理启动入口失败", e);
+            }
+            return chain.proceed();
+        }
+    }
+
+    private static final class LauncherIntentHooker implements XposedInterface.Hooker {
+        private final SettingsInjector owner;
+        private LauncherIntentHooker(SettingsInjector owner) { this.owner = owner; }
+        @Override
+        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+            try {
+                Activity activity = (Activity) chain.getThisObject();
+                Intent intent = (Intent) chain.getArg(0);
+                if (intent != null && intent.hasExtra(MODULE_TAG)) owner.showModuleSettingsPage(activity);
+            } catch (Throwable e) {
+                h.Hchat.utils.HLog.e(TAG + " [LauncherUI] 处理Intent入口失败", e);
+            }
+            return chain.proceed();
+        }
+    }
+
+    private static final class PlusActionConstructedHooker implements XposedInterface.Hooker {
+        private final SettingsInjector owner;
+        private PlusActionConstructedHooker(SettingsInjector owner) { this.owner = owner; }
+        @Override
+        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+            Object result = chain.proceed();
+            try {
+                owner.markPlusView(owner.resolvePlusActionRealView(chain.getThisObject()));
+            } catch (Throwable e) {
+                h.Hchat.utils.HLog.e(TAG + " [PlusLongPress] 绑定加号入口失败: " + e.getMessage(), e);
+            }
+            return result;
+        }
+    }
+
+    private static final class PlusMenuAdapterHooker implements XposedInterface.Hooker {
+        private final SettingsInjector owner;
+        private PlusMenuAdapterHooker(SettingsInjector owner) { this.owner = owner; }
+        @Override
+        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+            Object result = chain.proceed();
+            try {
+                owner.appendEnabledPlusMenuItems(chain.getThisObject(), result instanceof BaseAdapter ? (BaseAdapter) result : null);
+            } catch (Throwable e) {
+                h.Hchat.utils.HLog.e(TAG + " [PlusMenu] 添加入口失败: " + e.getMessage(), e);
+            }
+            return result;
+        }
+    }
+
+    private static final class PlusMenuClickHooker implements XposedInterface.Hooker {
+        private final SettingsInjector owner;
+        private PlusMenuClickHooker(SettingsInjector owner) { this.owner = owner; }
+        @Override
+        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+            boolean handled = false;
+            try {
+                if (chain.getArgs().size() >= 3) {
+                    int itemId = owner.readPlusMenuItemId(chain.getThisObject(), (int) chain.getArg(2));
+                    if (itemId != Integer.MIN_VALUE) {
+                        handled = true;
+                        owner.dismissPlusMenu(chain.getThisObject());
+                        if (itemId == QUICK_TERMINATE_PLUS_MENU_ID) {
+                            QuickTerminateRuntime.terminateCurrentProcess();
+                        } else {
+                            Context context = owner.findContextFieldValue(chain.getThisObject());
+                            if (context != null) {
+                                if (itemId == HCHAT_PLUS_MENU_ID) owner.showModuleSettingsPage(context);
+                                else if (itemId == PLUGIN_AGENT_PLUS_MENU_ID) owner.showScriptPluginAgentPage(context);
+                                else if (itemId == QUICK_READ_PLUS_MENU_ID) QuickMarkReadRuntime.markAllRead(context, true);
+                            }
+                        }
+                    }
+                }
+            } catch (Throwable e) {
+                h.Hchat.utils.HLog.e(TAG + " [PlusMenu] 处理菜单点击失败: " + e.getMessage(), e);
+            }
+            return handled ? null : chain.proceed();
+        }
+    }
+
+    private static final class PlusMenuRowHooker implements XposedInterface.Hooker {
+        private final SettingsInjector owner;
+        private PlusMenuRowHooker(SettingsInjector owner) { this.owner = owner; }
+        @Override
+        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+            Object result = chain.proceed();
+            try {
+                if (!chain.getArgs().isEmpty() && result instanceof View) {
+                    Object helper = owner.findPlusMenuHelperFieldValue(chain.getThisObject());
+                    int itemId = owner.readPlusMenuItemId(helper, (int) chain.getArg(0));
+                    if (itemId != Integer.MIN_VALUE) owner.applyPlusMenuIcon((View) result, itemId);
+                }
+            } catch (Throwable e) {
+                h.Hchat.utils.HLog.e(TAG + " [PlusMenu] 设置菜单图标失败: " + e.getMessage(), e);
+            }
+            return result;
+        }
+    }
+
+    private static final class PlusMenuPopulateHooker implements XposedInterface.Hooker {
+        private final SettingsInjector owner;
+        private PlusMenuPopulateHooker(SettingsInjector owner) { this.owner = owner; }
+        @Override
+        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+            Object result = chain.proceed();
+            owner.appendPlusMenuItemSafely(chain.getThisObject());
+            return result;
+        }
+    }
+
+    private static final class PlusMenuShowHooker implements XposedInterface.Hooker {
+        private final SettingsInjector owner;
+        private PlusMenuShowHooker(SettingsInjector owner) { this.owner = owner; }
+        @Override
+        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+            owner.appendPlusMenuItemSafely(chain.getThisObject());
+            return chain.proceed();
+        }
+    }
+
     private void logDetail(String message) {
         if (verbose()) {
-            XposedBridge.log(TAG + " " + message);
+            h.Hchat.utils.HLog.e(TAG + " " + message);
         }
     }
 }

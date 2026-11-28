@@ -19,7 +19,7 @@ import android.widget.Adapter
 import android.widget.AdapterView
 import android.widget.TextView
 import android.widget.Toast
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.dexkit.DexMethodCache
 import h.Hchat.hooks.api.core.WeChatApis
 import h.Hchat.hooks.api.conversation.WeChatConversationChangeApi
@@ -184,99 +184,20 @@ object ConversationGroupRuntime {
         }
         initializeRuntime(context)
         val generation = lifecycleGeneration.get()
-        val queryInstalled = hook(query, object : XC_MethodHook() {
-            override fun afterHookedMethod(param: MethodHookParam) {
-                if (isExpandingShareRecentQuery()) return
-                captureConversationStorage(param.thisObject, parentUpdate, context.hostContext(), generation)
-                if (!ConversationGroupStore.isEnabled(context.hostContext())) return
-                val cursor = param.result as? Cursor ?: return
-                if (isShareRecentQuery()) {
-                    val groupedIds = shareGroupedConversationIds(context.hostContext())
-                    val expanded = expandShareRecentQuery(query, param, 2, groupedIds)
-                    param.result = flattenShareRecentCursor(cursor, expanded, groupedIds)
-                    return
-                }
-                val rootGroups = ConversationGroupStore.load(context.hostContext())
-                    .filter { it.parentId == null }
-                param.result = reorderVirtualGroupRows(filterProjectedOfficialRows(context.hostContext(), cursor), rootGroups)
-            }
-        })
+        val queryInstalled = hook(query, ConversationQueryHook(query, parentUpdate, context, generation))
         val shareRecentAdapterInstalled = hook(
             shareRecentAdapterReset,
-            object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    enterShareRecentQuery()
-                }
-
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    leaveShareRecentQuery()
-                }
-            }
+            ShareRecentAdapterHook()
         )
         val shareRecentForwardQueryInstalled = hook(
             shareRecentForwardQuery,
-            object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    if (isExpandingShareRecentQuery() || !isShareRecentQuery() ||
-                        !ConversationGroupStore.isEnabled(context.hostContext())
-                    ) {
-                        return
-                    }
-                    val cursor = param.result as? Cursor ?: return
-                    val groupedIds = shareGroupedConversationIds(context.hostContext())
-                    val expanded = expandShareRecentQuery(
-                        shareRecentForwardQuery,
-                        param,
-                        3,
-                        groupedIds,
-                        candidateListArgumentIndex = 0
-                    )
-                    param.result = flattenShareRecentCursor(cursor, expanded, groupedIds)
-                }
-            }
+            ShareRecentForwardQueryHook(shareRecentForwardQuery, context)
         )
         val clickInstalled = hook(click, groupClickHook())
-        val nativeGroupQueryInstalled = hook(nativeGroupQuery, object : XC_MethodHook() {
-            override fun beforeHookedMethod(param: MethodHookParam) {
-                val parent = nativeGroupQueryParent.get()?.takeIf(::isVirtualTalker) ?: return
-                if (param.args?.getOrNull(2) == NATIVE_GROUP_REFRESH_ANCHOR) {
-                    param.args[0] = 0
-                    param.args[2] = parent
-                }
-            }
-
-            override fun afterHookedMethod(param: MethodHookParam) {
-                val parent = nativeGroupQueryParent.get()?.takeIf(::isVirtualTalker) ?: return
-                val cursor = param.result as? Cursor ?: return
-                val excluded = (param.args?.getOrNull(1) as? List<*>)
-                    .orEmpty().filterIsInstance<String>().toSet()
-                val limit = param.args?.getOrNull(3) as? Int ?: 0
-                val merged = if (param.args?.getOrNull(0) == 0) {
-                    mergeProjectedOfficialRows(context.hostContext(), parent, cursor, excluded, limit)
-                } else cursor
-                param.result = reorderNativeGroupCursor(context.hostContext(), parent, merged)
-            }
-        })
+        val nativeGroupQueryInstalled = hook(nativeGroupQuery, NativeGroupQueryHook(context))
         val nativeGroupClickInstalled = hook(nativeGroupClick, nativeGroupClickHook())
-        val nativeGroupRefreshInstalled = hook(nativeGroupRefresh, object : XC_MethodHook() {
-            override fun beforeHookedMethod(param: MethodHookParam) {
-                nativeGroupQueryParent.remove()
-                nativeGroupAdapterParents[param.thisObject]
-                    ?.takeIf(::isVirtualTalker)
-                    ?.let(nativeGroupQueryParent::set)
-            }
-
-            override fun afterHookedMethod(param: MethodHookParam) {
-                nativeGroupQueryParent.remove()
-            }
-        })
-        val nativeGroupMarkReadInstalled = hook(nativeGroupMarkRead, object : XC_MethodHook() {
-            override fun beforeHookedMethod(param: MethodHookParam) {
-                if (isVirtualTalker(param.args?.getOrNull(0) as? String)) {
-                    param.setResult(false)
-                }
-            }
-        })
+        val nativeGroupRefreshInstalled = hook(nativeGroupRefresh, NativeGroupRefreshHook())
+        val nativeGroupMarkReadInstalled = hook(nativeGroupMarkRead, NativeGroupMarkReadHook())
         val nativeSetPinnedInstalled = hook(
             nativeSetPinned,
             nativeGroupPinnedHook(context.hostContext(), pinned = true)
@@ -290,43 +211,23 @@ object ConversationGroupRuntime {
             nativeHideConversationHook(nativeHideConversation)
         )
         val nativeGroupStatusInstalled = nativeGroupStatusNotify?.let { method ->
-            hook(method, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    if (isVirtualTalker(nativeGroupPageParent.get()) &&
-                        param.args?.getOrNull(0) == NATIVE_GROUP_PLACEHOLDER
-                    ) {
-                        param.setResult(null)
-                    }
-                }
-            })
+            hook(method, NativeGroupStatusHook())
         } ?: true
         val nativePageInstalled = installNativeGroupPageHooks(context)
         nativeGroupMenuMethods?.let { methods ->
             val clickInstalled = hook(
                 methods.click,
-                object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        handleNativeGroupChildMenuClick(param)
-                    }
-                }
+                NativeChildMenuClickHook()
             )
             val createInstalled = clickInstalled && hook(
                 methods.create,
-                object : XC_MethodHook() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        appendNativeGroupChildMenu(param)
-                    }
-                }
+                NativeChildMenuHook()
             )
             if (!clickInstalled || !createInstalled) {
                 HLog.e("$TAG 微信原生分组长按菜单 Hook 安装不完整，已保留原生菜单")
             }
         }
-        val conversationMenuInstalled = hook(conversationMenu, object : XC_MethodHook() {
-            override fun afterHookedMethod(param: MethodHookParam) {
-                addConversationGroupMenuItem(param)
-            }
-        })
+        val conversationMenuInstalled = hook(conversationMenu, ConversationMenuHook())
         return homeProjectionInstalled && queryInstalled && shareRecentAdapterInstalled &&
             shareRecentForwardQueryInstalled && clickInstalled &&
             nativeGroupQueryInstalled && nativeGroupClickInstalled && nativeGroupRefreshInstalled &&
@@ -496,82 +397,18 @@ object ConversationGroupRuntime {
         syncAsync(context.hostContext())
     }
 
-    private fun groupClickHook(): XC_MethodHook {
-        return object : XC_MethodHook() {
-            override fun beforeHookedMethod(param: MethodHookParam) {
-                val adapter = param.args?.getOrNull(0) as? AdapterView<*> ?: return
-                val view = param.args?.getOrNull(1) as? View ?: return
-                val position = param.args?.getOrNull(2) as? Int ?: return
-                val item = runCatching { adapter.getItemAtPosition(position) }.getOrNull() ?: return
-                val talker = virtualTalkerFromItem(item) ?: return
-                val activity = findActivity(view.context) ?: return
-                param.setResult(null)
-                main.post {
-                    val groupId = ConversationGroupStore.load(activity)
-                        .firstOrNull { virtualTalker(it.id) == talker }
-                        ?.id ?: return@post
-                    showGroup(activity, groupId)
-                }
-            }
-        }
+    private fun groupClickHook(): XposedInterface.Hooker {
+        return GroupClickHook()
     }
 
-    private fun nativeGroupPinnedHook(context: Context, pinned: Boolean): XC_MethodHook {
-        return object : XC_MethodHook() {
-            override fun afterHookedMethod(param: MethodHookParam) {
-                if (param.result as? Boolean != true) return
-                val talker = param.args?.getOrNull(0) as? String
-                if (!isVirtualTalker(talker)) return
-                val group = ConversationGroupStore.load(context)
-                    .firstOrNull { virtualTalker(it.id) == talker }
-                    ?: return
-                if (group.pinned == pinned) return
-                if (!ConversationGroupStore.updateGroup(context, group.copy(pinned = pinned))) {
-                    HLog.e("$TAG 同步微信原生分组置顶状态失败: talker=$talker pinned=$pinned")
-                }
-            }
-        }
+    private fun nativeGroupPinnedHook(context: Context, pinned: Boolean): XposedInterface.Hooker {
+        return NativeGroupPinnedHook(context, pinned)
     }
 
-    private fun nativeHideConversationHook(method: Method): XC_MethodHook {
-        return object : XC_MethodHook() {
-            override fun beforeHookedMethod(param: MethodHookParam) {
-                val talker = (param.args?.getOrNull(0) as? String)?.trim().orEmpty()
-                if (talker.isEmpty() || isVirtualTalker(talker)) return
-                val parent = WeChatApis.database()?.queryFirstString(
-                    "SELECT IFNULL(parentRef,'') AS parentRef " +
-                        "FROM rconversation WHERE username=? LIMIT 1",
-                    arrayOf(talker),
-                    "parentRef"
-                ).orEmpty()
-                if (!isVirtualTalker(parent)) return
-
-                if (WeChatApis.conversations()?.deleteConversation(talker) == true) {
-                    param.setResult(null)
-                } else {
-                    HLog.e(
-                        "$TAG 隐藏分组会话失败，继续执行微信原逻辑: " +
-                            "talker=$talker method=${method.toGenericString()}"
-                    )
-                }
-            }
-        }
+    private fun nativeHideConversationHook(method: Method): XposedInterface.Hooker {
+        return NativeHideConversationHook(method)
     }
 
-    private fun addConversationGroupMenuItem(param: XC_MethodHook.MethodHookParam) {
-        val menu = param.args?.getOrNull(0) as? ContextMenu ?: return
-        val view = param.args?.getOrNull(1) as? View ?: return
-        val activity = findActivity(view.context) ?: return
-        if (!ConversationGroupStore.isEnabled(activity)) return
-        if (!installConversationMenuClickHook(param.thisObject)) return
-        val talker = conversationMenuTalker(param.thisObject) ?: return
-
-        menu.removeItem(MENU_ITEM_ID)
-        val groupId = runCatching { menu.getItem(0).groupId }.getOrDefault(0)
-        val item = menu.add(groupId, MENU_ITEM_ID, 0, MENU_TITLE)
-        moveMenuItemToFront(menu, item)
-        menuBindings[item] = ConversationMenuTarget(activity, talker)
-    }
 
     private fun installConversationMenuClickHook(listener: Any?): Boolean {
         listener ?: return false
@@ -591,24 +428,7 @@ object ConversationGroupRuntime {
                 candidate.returnType == Void.TYPE &&
                     candidate.declaringClass.name.startsWith("com.tencent.mm.ui.conversation.")
             } ?: return false
-        return hook(method, object : XC_MethodHook() {
-            override fun beforeHookedMethod(param: MethodHookParam) {
-                val item = param.args?.getOrNull(0) as? MenuItem ?: return
-                if (item.itemId != MENU_ITEM_ID) return
-                val target = menuBindings.remove(item) ?: return
-                param.setResult(null)
-                main.post {
-                    val activity = target.activity.get() ?: return@post
-                    if (!activity.isFinishing && !activity.isDestroyed) {
-                        ConversationGroupQuickDialog.show(
-                            activity = activity,
-                            talker = target.talker,
-                            onChanged = { syncAsync(activity) }
-                        )
-                    }
-                }
-            }
-        })
+        return hook(method, ConversationMenuClickHook())
     }
 
     private fun conversationMenuTalker(listener: Any?): String? {
@@ -660,35 +480,8 @@ object ConversationGroupRuntime {
         }
     }
 
-    private fun nativeGroupClickHook(): XC_MethodHook {
-        return object : XC_MethodHook() {
-            override fun beforeHookedMethod(param: MethodHookParam) {
-                val fragment = nativeGroupFragmentFromListener(param.thisObject) ?: return
-                if (!isVirtualGroupFragment(fragment)) return
-                val adapter = param.args?.getOrNull(0) as? AdapterView<*> ?: return
-                val view = param.args?.getOrNull(1) as? View ?: return
-                val position = param.args?.getOrNull(2) as? Int ?: return
-                val item = runCatching { adapter.getItemAtPosition(position) }.getOrNull() ?: return
-                val talker = conversationTalkerFromItem(item)
-                val activity = findActivity(view.context) ?: return
-                param.setResult(null)
-                if (talker.isNullOrBlank()) {
-                    HLog.e("$TAG 微信原生分组列表无法解析会话: item=${item.javaClass.name}")
-                    return
-                }
-                main.post {
-                    val child = ConversationGroupStore.load(activity)
-                        .firstOrNull { virtualTalker(it.id) == talker }
-                    if (child != null) {
-                        showGroup(activity, child.id)
-                    } else if (!openNativeGroupConversation(fragment, talker) &&
-                        WeChatApis.conversations()?.openChat(talker) != true
-                    ) {
-                        HLog.e("$TAG 打开分组内会话失败: talker=$talker")
-                    }
-                }
-            }
-        }
+    private fun nativeGroupClickHook(): XposedInterface.Hooker {
+        return NativeGroupClickHook()
     }
 
     private fun showGroup(activity: Activity, groupId: String) {
@@ -722,48 +515,11 @@ object ConversationGroupRuntime {
             "getStringExtra",
             String::class.java
         ) ?: return false
-        val parentExtraInstalled = hook(getStringExtra, object : XC_MethodHook() {
-            override fun beforeHookedMethod(param: MethodHookParam) {
-                if (param.thisObject?.javaClass?.name != NATIVE_GROUP_FRAGMENT ||
-                    param.args?.getOrNull(0) != CONTACT_USER_EXTRA
-                ) {
-                    return
-                }
-                val activity = (KavaReflector.invokeMethod(param.thisObject, "getActivity")
-                    ?: KavaReflector.invokeMethod(param.thisObject, "thisActivity")) as? Activity
-                    ?: return
-                val talker = activity.intent?.getStringExtra(CONTACT_USER_EXTRA)
-                    ?.takeIf(::isVirtualTalker) ?: return
-                param.setResult(talker)
-            }
-        })
-        val lifecycleInstalled = hook(lifecycle, object : XC_MethodHook() {
-            override fun afterHookedMethod(param: MethodHookParam) {
-                customizeNativeGroupPage(param.thisObject, context.hostContext())
-            }
-        })
+        val parentExtraInstalled = hook(getStringExtra, NativeParentExtraHook())
+        val lifecycleInstalled = hook(lifecycle, NativeGroupCreatedHook(context))
         val lifecycleContextInstalled = listOf("onPause", "onResume").all { name ->
             val method = KavaReflector.findDeclaredMethod(fragmentClass, name) ?: return@all false
-            hook(method, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    nativeGroupPageParent.remove()
-                    nativeGroupTalker(param.thisObject)?.let(nativeGroupPageParent::set)
-                }
-
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    try {
-                        if (name == "onResume") {
-                            // A read update can happen while the child chat is open and
-                            // may finish outside the group page lifecycle callback.
-                            syncAsync(context.hostContext())
-                            updateNativeGroupUnread(param.thisObject)
-                            updateNativeGroupTitle(param.thisObject, context.hostContext())
-                        }
-                    } finally {
-                        nativeGroupPageParent.remove()
-                    }
-                }
-            })
+            hook(method, NativeGroupPageLifecycleHook(name, context))
         }
         if (!parentExtraInstalled || !lifecycleInstalled || !lifecycleContextInstalled) {
             HLog.e("$TAG 微信原生分组页面 Hook 安装不完整: fragment=$NATIVE_GROUP_FRAGMENT")
@@ -902,149 +658,6 @@ object ConversationGroupRuntime {
             callback.onItemLongClick(parent, view, position, id)
     }
 
-    private fun appendNativeGroupChildMenu(param: XC_MethodHook.MethodHookParam) {
-        val target = nativeGroupLongClickTarget.get() ?: return
-        if (target.talker.isBlank() || isVirtualTalker(target.talker)) return
-        val menu = param.args?.getOrNull(0) as? ContextMenu ?: return
-        val activity = target.activity.get() ?: return
-        val group = ConversationGroupStore.load(activity)
-            .firstOrNull { it.id == target.groupId }
-            ?: return
-        menu.removeItem(CHILD_MENU_REMOVE_ID)
-        menu.removeItem(CHILD_MENU_MOVE_ID)
-        menu.removeItem(CHILD_MENU_PIN_ID)
-        menu.removeItem(CHILD_MENU_BOTTOM_ID)
-        if (target.talker in group.conversationIds) {
-            val removeItem = menu.add(0, CHILD_MENU_REMOVE_ID, menu.size(), "移出")
-            val moveItem = menu.add(0, CHILD_MENU_MOVE_ID, menu.size(), "移至")
-            val pinned = target.talker in group.pinnedConversationIds
-            val bottom = target.talker in group.bottomConversationIds
-            val pinItem = menu.add(
-                0,
-                CHILD_MENU_PIN_ID,
-                menu.size(),
-                if (pinned) "取消置顶" else "置顶聊天"
-            )
-            val bottomItem = menu.add(
-                0,
-                CHILD_MENU_BOTTOM_ID,
-                menu.size(),
-                if (bottom) "取消置底" else "置底聊天"
-            )
-            nativeGroupMenuBindings[removeItem] = NativeGroupMenuTarget(
-                target,
-                NativeGroupMenuAction.REMOVE
-            )
-            nativeGroupMenuBindings[moveItem] = NativeGroupMenuTarget(
-                target,
-                NativeGroupMenuAction.MOVE
-            )
-            nativeGroupMenuBindings[pinItem] = NativeGroupMenuTarget(
-                target,
-                if (pinned) NativeGroupMenuAction.UNPIN else NativeGroupMenuAction.PIN
-            )
-            nativeGroupMenuBindings[bottomItem] = NativeGroupMenuTarget(
-                target,
-                if (bottom) NativeGroupMenuAction.UNBOTTOM else NativeGroupMenuAction.BOTTOM
-            )
-        }
-        val extensionTarget = ConversationMenuExtensionTarget(activity, target.talker)
-        ConversationMenuExtensionRegistry.visibleItems(extensionTarget).forEach { extension ->
-            menu.removeItem(extension.itemId)
-            val item = menu.add(0, extension.itemId, menu.size(), extension.title)
-            nativeGroupMenuBindings[item] = NativeGroupMenuTarget(
-                target = target,
-                action = NativeGroupMenuAction.EXTENSION,
-                extensionItemId = extension.itemId
-            )
-        }
-    }
-
-    private fun handleNativeGroupChildMenuClick(param: XC_MethodHook.MethodHookParam) {
-        val item = param.args?.getOrNull(0) as? MenuItem ?: return
-        val binding = nativeGroupMenuBindings.remove(item) ?: return
-        param.result = null
-        main.post {
-            val target = binding.target
-            val activity = target.activity.get() ?: return@post
-            val fragment = target.fragment.get() ?: return@post
-            if (activity.isFinishing || activity.isDestroyed) return@post
-            when (binding.action) {
-                NativeGroupMenuAction.REMOVE -> {
-                    val success = ConversationGroupStore.setConversationGroup(
-                        activity,
-                        target.talker,
-                        null
-                    )
-                    Toast.makeText(
-                        activity.applicationContext,
-                        if (success) "已移出当前分组" else "移出会话失败",
-                        Toast.LENGTH_SHORT
-                    ).show()
-                    if (success) {
-                        syncAsync(activity)
-                        refreshNativeGroupFragment(fragment, activity)
-                    }
-                }
-                NativeGroupMenuAction.MOVE -> ConversationGroupQuickDialog.show(
-                    activity = activity,
-                    talker = target.talker,
-                    onChanged = {
-                        syncAsync(activity)
-                        refreshNativeGroupFragment(fragment, activity)
-                    }
-                )
-                NativeGroupMenuAction.PIN,
-                NativeGroupMenuAction.UNPIN -> {
-                    val pin = binding.action == NativeGroupMenuAction.PIN
-                    val success = ConversationGroupStore.setConversationPinned(
-                        activity,
-                        target.groupId,
-                        target.talker,
-                        pin
-                    )
-                    Toast.makeText(
-                        activity.applicationContext,
-                        when {
-                            !success -> "更新分组置顶失败"
-                            pin -> "已在当前分组置顶"
-                            else -> "已取消当前分组置顶"
-                        },
-                        Toast.LENGTH_SHORT
-                    ).show()
-                    if (success) refreshNativeGroupFragment(fragment, activity)
-                }
-                NativeGroupMenuAction.BOTTOM,
-                NativeGroupMenuAction.UNBOTTOM -> {
-                    val bottom = binding.action == NativeGroupMenuAction.BOTTOM
-                    val success = ConversationGroupStore.setConversationBottom(
-                        activity,
-                        target.groupId,
-                        target.talker,
-                        bottom
-                    )
-                    Toast.makeText(
-                        activity.applicationContext,
-                        when {
-                            !success -> "更新分组置底失败"
-                            bottom -> "已在当前分组置底"
-                            else -> "已取消当前分组置底"
-                        },
-                        Toast.LENGTH_SHORT
-                    ).show()
-                    if (success) refreshNativeGroupFragment(fragment, activity)
-                }
-                NativeGroupMenuAction.EXTENSION -> {
-                    binding.extensionItemId?.let { itemId ->
-                        ConversationMenuExtensionRegistry.perform(
-                            itemId,
-                            ConversationMenuExtensionTarget(activity, target.talker)
-                        )
-                    }
-                }
-            }
-        }
-    }
 
     private fun refreshNativeGroupFragment(fragment: Any, context: Context) {
         val adapter = KavaReflector.readField(fragment, "adapter") ?: return
@@ -1291,13 +904,14 @@ object ConversationGroupRuntime {
 
     private fun expandShareRecentQuery(
         method: Method,
-        param: XC_MethodHook.MethodHookParam,
+        receiver: Any?,
+        arguments: List<Any?>,
         parentArgumentIndex: Int,
         groupedIds: Set<String>,
         candidateListArgumentIndex: Int? = null
     ): Cursor? {
         if (groupedIds.isEmpty()) return null
-        val args = param.args?.copyOf() ?: return null
+        val args = arguments.toTypedArray()
         if (parentArgumentIndex !in args.indices || args[parentArgumentIndex] != null) return null
         if (candidateListArgumentIndex != null) {
             val candidates = args.getOrNull(candidateListArgumentIndex) as? List<*> ?: return null
@@ -1311,7 +925,7 @@ object ConversationGroupRuntime {
         args[parentArgumentIndex] = ""
         expandingShareRecentQuery.set(true)
         return try {
-            KavaReflector.invokeOrThrow(method, param.thisObject, *args) as? Cursor
+            KavaReflector.invokeOrThrow(method, receiver, *args) as? Cursor
         } catch (throwable: Throwable) {
             logShareRecentExpandFailure(throwable)
             null
@@ -2674,7 +2288,7 @@ object ConversationGroupRuntime {
             types[3] == java.lang.Long.TYPE
     }
 
-    private fun hook(method: Method, callback: XC_MethodHook): Boolean {
+    private fun hook(method: Method, callback: XposedInterface.Hooker): Boolean {
         if (!hookedMethods.add(method)) return true
         return runCatching {
             HookRegistry.get().hook(method, callback)
@@ -2818,4 +2432,424 @@ object ConversationGroupRuntime {
         val digestUser: String
     )
 
+
+    private class ConversationQueryHook(private val query: Method, private val parentUpdate: Method, private val context: FeatureContext, private val generation: Long) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            var outcome = chain.proceed()
+            val args = chain.args
+            if (isExpandingShareRecentQuery()) return outcome
+            captureConversationStorage(chain.thisObject, parentUpdate, context.hostContext(), generation)
+            if (!ConversationGroupStore.isEnabled(context.hostContext())) return outcome
+            val cursor = outcome as? Cursor ?: return outcome
+            if (isShareRecentQuery()) {
+                val groupedIds = shareGroupedConversationIds(context.hostContext())
+                val expanded = expandShareRecentQuery(query, chain.thisObject, args, 2, groupedIds)
+                outcome = flattenShareRecentCursor(cursor, expanded, groupedIds)
+                return outcome
+            }
+            val rootGroups = ConversationGroupStore.load(context.hostContext())
+                .filter { it.parentId == null }
+            outcome = reorderVirtualGroupRows(filterProjectedOfficialRows(context.hostContext(), cursor), rootGroups)
+            return outcome
+        }
+    }
+
+    private class ShareRecentAdapterHook : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            enterShareRecentQuery()
+            try {
+                return chain.proceed()
+            } finally {
+                leaveShareRecentQuery()
+            }
+        }
+    }
+
+    private class ShareRecentForwardQueryHook(private val shareRecentForwardQuery: Method, private val context: FeatureContext) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            var outcome = chain.proceed()
+            val args = chain.args
+            if (isExpandingShareRecentQuery() || !isShareRecentQuery() ||
+                !ConversationGroupStore.isEnabled(context.hostContext())
+            ) {
+                return outcome
+            }
+            val cursor = outcome as? Cursor ?: return outcome
+            val groupedIds = shareGroupedConversationIds(context.hostContext())
+            val expanded = expandShareRecentQuery(
+                shareRecentForwardQuery,
+                chain.thisObject,
+                args,
+                3,
+                groupedIds,
+                candidateListArgumentIndex = 0
+            )
+            outcome = flattenShareRecentCursor(cursor, expanded, groupedIds)
+            return outcome
+        }
+    }
+
+    private class NativeGroupQueryHook(private val context: FeatureContext) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val parent = nativeGroupQueryParent.get()?.takeIf(::isVirtualTalker)
+            val args = chain.args.toTypedArray()
+            if (parent != null && args.getOrNull(2) == NATIVE_GROUP_REFRESH_ANCHOR) {
+                args[0] = 0
+                args[2] = parent
+            }
+            val outcome = chain.proceed(args)
+            if (parent == null) return outcome
+            val cursor = outcome as? Cursor ?: return outcome
+            val excluded = (args.getOrNull(1) as? List<*>).orEmpty().filterIsInstance<String>().toSet()
+            val limit = args.getOrNull(3) as? Int ?: 0
+            val merged = if (args.getOrNull(0) == 0) mergeProjectedOfficialRows(context.hostContext(), parent, cursor, excluded, limit) else cursor
+            return reorderNativeGroupCursor(context.hostContext(), parent, merged)
+        }
+    }
+
+    private class NativeGroupRefreshHook : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val previousParent = nativeGroupQueryParent.get()
+            nativeGroupQueryParent.remove()
+            nativeGroupAdapterParents[chain.thisObject]?.takeIf(::isVirtualTalker)?.let(nativeGroupQueryParent::set)
+            try {
+                return chain.proceed()
+            } finally {
+                if (previousParent == null) nativeGroupQueryParent.remove() else nativeGroupQueryParent.set(previousParent)
+            }
+        }
+    }
+
+    private class NativeGroupMarkReadHook : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            if (isVirtualTalker(chain.args.getOrNull(0) as? String)) return false
+            return chain.proceed()
+        }
+    }
+
+    private class NativeGroupStatusHook : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            if (isVirtualTalker(nativeGroupPageParent.get()) && chain.args.getOrNull(0) == NATIVE_GROUP_PLACEHOLDER) return null
+            return chain.proceed()
+        }
+    }
+
+    private class NativeChildMenuClickHook : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val args = chain.args
+            val item = args.getOrNull(0) as? MenuItem ?: return chain.proceed()
+            val binding = nativeGroupMenuBindings.remove(item) ?: return chain.proceed()
+
+            main.post {
+                val target = binding.target
+                val activity = target.activity.get() ?: return@post
+                val fragment = target.fragment.get() ?: return@post
+                if (activity.isFinishing || activity.isDestroyed) return@post
+                when (binding.action) {
+                    NativeGroupMenuAction.REMOVE -> {
+                        val success = ConversationGroupStore.setConversationGroup(
+                            activity,
+                            target.talker,
+                            null
+                        )
+                        Toast.makeText(
+                            activity.applicationContext,
+                            if (success) "已移出当前分组" else "移出会话失败",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                        if (success) {
+                            syncAsync(activity)
+                            refreshNativeGroupFragment(fragment, activity)
+                        }
+                    }
+                    NativeGroupMenuAction.MOVE -> ConversationGroupQuickDialog.show(
+                        activity = activity,
+                        talker = target.talker,
+                        onChanged = {
+                            syncAsync(activity)
+                            refreshNativeGroupFragment(fragment, activity)
+                        }
+                    )
+                    NativeGroupMenuAction.PIN,
+                    NativeGroupMenuAction.UNPIN -> {
+                        val pin = binding.action == NativeGroupMenuAction.PIN
+                        val success = ConversationGroupStore.setConversationPinned(
+                            activity,
+                            target.groupId,
+                            target.talker,
+                            pin
+                        )
+                        Toast.makeText(
+                            activity.applicationContext,
+                            when {
+                                !success -> "更新分组置顶失败"
+                                pin -> "已在当前分组置顶"
+                                else -> "已取消当前分组置顶"
+                            },
+                            Toast.LENGTH_SHORT
+                        ).show()
+                        if (success) refreshNativeGroupFragment(fragment, activity)
+                    }
+                    NativeGroupMenuAction.BOTTOM,
+                    NativeGroupMenuAction.UNBOTTOM -> {
+                        val bottom = binding.action == NativeGroupMenuAction.BOTTOM
+                        val success = ConversationGroupStore.setConversationBottom(
+                            activity,
+                            target.groupId,
+                            target.talker,
+                            bottom
+                        )
+                        Toast.makeText(
+                            activity.applicationContext,
+                            when {
+                                !success -> "更新分组置底失败"
+                                bottom -> "已在当前分组置底"
+                                else -> "已取消当前分组置底"
+                            },
+                            Toast.LENGTH_SHORT
+                        ).show()
+                        if (success) refreshNativeGroupFragment(fragment, activity)
+                    }
+                    NativeGroupMenuAction.EXTENSION -> {
+                        binding.extensionItemId?.let { itemId ->
+                            ConversationMenuExtensionRegistry.perform(
+                                itemId,
+                                ConversationMenuExtensionTarget(activity, target.talker)
+                            )
+                        }
+                    }
+                }
+            }
+            return null
+        }
+    }
+
+    private class NativeChildMenuHook : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val outcome = chain.proceed()
+            val args = chain.args
+            val target = nativeGroupLongClickTarget.get() ?: return outcome
+            if (target.talker.isBlank() || isVirtualTalker(target.talker)) return outcome
+            val menu = args.getOrNull(0) as? ContextMenu ?: return outcome
+            val activity = target.activity.get() ?: return outcome
+            val group = ConversationGroupStore.load(activity)
+                .firstOrNull { it.id == target.groupId }
+                ?: return outcome
+            menu.removeItem(CHILD_MENU_REMOVE_ID)
+            menu.removeItem(CHILD_MENU_MOVE_ID)
+            menu.removeItem(CHILD_MENU_PIN_ID)
+            menu.removeItem(CHILD_MENU_BOTTOM_ID)
+            if (target.talker in group.conversationIds) {
+                val removeItem = menu.add(0, CHILD_MENU_REMOVE_ID, menu.size(), "移出")
+                val moveItem = menu.add(0, CHILD_MENU_MOVE_ID, menu.size(), "移至")
+                val pinned = target.talker in group.pinnedConversationIds
+                val bottom = target.talker in group.bottomConversationIds
+                val pinItem = menu.add(
+                    0,
+                    CHILD_MENU_PIN_ID,
+                    menu.size(),
+                    if (pinned) "取消置顶" else "置顶聊天"
+                )
+                val bottomItem = menu.add(
+                    0,
+                    CHILD_MENU_BOTTOM_ID,
+                    menu.size(),
+                    if (bottom) "取消置底" else "置底聊天"
+                )
+                nativeGroupMenuBindings[removeItem] = NativeGroupMenuTarget(
+                    target,
+                    NativeGroupMenuAction.REMOVE
+                )
+                nativeGroupMenuBindings[moveItem] = NativeGroupMenuTarget(
+                    target,
+                    NativeGroupMenuAction.MOVE
+                )
+                nativeGroupMenuBindings[pinItem] = NativeGroupMenuTarget(
+                    target,
+                    if (pinned) NativeGroupMenuAction.UNPIN else NativeGroupMenuAction.PIN
+                )
+                nativeGroupMenuBindings[bottomItem] = NativeGroupMenuTarget(
+                    target,
+                    if (bottom) NativeGroupMenuAction.UNBOTTOM else NativeGroupMenuAction.BOTTOM
+                )
+            }
+            val extensionTarget = ConversationMenuExtensionTarget(activity, target.talker)
+            ConversationMenuExtensionRegistry.visibleItems(extensionTarget).forEach { extension ->
+                menu.removeItem(extension.itemId)
+                val item = menu.add(0, extension.itemId, menu.size(), extension.title)
+                nativeGroupMenuBindings[item] = NativeGroupMenuTarget(
+                    target = target,
+                    action = NativeGroupMenuAction.EXTENSION,
+                    extensionItemId = extension.itemId
+                )
+            }
+            return outcome
+        }
+    }
+
+    private class ConversationMenuHook : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val outcome = chain.proceed()
+            val args = chain.args
+            val menu = args.getOrNull(0) as? ContextMenu ?: return outcome
+            val view = args.getOrNull(1) as? View ?: return outcome
+            val activity = findActivity(view.context) ?: return outcome
+            if (!ConversationGroupStore.isEnabled(activity)) return outcome
+            if (!installConversationMenuClickHook(chain.thisObject)) return outcome
+            val talker = conversationMenuTalker(chain.thisObject) ?: return outcome
+
+            menu.removeItem(MENU_ITEM_ID)
+            val groupId = runCatching { menu.getItem(0).groupId }.getOrDefault(0)
+            val item = menu.add(groupId, MENU_ITEM_ID, 0, MENU_TITLE)
+            moveMenuItemToFront(menu, item)
+            menuBindings[item] = ConversationMenuTarget(activity, talker)
+            return outcome
+        }
+    }
+
+    private class GroupClickHook : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val args = chain.args
+            val adapter = args.getOrNull(0) as? AdapterView<*> ?: return chain.proceed()
+            val view = args.getOrNull(1) as? View ?: return chain.proceed()
+            val position = args.getOrNull(2) as? Int ?: return chain.proceed()
+            val item = runCatching { adapter.getItemAtPosition(position) }.getOrNull() ?: return chain.proceed()
+            val talker = virtualTalkerFromItem(item) ?: return chain.proceed()
+            val activity = findActivity(view.context) ?: return chain.proceed()
+
+            main.post {
+                val groupId = ConversationGroupStore.load(activity)
+                    .firstOrNull { virtualTalker(it.id) == talker }
+                    ?.id ?: return@post
+                showGroup(activity, groupId)
+            }
+            return null
+        }
+    }
+
+    private class NativeGroupPinnedHook(private val context: Context, private val pinned: Boolean) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val outcome = chain.proceed()
+            val args = chain.args
+            if (outcome as? Boolean != true) return outcome
+            val talker = args.getOrNull(0) as? String
+            if (!isVirtualTalker(talker)) return outcome
+            val group = ConversationGroupStore.load(context)
+                .firstOrNull { virtualTalker(it.id) == talker }
+                ?: return outcome
+            if (group.pinned == pinned) return outcome
+            if (!ConversationGroupStore.updateGroup(context, group.copy(pinned = pinned))) {
+                HLog.e("$TAG 同步微信原生分组置顶状态失败: talker=$talker pinned=$pinned")
+            }
+            return outcome
+        }
+    }
+
+    private class NativeHideConversationHook(private val method: Method) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val talker = (chain.args.getOrNull(0) as? String)?.trim().orEmpty()
+            if (talker.isEmpty() || isVirtualTalker(talker)) return chain.proceed()
+            val parent = WeChatApis.database()?.queryFirstString(
+                "SELECT IFNULL(parentRef,'') AS parentRef " +
+                    "FROM rconversation WHERE username=? LIMIT 1",
+                arrayOf(talker),
+                "parentRef"
+            ).orEmpty()
+            if (!isVirtualTalker(parent)) return chain.proceed()
+
+            if (WeChatApis.conversations()?.deleteConversation(talker) == true) {
+                return null
+            } else {
+                HLog.e(
+                    "$TAG 隐藏分组会话失败，继续执行微信原逻辑: " +
+                        "talker=$talker method=${method.toGenericString()}"
+                )
+            }
+            return chain.proceed()
+        }
+    }
+
+    private class ConversationMenuClickHook : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val args = chain.args
+            val item = args.getOrNull(0) as? MenuItem ?: return chain.proceed()
+            if (item.itemId != MENU_ITEM_ID) return chain.proceed()
+            val target = menuBindings.remove(item) ?: return chain.proceed()
+
+            main.post {
+                val activity = target.activity.get() ?: return@post
+                if (!activity.isFinishing && !activity.isDestroyed) {
+                    ConversationGroupQuickDialog.show(
+                        activity = activity,
+                        talker = target.talker,
+                        onChanged = { syncAsync(activity) }
+                    )
+                }
+            }
+            return null
+        }
+    }
+
+    private class NativeGroupClickHook : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val fragment = nativeGroupFragmentFromListener(chain.thisObject) ?: return chain.proceed()
+            if (!isVirtualGroupFragment(fragment)) return chain.proceed()
+            val adapter = chain.args.getOrNull(0) as? AdapterView<*> ?: return chain.proceed()
+            val view = chain.args.getOrNull(1) as? View ?: return chain.proceed()
+            val position = chain.args.getOrNull(2) as? Int ?: return chain.proceed()
+            val item = runCatching { adapter.getItemAtPosition(position) }.getOrNull() ?: return chain.proceed()
+            val talker = conversationTalkerFromItem(item)
+            val activity = findActivity(view.context) ?: return chain.proceed()
+            if (talker.isNullOrBlank()) {
+                HLog.e("$TAG 微信原生分组列表无法解析会话: item=${item.javaClass.name}")
+                return null
+            }
+            main.post {
+                val child = ConversationGroupStore.load(activity).firstOrNull { virtualTalker(it.id) == talker }
+                if (child != null) showGroup(activity, child.id)
+                else if (!openNativeGroupConversation(fragment, talker) && WeChatApis.conversations()?.openChat(talker) != true) {
+                    HLog.e("$TAG 打开分组内会话失败: talker=$talker")
+                }
+            }
+            return null
+        }
+    }
+
+    private class NativeParentExtraHook : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            if (chain.thisObject?.javaClass?.name != NATIVE_GROUP_FRAGMENT || chain.args.getOrNull(0) != CONTACT_USER_EXTRA) return chain.proceed()
+            val activity = (KavaReflector.invokeMethod(chain.thisObject, "getActivity")
+                ?: KavaReflector.invokeMethod(chain.thisObject, "thisActivity")) as? Activity ?: return chain.proceed()
+            val talker = activity.intent?.getStringExtra(CONTACT_USER_EXTRA)?.takeIf(::isVirtualTalker) ?: return chain.proceed()
+            return talker
+        }
+    }
+
+    private class NativeGroupCreatedHook(private val context: FeatureContext) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val outcome = chain.proceed()
+
+            customizeNativeGroupPage(chain.thisObject, context.hostContext())
+            return outcome
+        }
+    }
+
+    private class NativeGroupPageLifecycleHook(private val name: String, private val context: FeatureContext) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val previousParent = nativeGroupPageParent.get()
+            nativeGroupPageParent.remove()
+            nativeGroupTalker(chain.thisObject)?.let(nativeGroupPageParent::set)
+            try {
+                val outcome = chain.proceed()
+                if (name == "onResume") {
+                    syncAsync(context.hostContext())
+                    updateNativeGroupUnread(chain.thisObject)
+                    updateNativeGroupTitle(chain.thisObject, context.hostContext())
+                }
+                return outcome
+            } finally {
+                if (previousParent == null) nativeGroupPageParent.remove() else nativeGroupPageParent.set(previousParent)
+            }
+        }
+    }
 }

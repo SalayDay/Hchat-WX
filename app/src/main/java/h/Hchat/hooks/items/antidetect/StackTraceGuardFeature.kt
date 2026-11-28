@@ -1,6 +1,6 @@
 package h.Hchat.hooks.items.antidetect
 
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.hooks.api.core.WeChatApis
 import h.Hchat.hooks.core.BaseFeature
 import h.Hchat.hooks.core.FeatureContext
@@ -77,19 +77,7 @@ class StackTraceGuardFeature : BaseFeature() {
         enabled = HotConfig.flag(ID, KEY_ENABLED, DEFAULT_ENABLED) {
             config.getBoolean(ID, KEY_ENABLED, DEFAULT_ENABLED)
         }
-        val stackHook = object : XC_MethodHook() {
-            override fun afterHookedMethod(param: MethodHookParam) {
-                if (!enabled()) return
-                // 回调挂在 Throwable#getStackTrace 上，LSPosed 记录 hook 异常日志时
-                // 会走同一条路；这里任何意外都不能再抛，否则框架错误处理自激。
-                runCatching {
-                    val stack = param.result as? Array<StackTraceElement> ?: return
-                    // release 下自身类名被 R8 改短，必须叠加运行时登记表才拦得住回调帧。
-                    val cleaned = StackFramePolicy.clean(stack) { SelfFrameRegistry.contains(it) }
-                    if (cleaned !== stack) param.result = cleaned
-                }
-            }
-        }
+        val stackHook = StackTraceHooker(this)
 
         var installed = 0
         for (owner in arrayOf(Thread::class.java, Throwable::class.java)) {
@@ -120,4 +108,27 @@ class StackTraceGuardFeature : BaseFeature() {
 
         private const val TAG = "[Hchat:AntiDetectStack]"
     }
+
+    private class StackTraceHooker(private val owner: StackTraceGuardFeature) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val args = chain.args.toTypedArray()
+            val receiver = chain.thisObject
+            var result = chain.proceed()
+            with(owner) {
+            run update@{
+                if (!enabled()) return@update
+                // 回调挂在 Throwable#getStackTrace 上，LSPosed 记录 hook 异常日志时
+                // 会走同一条路；这里任何意外都不能再抛，否则框架错误处理自激。
+                runCatching {
+                    val stack = result as? Array<StackTraceElement> ?: return@update
+                    // release 下自身类名被 R8 改短，必须叠加运行时登记表才拦得住回调帧。
+                    val cleaned = StackFramePolicy.clean(stack) { SelfFrameRegistry.contains(it) }
+                    if (cleaned !== stack) result = cleaned
+                }
+            }
+            return result
+            }
+        }
+    }
+
 }

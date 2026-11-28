@@ -18,8 +18,6 @@ import java.util.zip.CRC32;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 
-import de.robv.android.xposed.XposedBridge;
-
 /**
  * Native 库加载器。
  * 负责从模块 APK 中提取并加载 Native so，避免模块入口混入底层加载细节。

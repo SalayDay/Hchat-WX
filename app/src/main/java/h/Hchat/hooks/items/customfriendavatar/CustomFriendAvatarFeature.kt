@@ -16,7 +16,7 @@ import android.view.ContextMenu
 import android.view.MenuItem
 import android.view.View
 import android.widget.ImageView
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.dexkit.DexMethodCache
 import h.Hchat.event.Events
 import h.Hchat.hooks.api.core.WeChatApis
@@ -123,22 +123,14 @@ private class CustomFriendAvatarRuntime(
     private var desktopShortcutInstalled = false
 
     fun installNotificationHooks() {
-        NotificationManager::class.java.declaredMethods
+        KavaReflector.declaredMethods(NotificationManager::class.java)
             .asSequence()
             .filter { method ->
                 val types = method.parameterTypes
                 method.name == "notify" && types.isNotEmpty() && types.last() == Notification::class.java
             }
             .forEach { method ->
-                hook(method, object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        if (!CustomFriendAvatarSettings.notificationsEnabled(context.hostContext())) return
-                        val notification = param.args.lastOrNull() as? Notification ?: return
-                        val talker = CustomNotificationRuntime.notificationTalker(notification)
-                        val source = CustomFriendAvatarStore.loadBitmap(context.hostContext(), talker) ?: return
-                        replaceNotificationLargeIcon(notification, processBitmap(source, NATIVE_RADIUS_FACTOR))
-                    }
-                })
+                hook(method, NotificationAvatarHook(this))
             }
     }
 
@@ -146,21 +138,16 @@ private class CustomFriendAvatarRuntime(
     fun installDesktopShortcutHook(): Boolean {
         if (desktopShortcutInstalled) return true
         val method = locateDesktopShortcutMethod() ?: return false
-        desktopShortcutInstalled = hook(method, object : XC_MethodHook() {
-            override fun afterHookedMethod(param: MethodHookParam) {
-                runCatching { replaceDesktopShortcutIcon(param) }
-                    .onFailure { logger("替换桌面快捷方式头像失败", it) }
-            }
-        })
+        desktopShortcutInstalled = hook(method, DesktopShortcutHook(this))
         return desktopShortcutInstalled
     }
 
-    private fun replaceDesktopShortcutIcon(param: XC_MethodHook.MethodHookParam) {
+    private fun replaceDesktopShortcutIcon(args: List<Any?>, result: Any?) {
         if (!CustomFriendAvatarSettings.desktopShortcutEnabled(context.hostContext())) return
-        if (param.args.getOrNull(2) as? Boolean != true) return
-        val wxid = (param.args.getOrNull(1) as? String)?.trim().orEmpty()
+        if (args.getOrNull(2) as? Boolean != true) return
+        val wxid = (args.getOrNull(1) as? String)?.trim().orEmpty()
         if (wxid.isEmpty()) return
-        val intent = param.result as? Intent ?: return
+        val intent = result as? Intent ?: return
         @Suppress("DEPRECATION")
         val original = intent.getParcelableExtra(Intent.EXTRA_SHORTCUT_ICON) as? Bitmap ?: return
         val source = CustomFriendAvatarStore.loadBitmap(context.hostContext(), wxid) ?: return
@@ -175,96 +162,12 @@ private class CustomFriendAvatarRuntime(
     @Synchronized
     fun install(): Boolean {
         val avatarMembers = locateAvatarMembers() ?: return false
-        val legacy = hook(avatarMembers.legacyLoad, object : XC_MethodHook() {
-            override fun beforeHookedMethod(param: MethodHookParam) {
-                val requestedWxid = param.args.getOrNull(1) as? String ?: return
-                val source = automaticGroupAvatarSource(requestedWxid) ?: return
-                if (conversationGroupHasCustomAvatar(requestedWxid)) return
-                param.setObjectExtra(ORIGINAL_GROUP_WXID, requestedWxid)
-                param.args[1] = source
-            }
-
-            override fun afterHookedMethod(param: MethodHookParam) {
-                val image = param.args.getOrNull(0) as? ImageView ?: return
-                val wxid = param.getObjectExtra(ORIGINAL_GROUP_WXID) as? String
-                    ?: param.args.getOrNull(1) as? String
-                    ?: return
-                if (!avatarScopeEnabled(wxid, AvatarSurfaceClassifier.forView(image))) {
-                    return
-                }
-                val bitmap = CustomFriendAvatarStore.cachedBitmap(wxid)
-                    ?: CustomFriendAvatarStore.loadBitmap(context.hostContext(), wxid)
-                    ?: return
-                val nativeRadius = (param.args.getOrNull(2) as? Number)?.toFloat()
-                image.setImageBitmap(processBitmap(bitmap, nativeRadius))
-                param.result = null
-            }
-        })
-        val constructor = hook(avatarMembers.workerConstructor, object : XC_MethodHook() {
-            override fun beforeHookedMethod(param: MethodHookParam) {
-                val requestedWxid = param.args.getOrNull(1) as? String ?: return
-                val source = automaticGroupAvatarSource(requestedWxid) ?: return
-                if (conversationGroupHasCustomAvatar(requestedWxid)) return
-                param.setObjectExtra(ORIGINAL_GROUP_WXID, requestedWxid)
-                param.args[1] = source
-            }
-
-            override fun afterHookedMethod(param: MethodHookParam) {
-                val wxid = param.getObjectExtra(ORIGINAL_GROUP_WXID) as? String
-                    ?: param.args.getOrNull(1) as? String
-                    ?: return
-                if (wxid.isNotBlank()) {
-                    drawableWxids[param.thisObject] = wxid
-                    drawableSurfaces[param.thisObject] = AvatarSurfaceClassifier.forObject(param.args.getOrNull(0))
-                    drawableRadiusFactors[param.thisObject] = effectiveRadiusFactor(param.args, 2, 5)
-                }
-            }
-        })
+        val legacy = hook(avatarMembers.legacyLoad, LegacyAvatarHook(this))
+        val constructor = hook(avatarMembers.workerConstructor, AvatarWorkerConstructorHook(this))
         val modify = avatarMembers.workerModify?.let { method ->
-            hook(method, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    val target = param.args.getOrNull(0) ?: return
-                    val requestedWxid = param.args.getOrNull(2) as? String ?: return
-                    val source = automaticGroupAvatarSource(requestedWxid)
-                    if (source != null && !conversationGroupHasCustomAvatar(requestedWxid)) {
-                        param.setObjectExtra(ORIGINAL_GROUP_WXID, requestedWxid)
-                        param.args[2] = source
-                    }
-                    val wxid = param.getObjectExtra(ORIGINAL_GROUP_WXID) as? String
-                        ?: param.args.getOrNull(2) as? String
-                        ?: return
-                    if (wxid.isNotBlank()) {
-                        drawableWxids[target] = wxid
-                        drawableSurfaces[target] = AvatarSurfaceClassifier.forObject(param.args.getOrNull(1))
-                        drawableRadiusFactors[target] = effectiveRadiusFactor(param.args, 3, 6)
-                    }
-                }
-            })
+            hook(method, AvatarWorkerModifyHook(this))
         } ?: true
-        val draw = hook(avatarMembers.draw, object : XC_MethodHook() {
-            override fun beforeHookedMethod(param: MethodHookParam) {
-                val wxid = drawableWxids[param.thisObject].orEmpty()
-                if (wxid.isBlank()) return
-                val surface = drawableSurfaces[param.thisObject] ?: AvatarSurface.OTHER
-                if (!avatarScopeEnabled(wxid, surface)) {
-                    return
-                }
-                // draw() 每帧每头像都会进来，优先走无 IO 的内存缓存；
-                // 只有首次未命中才真正解码文件（stat + decode）。
-                val bitmap = CustomFriendAvatarStore.cachedBitmap(wxid)
-                    ?: CustomFriendAvatarStore.loadBitmap(context.hostContext(), wxid)
-                    ?: return
-                val canvas = param.args.getOrNull(0) as? Canvas ?: return
-                val drawable = param.thisObject as? Drawable ?: return
-                canvas.drawBitmap(
-                    processBitmap(bitmap, drawableRadiusFactors[param.thisObject]),
-                    null,
-                    drawable.bounds,
-                    DRAW_PAINT
-                )
-                param.setResult(null)
-            }
-        })
+        val draw = hook(avatarMembers.draw, AvatarDrawHook(this))
         if (legacy && constructor && modify && draw) installed = true
         installConversationMenu()
         return installed
@@ -282,20 +185,7 @@ private class CustomFriendAvatarRuntime(
     private fun installConversationMenu() {
         ConversationMenuExtensionRegistry.register(conversationMenuExtension)
         val method = ConversationMenuLocator.menuCreateMethod(context, logger) ?: return
-        hook(method, object : XC_MethodHook() {
-            override fun afterHookedMethod(param: MethodHookParam) {
-                if (!CustomFriendAvatarSettings.conversationMenuEnabled(context.hostContext())) return
-                val menu = param.args.getOrNull(0) as? ContextMenu ?: return
-                val target = resolveAvatarTarget(param.thisObject) ?: return
-                menu.removeItem(CONVERSATION_MENU_ID)
-                val groupId = runCatching { menu.getItem(0).groupId }.getOrDefault(0)
-                val item = menu.add(groupId, CONVERSATION_MENU_ID, 0, MENU_TITLE)
-                moveMenuItemToFront(menu, item)
-                val activity = resolveActivity(param.thisObject) ?: return
-                conversationBindings[item] = ConversationBinding(WeakReference(activity), target)
-                installConversationClick(param.thisObject)
-            }
-        })
+        hook(method, ConversationAvatarMenuHook(this))
     }
 
     private fun installConversationClick(listener: Any?) {
@@ -309,16 +199,7 @@ private class CustomFriendAvatarRuntime(
             }
             .firstOrNull { it.returnType == Void.TYPE && it.declaringClass.name.startsWith("com.tencent.mm.ui.conversation.") }
             ?: return
-        hook(method, object : XC_MethodHook() {
-            override fun beforeHookedMethod(param: MethodHookParam) {
-                val clicked = param.args.getOrNull(0) as? MenuItem ?: return
-                if (clicked.itemId != CONVERSATION_MENU_ID) return
-                val target = conversationBindings.remove(clicked) ?: return
-                val activity = target.activity.get() ?: return
-                param.setResult(null)
-                showAvatarActions(activity, target.wxid)
-            }
-        })
+        hook(method, ConversationAvatarClickHook(this))
     }
 
     private fun showAvatarActions(activity: Activity?, wxid: String) {
@@ -393,7 +274,7 @@ private class CustomFriendAvatarRuntime(
         return null
     }
 
-    private fun hook(member: Member, callback: XC_MethodHook): Boolean {
+    private fun hook(member: Member, callback: XposedInterface.Hooker): Boolean {
         if (member is Method && (Modifier.isAbstract(member.modifiers) || member.declaringClass.isInterface)) return false
         if (!hookedMembers.add(member)) return true
         return runCatching {
@@ -633,6 +514,141 @@ private class CustomFriendAvatarRuntime(
         while (current != null && current != Any::class.java) {
             yieldAll(KavaReflector.declaredFields(current))
             current = current.superclass
+        }
+    }
+
+    private class NotificationAvatarHook(private val owner: CustomFriendAvatarRuntime) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            return with(owner) {
+                val args = chain.args
+                if (!CustomFriendAvatarSettings.notificationsEnabled(context.hostContext())) return chain.proceed()
+                val notification = args.lastOrNull() as? Notification ?: return chain.proceed()
+                val talker = CustomNotificationRuntime.notificationTalker(notification)
+                val source = CustomFriendAvatarStore.loadBitmap(context.hostContext(), talker) ?: return chain.proceed()
+                replaceNotificationLargeIcon(notification, processBitmap(source, NATIVE_RADIUS_FACTOR))
+                return chain.proceed()
+            }
+        }
+    }
+
+    private class DesktopShortcutHook(private val owner: CustomFriendAvatarRuntime) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            return with(owner) {
+                val outcome = chain.proceed()
+
+                runCatching { replaceDesktopShortcutIcon(chain.args, outcome) }
+                    .onFailure { logger("替换桌面快捷方式头像失败", it) }
+                return outcome
+            }
+        }
+    }
+
+    private class LegacyAvatarHook(private val owner: CustomFriendAvatarRuntime) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            return with(owner) {
+                val args = chain.args.toTypedArray()
+                val requestedWxid = args.getOrNull(1) as? String
+                val source = requestedWxid?.let(::automaticGroupAvatarSource)
+                val originalWxid = requestedWxid?.takeIf { source != null && !conversationGroupHasCustomAvatar(it) }
+                if (originalWxid != null) args[1] = source
+                val outcome = chain.proceed(args)
+                val image = args.getOrNull(0) as? ImageView ?: return outcome
+                val wxid = originalWxid ?: args.getOrNull(1) as? String ?: return outcome
+                if (!avatarScopeEnabled(wxid, AvatarSurfaceClassifier.forView(image))) return outcome
+                val bitmap = CustomFriendAvatarStore.cachedBitmap(wxid)
+                    ?: CustomFriendAvatarStore.loadBitmap(context.hostContext(), wxid) ?: return outcome
+                val nativeRadius = (args.getOrNull(2) as? Number)?.toFloat()
+                image.setImageBitmap(processBitmap(bitmap, nativeRadius))
+                return null
+            }
+        }
+    }
+
+    private class AvatarWorkerConstructorHook(private val owner: CustomFriendAvatarRuntime) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            return with(owner) {
+                val args = chain.args.toTypedArray()
+                val requestedWxid = args.getOrNull(1) as? String
+                val source = requestedWxid?.let(::automaticGroupAvatarSource)
+                val originalWxid = requestedWxid?.takeIf { source != null && !conversationGroupHasCustomAvatar(it) }
+                if (originalWxid != null) args[1] = source
+                val outcome = chain.proceed(args)
+                val wxid = originalWxid ?: args.getOrNull(1) as? String ?: return outcome
+                if (wxid.isNotBlank()) {
+                    drawableWxids[chain.thisObject] = wxid
+                    drawableSurfaces[chain.thisObject] = AvatarSurfaceClassifier.forObject(args.getOrNull(0))
+                    drawableRadiusFactors[chain.thisObject] = effectiveRadiusFactor(args, 2, 5)
+                }
+                return outcome
+            }
+        }
+    }
+
+    private class AvatarWorkerModifyHook(private val owner: CustomFriendAvatarRuntime) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            return with(owner) {
+                val target = chain.args.getOrNull(0) ?: return chain.proceed()
+                val requestedWxid = chain.args.getOrNull(2) as? String ?: return chain.proceed()
+                val args = chain.args.toTypedArray()
+                val source = automaticGroupAvatarSource(requestedWxid)
+                if (source != null && !conversationGroupHasCustomAvatar(requestedWxid)) args[2] = source
+                if (requestedWxid.isNotBlank()) {
+                    drawableWxids[target] = requestedWxid
+                    drawableSurfaces[target] = AvatarSurfaceClassifier.forObject(args.getOrNull(1))
+                    drawableRadiusFactors[target] = effectiveRadiusFactor(args, 3, 6)
+                }
+                return chain.proceed(args)
+            }
+        }
+    }
+
+    private class AvatarDrawHook(private val owner: CustomFriendAvatarRuntime) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            return with(owner) {
+                val wxid = drawableWxids[chain.thisObject].orEmpty()
+                if (wxid.isBlank()) return chain.proceed()
+                val surface = drawableSurfaces[chain.thisObject] ?: AvatarSurface.OTHER
+                if (!avatarScopeEnabled(wxid, surface)) return chain.proceed()
+                val bitmap = CustomFriendAvatarStore.cachedBitmap(wxid)
+                    ?: CustomFriendAvatarStore.loadBitmap(context.hostContext(), wxid) ?: return chain.proceed()
+                val canvas = chain.args.getOrNull(0) as? Canvas ?: return chain.proceed()
+                val drawable = chain.thisObject as? Drawable ?: return chain.proceed()
+                canvas.drawBitmap(processBitmap(bitmap, drawableRadiusFactors[drawable]), null, drawable.bounds, DRAW_PAINT)
+                return null
+            }
+        }
+    }
+
+    private class ConversationAvatarMenuHook(private val owner: CustomFriendAvatarRuntime) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            return with(owner) {
+                val outcome = chain.proceed()
+                val args = chain.args
+                if (!CustomFriendAvatarSettings.conversationMenuEnabled(context.hostContext())) return outcome
+                val menu = args.getOrNull(0) as? ContextMenu ?: return outcome
+                val target = resolveAvatarTarget(chain.thisObject) ?: return outcome
+                menu.removeItem(CONVERSATION_MENU_ID)
+                val groupId = runCatching { menu.getItem(0).groupId }.getOrDefault(0)
+                val item = menu.add(groupId, CONVERSATION_MENU_ID, 0, MENU_TITLE)
+                moveMenuItemToFront(menu, item)
+                val activity = resolveActivity(chain.thisObject) ?: return outcome
+                conversationBindings[item] = ConversationBinding(WeakReference(activity), target)
+                installConversationClick(chain.thisObject)
+                return outcome
+            }
+        }
+    }
+
+    private class ConversationAvatarClickHook(private val owner: CustomFriendAvatarRuntime) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            return with(owner) {
+                val clicked = chain.args.getOrNull(0) as? MenuItem ?: return chain.proceed()
+                if (clicked.itemId != CONVERSATION_MENU_ID) return chain.proceed()
+                val target = conversationBindings.remove(clicked) ?: return chain.proceed()
+                val activity = target.activity.get() ?: return chain.proceed()
+                showAvatarActions(activity, target.wxid)
+                return null
+            }
         }
     }
 }

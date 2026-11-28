@@ -1,7 +1,7 @@
 package h.Hchat.hooks.items.antidetect
 
 import android.content.pm.PackageManager
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.hooks.api.core.WeChatApis
 import h.Hchat.hooks.core.BaseFeature
 import h.Hchat.hooks.core.FeatureContext
@@ -94,24 +94,7 @@ class XposedProbeFeature : BaseFeature() {
                 (method.name == "getInstalledPackages" || method.name == "getInstalledApplications")
                     && method.parameterTypes.size == 1 -> {
                     try {
-                        HookRegistry.get().hook(method, object : XC_MethodHook() {
-                            override fun afterHookedMethod(param: MethodHookParam) {
-                                if (!enabled()) return
-                                val raw = param.result ?: return
-                                if (raw !is List<*>) return
-                                val kept = raw.filter { item ->
-                                    !XposedProbePolicy.isDeniedPackageName(
-                                        packageInfoName(item)
-                                    )
-                                }
-                                if (kept.size != raw.size) {
-                                    if (packageListProbeLogged.compareAndSet(false, true)) {
-                                        HLog.e("$TAG 安装列表已摘除痕迹: ${raw.size} -> ${kept.size}")
-                                    }
-                                    param.result = ArrayList(kept)
-                                }
-                            }
-                        })
+                        HookRegistry.get().hook(method, InstalledPackagesHooker(this))
                         installed++
                     } catch (e: Throwable) {
                         logError("挂载 ${method.name} 失败", e)
@@ -122,18 +105,7 @@ class XposedProbeFeature : BaseFeature() {
                     && method.parameterTypes.isNotEmpty()
                     && method.parameterTypes[0] == String::class.java -> {
                     try {
-                        HookRegistry.get().hook(method, object : XC_MethodHook() {
-                            override fun beforeHookedMethod(param: MethodHookParam) {
-                                if (!enabled()) return
-                                val name = param.args?.getOrNull(0) as? String ?: return
-                                if (XposedProbePolicy.isDeniedPackageName(name)) {
-                                    if (packageProbeLogged.compareAndSet(false, true)) {
-                                        HLog.e("$TAG 已伪装包探测: $name -> NameNotFoundException")
-                                    }
-                                    throw PackageManager.NameNotFoundException(name)
-                                }
-                            }
-                        })
+                        HookRegistry.get().hook(method, PackageProbeHooker(this))
                         installed++
                     } catch (e: Throwable) {
                         logError("挂载 ${method.name} 失败", e)
@@ -161,4 +133,52 @@ class XposedProbeFeature : BaseFeature() {
         private val packageProbeLogged = java.util.concurrent.atomic.AtomicBoolean(false)
         private val packageListProbeLogged = java.util.concurrent.atomic.AtomicBoolean(false)
     }
+
+    private class InstalledPackagesHooker(private val owner: XposedProbeFeature) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val args = chain.args.toTypedArray()
+            val receiver = chain.thisObject
+            var result = chain.proceed()
+            with(owner) {
+            run update@{
+                if (!enabled()) return@update
+                val raw = result ?: return@update
+                if (raw !is List<*>) return@update
+                val kept = raw.filter { item ->
+                    !XposedProbePolicy.isDeniedPackageName(
+                        packageInfoName(item)
+                    )
+                }
+                if (kept.size != raw.size) {
+                    if (packageListProbeLogged.compareAndSet(false, true)) {
+                        HLog.e("$TAG 安装列表已摘除痕迹: ${raw.size} -> ${kept.size}")
+                    }
+                    result = ArrayList(kept)
+                }
+            }
+            return result
+            }
+        }
+    }
+
+    private class PackageProbeHooker(private val owner: XposedProbeFeature) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val args = chain.args.toTypedArray()
+            val receiver = chain.thisObject
+            with(owner) {
+            run patch@{
+                if (!enabled()) return@patch
+                val name = args?.getOrNull(0) as? String ?: return@patch
+                if (XposedProbePolicy.isDeniedPackageName(name)) {
+                    if (packageProbeLogged.compareAndSet(false, true)) {
+                        HLog.e("$TAG 已伪装包探测: $name -> NameNotFoundException")
+                    }
+                    throw PackageManager.NameNotFoundException(name)
+                }
+            }
+            return chain.proceed(args)
+            }
+        }
+    }
+
 }

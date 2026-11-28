@@ -9,7 +9,7 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.AbsListView
 import android.widget.Toast
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.hooks.api.core.WeChatApis
 import h.Hchat.hooks.api.sns.SnsCachedNativeLookup
 import h.Hchat.hooks.api.sns.SnsContextMenuTarget
@@ -90,11 +90,7 @@ internal class MomentsFakeInteractionRuntime(
             runCatching {
                 HookRegistry.get().hook(
                     KavaReflector.accessible(method) ?: method,
-                    object : XC_MethodHook() {
-                        override fun afterHookedMethod(param: MethodHookParam) {
-                            mergeIntoNativeInfo(param.thisObject)
-                        }
-                    }
+                    RecordLoadedHooker(this)
                 )
                 true
             }.getOrElse {
@@ -309,30 +305,7 @@ internal class MomentsFakeInteractionRuntime(
         return runCatching {
             HookRegistry.get().hook(
                 KavaReflector.accessible(method) ?: method,
-                object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        val nativeInfo = param.args?.getOrNull(0) ?: return
-                        val snsId = snsId(nativeInfo) ?: return
-                        val comments = knownEntry(store.entry(snsId)).comments
-                        if (comments.isEmpty()) return
-                        val reply = param.args?.getOrNull(3) ?: return
-                        val fakeReply = when (reply) {
-                            is Number -> comments.any { comment ->
-                                codec.commentNodeId(comment.id) == reply.toInt()
-                            }
-                            else -> codec.matchesFakeCommentNode(reply, comments)
-                        }
-                        if (!fakeReply) return
-                        param.setResult(null)
-                        mainHandler.post {
-                            Toast.makeText(
-                                context.hostContext(),
-                                "伪评论仅在本机显示，不能回复",
-                                Toast.LENGTH_SHORT
-                            ).show()
-                        }
-                    }
-                }
+                FakeCommentGuardHooker(this)
             )
             true
         }.getOrElse {
@@ -523,4 +496,41 @@ internal class MomentsFakeInteractionRuntime(
         private const val SNS_INFO_CLASS = "com.tencent.mm.plugin.sns.storage.SnsInfo"
         private const val RECYCLER_VIEW_CLASS = "androidx.recyclerview.widget.RecyclerView"
     }
+
+    private class RecordLoadedHooker(private val owner: MomentsFakeInteractionRuntime) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val args = chain.args.toTypedArray()
+            val receiver = chain.thisObject
+            var result = chain.proceed()
+            with(owner) {
+            run update@{
+                mergeIntoNativeInfo(receiver)
+            }
+            return result
+            }
+        }
+    }
+
+    private class FakeCommentGuardHooker(private val owner: MomentsFakeInteractionRuntime) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val args = chain.args.toTypedArray()
+            with(owner) {
+                val nativeInfo = args.getOrNull(0) ?: return chain.proceed()
+                val id = snsId(nativeInfo) ?: return chain.proceed()
+                val comments = knownEntry(store.entry(id)).comments
+                if (comments.isEmpty()) return chain.proceed()
+                val reply = args.getOrNull(3) ?: return chain.proceed()
+                val fakeReply = when (reply) {
+                    is Number -> comments.any { codec.commentNodeId(it.id) == reply.toInt() }
+                    else -> codec.matchesFakeCommentNode(reply, comments)
+                }
+                if (!fakeReply) return chain.proceed()
+                mainHandler.post {
+                    Toast.makeText(context.hostContext(), "伪评论仅在本机显示，不能回复", Toast.LENGTH_SHORT).show()
+                }
+                return null
+            }
+        }
+    }
+
 }

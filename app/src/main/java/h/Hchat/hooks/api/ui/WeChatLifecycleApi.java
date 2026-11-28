@@ -8,7 +8,7 @@ import h.Hchat.utils.KavaReflector;
 import java.lang.reflect.Method;
 import java.util.concurrent.CopyOnWriteArrayList;
 
-import de.robv.android.xposed.XC_MethodHook;
+import io.github.libxposed.api.XposedInterface;
 
 /**
  * 微信 Activity 生命周期监听 API。
@@ -114,18 +114,30 @@ public final class WeChatLifecycleApi {
     private int hookLifecycleMethod(String methodName, String event) {
         try {
             Method method = KavaReflector.findDeclaredMethod(Activity.class, methodName);
-            HookRegistry.get().hook(method, new XC_MethodHook() {
-                @Override
-                public void afterHookedMethod(MethodHookParam param) {
-                    if (param.thisObject instanceof Activity) {
-                        dispatch(new ActivityEvent(event, (Activity) param.thisObject));
-                    }
-                }
-            });
+            HookRegistry.get().hook(method, new LifecycleHooker(this, event));
             return 1;
         } catch (Throwable e) {
             log("生命周期Hook失败: " + methodName + " " + e.getMessage());
             return 0;
+        }
+    }
+
+    private static final class LifecycleHooker implements XposedInterface.Hooker {
+        private final WeChatLifecycleApi owner;
+        private final String event;
+
+        private LifecycleHooker(WeChatLifecycleApi owner, String event) {
+            this.owner = owner;
+            this.event = event;
+        }
+
+        @Override
+        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+            Object result = chain.proceed();
+            if (chain.getThisObject() instanceof Activity) {
+                owner.dispatch(new ActivityEvent(event, (Activity) chain.getThisObject()));
+            }
+            return result;
         }
     }
 

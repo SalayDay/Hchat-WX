@@ -1,6 +1,6 @@
 package h.Hchat.hooks.items.emojilimit
 
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.dexkit.DexMethodCache
 import h.Hchat.hooks.api.core.WeChatApis
 import h.Hchat.hooks.api.model.WeChatVersionMatch
@@ -71,13 +71,16 @@ class EmojiCollectionLimitFeature : BaseFeature() {
         val enabled = HotConfig.flag(ID, KEY_ENABLED, DEFAULT_ENABLED) {
             config.getBoolean(ID, KEY_ENABLED, DEFAULT_ENABLED)
         }
-        HookRegistry.get().hook(method, object : XC_MethodHook() {
-            override fun beforeHookedMethod(param: MethodHookParam) {
-                if (enabled()) param.setResult(EXPANDED_LIMIT)
-            }
-        })
+        HookRegistry.get().hook(method, CollectionLimitHooker(enabled))
         if (cached == null) DexMethodCache.save(prefs, runtimeKey, CACHE_METHOD, method)
         return true
+    }
+
+    private class CollectionLimitHooker(private val enabled: () -> Boolean) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            if (enabled()) return EXPANDED_LIMIT
+            return chain.proceed()
+        }
     }
 
     private fun isLimitGetter(method: Method): Boolean =

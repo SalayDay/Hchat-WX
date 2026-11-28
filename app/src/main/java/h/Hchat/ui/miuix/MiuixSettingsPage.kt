@@ -287,8 +287,6 @@ import h.Hchat.hooks.items.groupleave.GroupLeaveMonitorFeature
 import h.Hchat.hooks.items.groupleave.GroupLeaveReplyTemplate
 import h.Hchat.hooks.items.groupleave.GroupLeaveReplyTemplateBinding
 import h.Hchat.hooks.items.groupleave.GroupLeaveMonitorSettings
-import h.Hchat.hooks.items.groupadminlabel.GroupAdminLabelFeature
-import h.Hchat.hooks.items.groupadminlabel.GroupAdminLabelSettings
 import h.Hchat.hooks.items.grouplabel.GroupChatLabel
 import h.Hchat.hooks.items.grouplabel.GroupChatLabelFeature
 import h.Hchat.hooks.items.grouplabel.GroupChatLabelStore
@@ -533,8 +531,10 @@ import h.Hchat.ui.FeatureSettingsProvider
 import h.Hchat.ui.UIRegistry
 import h.Hchat.utils.KavaReflector
 import h.Hchat.utils.KeywordReplacementRule
-import de.robv.android.xposed.XC_MethodHook
-import de.robv.android.xposed.XposedBridge
+import h.Hchat.hooks.core.HookRegistry
+import io.github.libxposed.api.XposedInterface.Chain
+import io.github.libxposed.api.XposedInterface.Hooker
+import io.github.libxposed.api.XposedInterface.HookHandle
 import org.json.JSONArray
 import org.json.JSONObject
 import top.yukonga.miuix.kmp.basic.BreadcrumbBar
@@ -1032,6 +1032,40 @@ internal fun RegisterSettingsBackHandler(onBack: (() -> Unit)?) {
 object MiuixSettingsPage {
     private const val PAGE_TAG = "Hchat:MiuixSettingsPage"
 
+    private class ActivityBackKeyHook(
+        private val page: View,
+        private val handleBack: () -> Unit
+    ) : Hooker {
+        override fun intercept(chain: Chain): Any? {
+            val event = chain.args.firstOrNull { it is KeyEvent } as? KeyEvent
+                ?: return chain.proceed()
+            if (event.keyCode != KeyEvent.KEYCODE_BACK || page.parent == null) return chain.proceed()
+            try {
+                if (event.action == KeyEvent.ACTION_UP) handleBack()
+            } catch (error: Throwable) {
+                h.Hchat.utils.HLog.e("[Hchat:MiuixSettings] 处理返回按键失败", error)
+                return chain.proceed()
+            }
+            return true
+        }
+    }
+
+    private class ActivityBackPressedHook(
+        private val page: View,
+        private val handleBack: () -> Unit
+    ) : Hooker {
+        override fun intercept(chain: Chain): Any? {
+            if (page.parent == null) return chain.proceed()
+            try {
+                handleBack()
+            } catch (error: Throwable) {
+                h.Hchat.utils.HLog.e("[Hchat:MiuixSettings] 处理返回导航失败", error)
+                return chain.proceed()
+            }
+            return null
+        }
+    }
+
     private class SettingsPageHostTag(val floatingAgent: Boolean) {
         var close: (() -> Unit)? = null
         var closeNow: (() -> Unit)? = null
@@ -1107,14 +1141,14 @@ object MiuixSettingsPage {
         val configVersion = mutableStateOf(0)
         val settingsBackHandlers = SettingsBackHandlerRegistry()
         lateinit var page: FrameLayout
-        val activityBackHooks = ArrayList<XC_MethodHook.Unhook>()
+        val activityBackHooks = ArrayList<HookHandle>()
         var consumingBack = false
         var closed = false
         var agentExitHandler: (() -> Unit)? = null
         fun unhookActivityBack() {
             activityBackHooks.forEach {
                 try {
-                    it.unhook()
+                    HookRegistry.get().unhook(it)
                 } catch (_: Throwable) {
                 }
             }
@@ -1173,38 +1207,23 @@ object MiuixSettingsPage {
         if (floatingAgent) hostTag.collapseAgent = { closePage() }
         fun installActivityBackHooks() {
             if (activityBackHooks.isNotEmpty()) return
-            val keyHook = object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    val event = param.args.firstOrNull { it is KeyEvent } as? KeyEvent ?: return
-                    if (event.keyCode != KeyEvent.KEYCODE_BACK || page.parent == null) return
-                    if (event.action == KeyEvent.ACTION_UP) {
-                        handleBack()
-                    }
-                    param.setResult(true)
-                }
-            }
-            val pressedHook = object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    if (page.parent == null) return
-                    handleBack()
-                    param.setResult(null)
-                }
-            }
+            val keyHook = ActivityBackKeyHook(page, ::handleBack)
+            val pressedHook = ActivityBackPressedHook(page, ::handleBack)
             listOf(Activity::class.java, activity.javaClass).forEach { clazz ->
                 try {
-                    activityBackHooks.addAll(XposedBridge.hookAllMethods(clazz, "dispatchKeyEvent", keyHook))
+                    activityBackHooks.addAll(HookRegistry.get().hookAllMethods(clazz, "dispatchKeyEvent", keyHook))
                 } catch (_: Throwable) {
                 }
                 try {
-                    activityBackHooks.addAll(XposedBridge.hookAllMethods(clazz, "onKeyDown", keyHook))
+                    activityBackHooks.addAll(HookRegistry.get().hookAllMethods(clazz, "onKeyDown", keyHook))
                 } catch (_: Throwable) {
                 }
                 try {
-                    activityBackHooks.addAll(XposedBridge.hookAllMethods(clazz, "onKeyUp", keyHook))
+                    activityBackHooks.addAll(HookRegistry.get().hookAllMethods(clazz, "onKeyUp", keyHook))
                 } catch (_: Throwable) {
                 }
                 try {
-                    activityBackHooks.addAll(XposedBridge.hookAllMethods(clazz, "onBackPressed", pressedHook))
+                    activityBackHooks.addAll(HookRegistry.get().hookAllMethods(clazz, "onBackPressed", pressedHook))
                 } catch (_: Throwable) {
                 }
             }
@@ -1503,26 +1522,34 @@ internal object NativeFakeLocationPickerBridge {
         }
     }
 
+    private class ActivityResultHook : Hooker {
+        override fun intercept(chain: Chain): Any? {
+            val original = chain.proceed()
+            try {
+                val requestCode = chain.args.getOrNull(0) as? Int ?: return original
+                if (requestCode != FAKE_LOCATION_WECHAT_PICKER_REQUEST_CODE) return original
+                val result = takePending() ?: return original
+                val resultCode = chain.args.getOrNull(1) as? Int ?: return original
+                val data = chain.args.getOrNull(2) as? Intent
+                if (resultCode != Activity.RESULT_OK || data == null) return original
+                val location = extractLocation(data)
+                if (location == null) {
+                    Toast.makeText(result.activity, "解析微信地图选点失败", Toast.LENGTH_SHORT).show()
+                } else {
+                    result.callback(location.first, location.second)
+                }
+            } catch (error: Throwable) {
+                h.Hchat.utils.HLog.e("[Hchat:NativeFakeLocationPickerBridge] 处理文件选择结果失败", error)
+            }
+            return original
+        }
+    }
+
     @Synchronized
     private fun hookActivityResult(clazz: Class<*>) {
         if (hookedClasses.contains(clazz)) return
         runCatching {
-            XposedBridge.hookAllMethods(clazz, "onActivityResult", object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    val requestCode = param.args.getOrNull(0) as? Int ?: return
-                    if (requestCode != FAKE_LOCATION_WECHAT_PICKER_REQUEST_CODE) return
-                    val result = takePending() ?: return
-                    val resultCode = param.args.getOrNull(1) as? Int ?: return
-                    val data = param.args.getOrNull(2) as? Intent
-                    if (resultCode != Activity.RESULT_OK || data == null) return
-                    val location = extractLocation(data)
-                    if (location == null) {
-                        Toast.makeText(result.activity, "解析微信地图选点失败", Toast.LENGTH_SHORT).show()
-                    } else {
-                        result.callback(location.first, location.second)
-                    }
-                }
-            })
+            HookRegistry.get().hookAllMethods(clazz, "onActivityResult", ActivityResultHook())
         }.onSuccess { unhooks ->
             if (unhooks.isNotEmpty()) hookedClasses.add(clazz)
         }.onFailure {
@@ -1626,22 +1653,30 @@ internal object RingtonePickerBridge {
         }
     }
 
+    private class ActivityResultHook : Hooker {
+        override fun intercept(chain: Chain): Any? {
+            val original = chain.proceed()
+            try {
+                val requestCode = chain.args.getOrNull(0) as? Int ?: return original
+                if (requestCode != RINGTONE_SYSTEM_REQUEST_CODE && requestCode != RINGTONE_FILE_REQUEST_CODE) return original
+                val resultCode = chain.args.getOrNull(1) as? Int ?: return original
+                if (resultCode != Activity.RESULT_OK) return original
+                val data = chain.args.getOrNull(2) as? Intent ?: return original
+                val picked = extractPickedUri(data, requestCode)
+                takeReadPermission(data, picked)
+                onPicked?.invoke(picked?.toString().orEmpty())
+            } catch (error: Throwable) {
+                h.Hchat.utils.HLog.e("[Hchat:RingtonePickerBridge] 处理文件选择结果失败", error)
+            }
+            return original
+        }
+    }
+
     @Synchronized
     private fun hookActivityResult(clazz: Class<*>) {
         if (hookedClasses.contains(clazz)) return
         try {
-            XposedBridge.hookAllMethods(clazz, "onActivityResult", object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    val requestCode = param.args.getOrNull(0) as? Int ?: return
-                    if (requestCode != RINGTONE_SYSTEM_REQUEST_CODE && requestCode != RINGTONE_FILE_REQUEST_CODE) return
-                    val resultCode = param.args.getOrNull(1) as? Int ?: return
-                    if (resultCode != Activity.RESULT_OK) return
-                    val data = param.args.getOrNull(2) as? Intent ?: return
-                    val picked = extractPickedUri(data, requestCode)
-                    takeReadPermission(data, picked)
-                    onPicked?.invoke(picked?.toString().orEmpty())
-                }
-            })
+            HookRegistry.get().hookAllMethods(clazz, "onActivityResult", ActivityResultHook())
             hookedClasses.add(clazz)
         } catch (_: Throwable) {
         }
@@ -1733,39 +1768,47 @@ internal object ScriptPluginAgentAttachmentPickerBridge {
         }
     }
 
+    private class ActivityResultHook : Hooker {
+        override fun intercept(chain: Chain): Any? {
+            val original = chain.proceed()
+            try {
+                val requestCode = chain.args.getOrNull(0) as? Int ?: return original
+                if (requestCode != SCRIPT_AGENT_ATTACHMENT_REQUEST_CODE) return original
+                val pending = takePending() ?: return original
+                val resultCode = chain.args.getOrNull(1) as? Int ?: return original
+                if (resultCode != Activity.RESULT_OK) return original
+                val data = chain.args.getOrNull(2) as? Intent ?: return original
+                val activity = pending.activity
+                val directory = pending.directory
+                val uris = pickedUris(data)
+                val persistentUris = uris.filter { uri ->
+                    takeReadPermission(activity, data, uri)
+                }.mapTo(HashSet()) { it.toString() }
+                Thread({
+                    val attachments = uris.mapNotNull { uri ->
+                        copyAttachment(
+                            activity,
+                            directory,
+                            uri,
+                            uri.toString() in persistentUris
+                        )
+                    }.distinctBy { it.sourceUri.ifBlank { it.path } }
+                    if (attachments.isNotEmpty()) {
+                        Handler(Looper.getMainLooper()).post { pending.callback(attachments) }
+                    }
+                }, "Hchat-Agent-Attachment-Copy").start()
+            } catch (error: Throwable) {
+                h.Hchat.utils.HLog.e("[Hchat:ScriptPluginAgentAttachmentPickerBridge] 处理文件选择结果失败", error)
+            }
+            return original
+        }
+    }
+
     @Synchronized
     private fun hookActivityResult(clazz: Class<*>) {
         if (hookedClasses.contains(clazz)) return
         try {
-            XposedBridge.hookAllMethods(clazz, "onActivityResult", object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    val requestCode = param.args.getOrNull(0) as? Int ?: return
-                    if (requestCode != SCRIPT_AGENT_ATTACHMENT_REQUEST_CODE) return
-                    val pending = takePending() ?: return
-                    val resultCode = param.args.getOrNull(1) as? Int ?: return
-                    if (resultCode != Activity.RESULT_OK) return
-                    val data = param.args.getOrNull(2) as? Intent ?: return
-                    val activity = pending.activity
-                    val directory = pending.directory
-                    val uris = pickedUris(data)
-                    val persistentUris = uris.filter { uri ->
-                        takeReadPermission(activity, data, uri)
-                    }.mapTo(HashSet()) { it.toString() }
-                    Thread({
-                        val attachments = uris.mapNotNull { uri ->
-                            copyAttachment(
-                                activity,
-                                directory,
-                                uri,
-                                uri.toString() in persistentUris
-                            )
-                        }.distinctBy { it.sourceUri.ifBlank { it.path } }
-                        if (attachments.isNotEmpty()) {
-                            Handler(Looper.getMainLooper()).post { pending.callback(attachments) }
-                        }
-                    }, "Hchat-Agent-Attachment-Copy").start()
-                }
-            })
+            HookRegistry.get().hookAllMethods(clazz, "onActivityResult", ActivityResultHook())
             hookedClasses.add(clazz)
         } catch (_: Throwable) {
         }
@@ -1898,29 +1941,37 @@ internal object PluginMarketExtraFilePickerBridge {
         }
     }
 
+    private class ActivityResultHook : Hooker {
+        override fun intercept(chain: Chain): Any? {
+            val original = chain.proceed()
+            try {
+                val requestCode = chain.args.getOrNull(0) as? Int ?: return original
+                if (requestCode != PLUGIN_MARKET_EXTRA_FILE_REQUEST_CODE) return original
+                val result = takePending() ?: return original
+                val resultCode = chain.args.getOrNull(1) as? Int ?: return original
+                if (resultCode != Activity.RESULT_OK) return original
+                val data = chain.args.getOrNull(2) as? Intent ?: return original
+                val uris = pickedUris(data)
+                if (uris.isEmpty()) return original
+                Thread({
+                    val files = uris.mapNotNull { uri -> readFile(result.activity, uri) }
+                        .distinctBy { it.name.lowercase(Locale.ROOT) }
+                    if (files.isNotEmpty()) {
+                        Handler(Looper.getMainLooper()).post { result.callback(files) }
+                    }
+                }, "Hchat-Plugin-Market-Files").start()
+            } catch (error: Throwable) {
+                h.Hchat.utils.HLog.e("[Hchat:PluginMarketExtraFilePickerBridge] 处理文件选择结果失败", error)
+            }
+            return original
+        }
+    }
+
     @Synchronized
     private fun hookActivityResult(clazz: Class<*>) {
         if (!hookedClasses.add(clazz)) return
         runCatching {
-            XposedBridge.hookAllMethods(clazz, "onActivityResult", object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    val requestCode = param.args.getOrNull(0) as? Int ?: return
-                    if (requestCode != PLUGIN_MARKET_EXTRA_FILE_REQUEST_CODE) return
-                    val result = takePending() ?: return
-                    val resultCode = param.args.getOrNull(1) as? Int ?: return
-                    if (resultCode != Activity.RESULT_OK) return
-                    val data = param.args.getOrNull(2) as? Intent ?: return
-                    val uris = pickedUris(data)
-                    if (uris.isEmpty()) return
-                    Thread({
-                        val files = uris.mapNotNull { uri -> readFile(result.activity, uri) }
-                            .distinctBy { it.name.lowercase(Locale.ROOT) }
-                        if (files.isNotEmpty()) {
-                            Handler(Looper.getMainLooper()).post { result.callback(files) }
-                        }
-                    }, "Hchat-Plugin-Market-Files").start()
-                }
-            })
+            HookRegistry.get().hookAllMethods(clazz, "onActivityResult", ActivityResultHook())
         }.onFailure {
             hookedClasses.remove(clazz)
         }
@@ -2042,27 +2093,35 @@ internal object RedPacketReplyFilePickerBridge {
         }
     }
 
+    private class ActivityResultHook : Hooker {
+        override fun intercept(chain: Chain): Any? {
+            val original = chain.proceed()
+            try {
+                val requestCode = chain.args.getOrNull(0) as? Int ?: return original
+                if (requestCode != REDPACKET_REPLY_FILE_REQUEST_CODE) return original
+                val resultCode = chain.args.getOrNull(1) as? Int ?: return original
+                if (resultCode != Activity.RESULT_OK) return original
+                val data = chain.args.getOrNull(2) as? Intent ?: return original
+                val activity = currentActivity ?: return original
+                val paths = pickedUris(data)
+                    .mapNotNull { uri ->
+                        takeReadPermission(activity, data, uri)
+                        copyReplyFileToCache(activity, uri)
+                    }
+                    .distinct()
+                if (paths.isNotEmpty()) onPicked?.invoke(paths)
+            } catch (error: Throwable) {
+                h.Hchat.utils.HLog.e("[Hchat:RedPacketReplyFilePickerBridge] 处理文件选择结果失败", error)
+            }
+            return original
+        }
+    }
+
     @Synchronized
     private fun hookActivityResult(clazz: Class<*>) {
         if (hookedClasses.contains(clazz)) return
         try {
-            XposedBridge.hookAllMethods(clazz, "onActivityResult", object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    val requestCode = param.args.getOrNull(0) as? Int ?: return
-                    if (requestCode != REDPACKET_REPLY_FILE_REQUEST_CODE) return
-                    val resultCode = param.args.getOrNull(1) as? Int ?: return
-                    if (resultCode != Activity.RESULT_OK) return
-                    val data = param.args.getOrNull(2) as? Intent ?: return
-                    val activity = currentActivity ?: return
-                    val paths = pickedUris(data)
-                        .mapNotNull { uri ->
-                            takeReadPermission(activity, data, uri)
-                            copyReplyFileToCache(activity, uri)
-                        }
-                        .distinct()
-                    if (paths.isNotEmpty()) onPicked?.invoke(paths)
-                }
-            })
+            HookRegistry.get().hookAllMethods(clazz, "onActivityResult", ActivityResultHook())
             hookedClasses.add(clazz)
         } catch (_: Throwable) {
         }
@@ -2162,27 +2221,35 @@ internal object AutoReplyFilePickerBridge {
         }
     }
 
+    private class ActivityResultHook : Hooker {
+        override fun intercept(chain: Chain): Any? {
+            val original = chain.proceed()
+            try {
+                val requestCode = chain.args.getOrNull(0) as? Int ?: return original
+                if (requestCode != AUTO_REPLY_FILE_REQUEST_CODE) return original
+                val resultCode = chain.args.getOrNull(1) as? Int ?: return original
+                if (resultCode != Activity.RESULT_OK) return original
+                val data = chain.args.getOrNull(2) as? Intent ?: return original
+                val activity = currentActivity ?: return original
+                val paths = pickedUris(data)
+                    .mapNotNull { uri ->
+                        takeReadPermission(activity, data, uri)
+                        copyReplyFileToCache(activity, uri)
+                    }
+                    .distinct()
+                if (paths.isNotEmpty()) onPicked?.invoke(paths)
+            } catch (error: Throwable) {
+                h.Hchat.utils.HLog.e("[Hchat:AutoReplyFilePickerBridge] 处理文件选择结果失败", error)
+            }
+            return original
+        }
+    }
+
     @Synchronized
     private fun hookActivityResult(clazz: Class<*>) {
         if (hookedClasses.contains(clazz)) return
         try {
-            XposedBridge.hookAllMethods(clazz, "onActivityResult", object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    val requestCode = param.args.getOrNull(0) as? Int ?: return
-                    if (requestCode != AUTO_REPLY_FILE_REQUEST_CODE) return
-                    val resultCode = param.args.getOrNull(1) as? Int ?: return
-                    if (resultCode != Activity.RESULT_OK) return
-                    val data = param.args.getOrNull(2) as? Intent ?: return
-                    val activity = currentActivity ?: return
-                    val paths = pickedUris(data)
-                        .mapNotNull { uri ->
-                            takeReadPermission(activity, data, uri)
-                            copyReplyFileToCache(activity, uri)
-                        }
-                        .distinct()
-                    if (paths.isNotEmpty()) onPicked?.invoke(paths)
-                }
-            })
+            HookRegistry.get().hookAllMethods(clazz, "onActivityResult", ActivityResultHook())
             hookedClasses.add(clazz)
         } catch (_: Throwable) {
         }
@@ -2282,27 +2349,35 @@ internal object ScheduledTaskFilePickerBridge {
         }
     }
 
+    private class ActivityResultHook : Hooker {
+        override fun intercept(chain: Chain): Any? {
+            val original = chain.proceed()
+            try {
+                val requestCode = chain.args.getOrNull(0) as? Int ?: return original
+                if (requestCode != SCHEDULED_TASK_FILE_REQUEST_CODE) return original
+                val resultCode = chain.args.getOrNull(1) as? Int ?: return original
+                if (resultCode != Activity.RESULT_OK) return original
+                val data = chain.args.getOrNull(2) as? Intent ?: return original
+                val activity = currentActivity ?: return original
+                val paths = scheduledTaskPickedUris(data)
+                    .mapNotNull { uri ->
+                        scheduledTaskTakeReadPermission(activity, data, uri)
+                        copyScheduledTaskFileToCache(activity, uri)
+                    }
+                    .distinct()
+                if (paths.isNotEmpty()) onPicked?.invoke(paths)
+            } catch (error: Throwable) {
+                h.Hchat.utils.HLog.e("[Hchat:ScheduledTaskFilePickerBridge] 处理文件选择结果失败", error)
+            }
+            return original
+        }
+    }
+
     @Synchronized
     private fun hookActivityResult(clazz: Class<*>) {
         if (hookedClasses.contains(clazz)) return
         try {
-            XposedBridge.hookAllMethods(clazz, "onActivityResult", object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    val requestCode = param.args.getOrNull(0) as? Int ?: return
-                    if (requestCode != SCHEDULED_TASK_FILE_REQUEST_CODE) return
-                    val resultCode = param.args.getOrNull(1) as? Int ?: return
-                    if (resultCode != Activity.RESULT_OK) return
-                    val data = param.args.getOrNull(2) as? Intent ?: return
-                    val activity = currentActivity ?: return
-                    val paths = scheduledTaskPickedUris(data)
-                        .mapNotNull { uri ->
-                            scheduledTaskTakeReadPermission(activity, data, uri)
-                            copyScheduledTaskFileToCache(activity, uri)
-                        }
-                        .distinct()
-                    if (paths.isNotEmpty()) onPicked?.invoke(paths)
-                }
-            })
+            HookRegistry.get().hookAllMethods(clazz, "onActivityResult", ActivityResultHook())
             hookedClasses.add(clazz)
         } catch (_: Throwable) {
         }
@@ -2425,35 +2500,43 @@ internal object AudioTransformDocumentBridge {
         }
     }
 
+    private class ActivityResultHook : Hooker {
+        override fun intercept(chain: Chain): Any? {
+            val original = chain.proceed()
+            try {
+                val requestCode = chain.args.getOrNull(0) as? Int ?: return original
+                if (requestCode != AUDIO_TRANSFORM_INPUT_REQUEST_CODE &&
+                    requestCode != AUDIO_TRANSFORM_OUTPUT_REQUEST_CODE
+                ) return original
+                val resultCode = chain.args.getOrNull(1) as? Int ?: return original
+                if (resultCode != Activity.RESULT_OK) return original
+                val data = chain.args.getOrNull(2) as? Intent ?: return original
+                val activity = currentActivity ?: return original
+                val uri = data.data ?: return original
+                if (requestCode == AUDIO_TRANSFORM_INPUT_REQUEST_CODE) {
+                    takeReadPermission(activity, data, uri)
+                    val copied = copyInputFileToCache(activity, uri) ?: return original
+                    onInputPicked?.invoke(copied.first, copied.second)
+                } else {
+                    val displayName = queryDisplayName(activity, uri)
+                        ?: uri.lastPathSegment
+                        ?.substringAfterLast('/')
+                        ?.substringAfterLast(':')
+                        .orEmpty()
+                    onOutputPicked?.invoke(uri, displayName.ifBlank { "output" })
+                }
+            } catch (error: Throwable) {
+                h.Hchat.utils.HLog.e("[Hchat:AudioTransformDocumentBridge] 处理文件选择结果失败", error)
+            }
+            return original
+        }
+    }
+
     @Synchronized
     private fun hookActivityResult(clazz: Class<*>) {
         if (hookedClasses.contains(clazz)) return
         try {
-            XposedBridge.hookAllMethods(clazz, "onActivityResult", object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    val requestCode = param.args.getOrNull(0) as? Int ?: return
-                    if (requestCode != AUDIO_TRANSFORM_INPUT_REQUEST_CODE &&
-                        requestCode != AUDIO_TRANSFORM_OUTPUT_REQUEST_CODE
-                    ) return
-                    val resultCode = param.args.getOrNull(1) as? Int ?: return
-                    if (resultCode != Activity.RESULT_OK) return
-                    val data = param.args.getOrNull(2) as? Intent ?: return
-                    val activity = currentActivity ?: return
-                    val uri = data.data ?: return
-                    if (requestCode == AUDIO_TRANSFORM_INPUT_REQUEST_CODE) {
-                        takeReadPermission(activity, data, uri)
-                        val copied = copyInputFileToCache(activity, uri) ?: return
-                        onInputPicked?.invoke(copied.first, copied.second)
-                    } else {
-                        val displayName = queryDisplayName(activity, uri)
-                            ?: uri.lastPathSegment
-                            ?.substringAfterLast('/')
-                            ?.substringAfterLast(':')
-                            .orEmpty()
-                        onOutputPicked?.invoke(uri, displayName.ifBlank { "output" })
-                    }
-                }
-            })
+            HookRegistry.get().hookAllMethods(clazz, "onActivityResult", ActivityResultHook())
             hookedClasses.add(clazz)
         } catch (_: Throwable) {
         }
@@ -2571,53 +2654,61 @@ internal object ScriptPluginDocumentBridge {
         }
     }
 
+    private class ActivityResultHook : Hooker {
+        override fun intercept(chain: Chain): Any? {
+            val original = chain.proceed()
+            try {
+                val requestCode = chain.args.getOrNull(0) as? Int ?: return original
+                if (requestCode != SCRIPT_PLUGIN_EXPORT_REQUEST_CODE &&
+                    requestCode != SCRIPT_PLUGIN_IMPORT_REQUEST_CODE
+                ) {
+                    return original
+                }
+                val owner = chain.thisObject as? Activity ?: return original
+                val callback = synchronized(ScriptPluginDocumentBridge) {
+                    if (requestCode == SCRIPT_PLUGIN_EXPORT_REQUEST_CODE) {
+                        val matches = exportOwner?.get() === owner
+                        exportCallback.takeIf { matches }.also {
+                            exportCallback = null
+                            exportOwner = null
+                        }
+                    } else {
+                        val matches = importOwner?.get() === owner
+                        importCallback.takeIf { matches }.also {
+                            importCallback = null
+                            importOwner = null
+                        }
+                    }
+                } ?: return original
+                val resultCode = chain.args.getOrNull(1) as? Int ?: return original
+                if (resultCode != Activity.RESULT_OK) return original
+                val data = chain.args.getOrNull(2) as? Intent ?: return original
+                val uri = data.data ?: return original
+                if (requestCode == SCRIPT_PLUGIN_IMPORT_REQUEST_CODE && uri.scheme == "content") {
+                    runCatching {
+                        val flags = data.flags and
+                            (Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+                        if ((flags and Intent.FLAG_GRANT_READ_URI_PERMISSION) != 0) {
+                            owner.contentResolver.takePersistableUriPermission(
+                                uri,
+                                Intent.FLAG_GRANT_READ_URI_PERMISSION
+                            )
+                        }
+                    }
+                }
+                callback(uri)
+            } catch (error: Throwable) {
+                h.Hchat.utils.HLog.e("[Hchat:ScriptPluginDocumentBridge] 处理文件选择结果失败", error)
+            }
+            return original
+        }
+    }
+
     @Synchronized
     private fun hookActivityResult(clazz: Class<*>) {
         if (hookedClasses.contains(clazz)) return
         try {
-            XposedBridge.hookAllMethods(clazz, "onActivityResult", object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    val requestCode = param.args.getOrNull(0) as? Int ?: return
-                    if (requestCode != SCRIPT_PLUGIN_EXPORT_REQUEST_CODE &&
-                        requestCode != SCRIPT_PLUGIN_IMPORT_REQUEST_CODE
-                    ) {
-                        return
-                    }
-                    val owner = param.thisObject as? Activity ?: return
-                    val callback = synchronized(this@ScriptPluginDocumentBridge) {
-                        if (requestCode == SCRIPT_PLUGIN_EXPORT_REQUEST_CODE) {
-                            val matches = exportOwner?.get() === owner
-                            exportCallback.takeIf { matches }.also {
-                                exportCallback = null
-                                exportOwner = null
-                            }
-                        } else {
-                            val matches = importOwner?.get() === owner
-                            importCallback.takeIf { matches }.also {
-                                importCallback = null
-                                importOwner = null
-                            }
-                        }
-                    } ?: return
-                    val resultCode = param.args.getOrNull(1) as? Int ?: return
-                    if (resultCode != Activity.RESULT_OK) return
-                    val data = param.args.getOrNull(2) as? Intent ?: return
-                    val uri = data.data ?: return
-                    if (requestCode == SCRIPT_PLUGIN_IMPORT_REQUEST_CODE && uri.scheme == "content") {
-                        runCatching {
-                            val flags = data.flags and
-                                (Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
-                            if ((flags and Intent.FLAG_GRANT_READ_URI_PERMISSION) != 0) {
-                                owner.contentResolver.takePersistableUriPermission(
-                                    uri,
-                                    Intent.FLAG_GRANT_READ_URI_PERMISSION
-                                )
-                            }
-                        }
-                    }
-                    callback(uri)
-                }
-            })
+            HookRegistry.get().hookAllMethods(clazz, "onActivityResult", ActivityResultHook())
             hookedClasses.add(clazz)
         } catch (_: Throwable) {
         }
@@ -2678,49 +2769,57 @@ internal object ConfigImportExportBridge {
         }
     }
 
+    private class ActivityResultHook : Hooker {
+        override fun intercept(chain: Chain): Any? {
+            val original = chain.proceed()
+            try {
+                val requestCode = chain.args.getOrNull(0) as? Int ?: return original
+                if (requestCode != CONFIG_EXPORT_REQUEST_CODE && requestCode != CONFIG_IMPORT_REQUEST_CODE) return original
+                val resultCode = chain.args.getOrNull(1) as? Int ?: return original
+                if (resultCode != Activity.RESULT_OK) return original
+                val data = chain.args.getOrNull(2) as? Intent ?: return original
+                val uri = data.data ?: return original
+                val activity = currentActivity ?: return original
+                // 导入/导出要读整份 JSON，再对 40+ 个 prefs 逐个 clear + commit。
+                // 这段原来直接跑在 onActivityResult 的回调（主线程）里，
+                // 配置稍大就是几百毫秒到数秒的主线程阻塞 → 用户侧表现为卡死/ANR。
+                // 挪到后台线程，Toast 与刷新回调再 post 回主线程。
+                val activityRef = java.lang.ref.WeakReference(activity)
+                Thread({
+                    val count = if (requestCode == CONFIG_EXPORT_REQUEST_CODE) {
+                        HchatConfigBackup.exportToUri(activity, uri)
+                    } else {
+                        HchatConfigBackup.importFromUri(activity, uri)
+                    }
+                    android.os.Handler(android.os.Looper.getMainLooper()).post {
+                        val host = activityRef.get()
+                        if (host == null || host.isFinishing || host.isDestroyed) return@post
+                        if (requestCode == CONFIG_EXPORT_REQUEST_CODE) {
+                            if (count > 0) {
+                                Toast.makeText(host, "已导出 $count 项配置", Toast.LENGTH_SHORT).show()
+                            } else {
+                                Toast.makeText(host, "导出失败", Toast.LENGTH_SHORT).show()
+                            }
+                        } else if (count > 0) {
+                            onImported?.invoke()
+                            Toast.makeText(host, "已导入 $count 项配置，当前设置页已刷新", Toast.LENGTH_LONG).show()
+                        } else {
+                            Toast.makeText(host, "导入失败或文件无配置", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                }, "Hchat-ConfigBackup").apply { isDaemon = true }.start()
+            } catch (error: Throwable) {
+                h.Hchat.utils.HLog.e("[Hchat:ConfigImportExportBridge] 处理文件选择结果失败", error)
+            }
+            return original
+        }
+    }
+
     @Synchronized
     private fun hookActivityResult(clazz: Class<*>) {
         if (hookedClasses.contains(clazz)) return
         try {
-            XposedBridge.hookAllMethods(clazz, "onActivityResult", object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    val requestCode = param.args.getOrNull(0) as? Int ?: return
-                    if (requestCode != CONFIG_EXPORT_REQUEST_CODE && requestCode != CONFIG_IMPORT_REQUEST_CODE) return
-                    val resultCode = param.args.getOrNull(1) as? Int ?: return
-                    if (resultCode != Activity.RESULT_OK) return
-                    val data = param.args.getOrNull(2) as? Intent ?: return
-                    val uri = data.data ?: return
-                    val activity = currentActivity ?: return
-                    // 导入/导出要读整份 JSON，再对 40+ 个 prefs 逐个 clear + commit。
-                    // 这段原来直接跑在 onActivityResult 的回调（主线程）里，
-                    // 配置稍大就是几百毫秒到数秒的主线程阻塞 → 用户侧表现为卡死/ANR。
-                    // 挪到后台线程，Toast 与刷新回调再 post 回主线程。
-                    val activityRef = java.lang.ref.WeakReference(activity)
-                    Thread({
-                        val count = if (requestCode == CONFIG_EXPORT_REQUEST_CODE) {
-                            HchatConfigBackup.exportToUri(activity, uri)
-                        } else {
-                            HchatConfigBackup.importFromUri(activity, uri)
-                        }
-                        android.os.Handler(android.os.Looper.getMainLooper()).post {
-                            val host = activityRef.get()
-                            if (host == null || host.isFinishing || host.isDestroyed) return@post
-                            if (requestCode == CONFIG_EXPORT_REQUEST_CODE) {
-                                if (count > 0) {
-                                    Toast.makeText(host, "已导出 $count 项配置", Toast.LENGTH_SHORT).show()
-                                } else {
-                                    Toast.makeText(host, "导出失败", Toast.LENGTH_SHORT).show()
-                                }
-                            } else if (count > 0) {
-                                onImported?.invoke()
-                                Toast.makeText(host, "已导入 $count 项配置，当前设置页已刷新", Toast.LENGTH_LONG).show()
-                            } else {
-                                Toast.makeText(host, "导入失败或文件无配置", Toast.LENGTH_SHORT).show()
-                            }
-                        }
-                    }, "Hchat-ConfigBackup").apply { isDaemon = true }.start()
-                }
-            })
+            HookRegistry.get().hookAllMethods(clazz, "onActivityResult", ActivityResultHook())
             hookedClasses.add(clazz)
         } catch (_: Throwable) {
         }
@@ -3241,10 +3340,12 @@ internal fun practicalFeatureGroups(
             title = "群组",
             providers = practicalProviders.filterByIds(
                 GroupChatLabelFeature.ID,
-                GroupAdminLabelFeature.ID,
                 AtAllNotificationBlockFeature.ID,
                 GroupLeaveMonitorFeature.ID,
-                GroupRenameMonitorFeature.ID
+                GroupRenameMonitorFeature.ID,
+                RealNameTailFeature.ID,
+                GroupNicknameColorSettings.FEATURE_ID,
+                MemberTitleFeature.ID
             )
         ),
         FeatureGroupEntry(
@@ -3337,14 +3438,6 @@ internal fun entertainmentFeatureGroups(
         FeatureGroupEntry(
             title = "点歌",
             providers = entertainmentProviders.filterByIds(QQMusicOrderFeature.ID)
-        ),
-        FeatureGroupEntry(
-            title = "群聊",
-            providers = entertainmentProviders.filterByIds(
-                RealNameTailFeature.ID,
-                GroupNicknameColorSettings.FEATURE_ID,
-                MemberTitleFeature.ID
-            )
         ),
         FeatureGroupEntry(
             title = "状态",
@@ -4032,7 +4125,6 @@ internal fun featureSubSearchTerms(featureId: String): List<String> {
         ZombieCheckFeature.ID -> listOf("僵尸粉检测", "好友关系检测", "单向好友", "删除好友", "异常好友", "好友标签")
         QQMusicOrderFeature.ID -> listOf("QQ点歌", "点歌", "音乐卡片", "点歌发送卡片", "点歌发送语音", "触发词", "歌手", "封面", "AppID", "允许点歌聊天")
         GroupChatLabelFeature.ID -> listOf("群聊标签", "群组分类", "群聊分类", "标签群聊", "批量选择群聊")
-        GroupAdminLabelFeature.ID -> listOf("群聊管理员标签", "群主标签", "管理员标签", "真名标签", "群成员标签")
         QuickGroupChatLabelFeature.ID -> listOf("快捷设置群聊标签", "群聊标签", "会话长按菜单", "聊天分组", "群聊分类")
         GroupLeaveMonitorFeature.ID -> listOf("进退群监控", "进群邀请", "退群提醒", "监听群", "批量保护", "新群保护", "群成员变化")
         GroupRenameMonitorFeature.ID -> listOf("改名监控", "群昵称", "群内昵称", "改名提醒", "改名卡片", "改名模板", "批量套用", "改名系统消息")
@@ -4971,7 +5063,6 @@ internal fun FeatureSettingsPage(
         CustomFriendAvatarFeature.ID -> CustomFriendAvatarMiuixPage(context, provider, onBack)
         MessageBlockFeature.ID -> MessageBlockMiuixPage(context, provider, onBack)
         GroupChatLabelFeature.ID -> GroupChatLabelMiuixPage(context, provider, onBack)
-        GroupAdminLabelFeature.ID -> GroupAdminLabelMiuixPage(context, provider, onBack)
         GroupLeaveMonitorFeature.ID -> GroupLeaveMonitorMiuixPage(context, provider, onBack)
         GroupRenameMonitorFeature.ID -> GroupRenameMonitorMiuixPage(context, provider, onBack)
         MomentsAutoLikeFeature.ID -> MomentsAutoLikeMiuixPage(context, provider, onBack)
@@ -9640,84 +9731,6 @@ internal fun HchatExtraToggleMiuixPage(
                         provider.title(),
                         summary,
                         defaultValue
-                    )
-                }
-            }
-        }
-    }
-}
-
-/**
- * 群聊管理员标签显示：三个独立开关。
- *
- * 开关直接写 feature prefs，运行时通过 `HotConfig.flag` 读取（3 秒缓存），
- * 所以切换后不需要重启微信，滚动一下聊天列表就生效。
- */
-@Composable
-internal fun GroupAdminLabelMiuixPage(
-    context: Context,
-    provider: FeatureSettingsProvider,
-    onBack: () -> Unit
-) {
-    val sp = remember(context, provider.featureId()) {
-        ConfigStore(context).getFeaturePrefs(provider.featureId())
-    }
-    val listState = rememberLazyListState()
-    val scrollBehavior = MiuixScrollBehavior()
-
-    PageScaffold(
-        title = provider.title(),
-        largeTitle = provider.title(),
-        scrollBehavior = scrollBehavior,
-        bottomBar = { BottomActionBar("返回", onBack) }
-    ) { padding ->
-        LazyColumn(
-            modifier = Modifier.fillMaxSize().nestedScroll(scrollBehavior.nestedScrollConnection),
-            state = listState,
-            contentPadding = PaddingValues(
-                top = padding.calculateTopPadding() + 8.dp,
-                bottom = padding.calculateBottomPadding() + 84.dp
-            )
-        ) {
-            item { SmallTitle(text = "群聊聊天界面显示") }
-            item {
-                SettingsCard {
-                    SwitchRow(
-                        sp,
-                        GroupAdminLabelSettings.KEY_OWNER,
-                        "群主标签",
-                        "群主发的消息，昵称前显示「群主」",
-                        GroupAdminLabelSettings.DEFAULT_SHOW
-                    )
-                    InsetDivider()
-                    SwitchRow(
-                        sp,
-                        GroupAdminLabelSettings.KEY_ADMIN,
-                        "管理员标签",
-                        "群管理员发的消息，昵称前显示「管理员」（群主不重复显示）",
-                        GroupAdminLabelSettings.DEFAULT_SHOW
-                    )
-                    InsetDivider()
-                    SwitchRow(
-                        sp,
-                        GroupAdminLabelSettings.KEY_REAL_NAME,
-                        "部分真名标签",
-                        "昵称前显示脱敏真名（如「张*」），复用「实名尾字」已缓存的真名数据",
-                        GroupAdminLabelSettings.DEFAULT_SHOW
-                    )
-                }
-            }
-            item { SmallTitle(text = "说明") }
-            item {
-                SettingsCard {
-                    Text(
-                        text = "标签只在群聊里出现，单聊不显示；自己发的消息不加标签。" +
-                            "三个开关互相独立，可以只开其中一个。「部分真名」需要该成员的真名" +
-                            "已经由「实名尾字」功能获取过，没获取到就先不显示。" +
-                            "标签排在昵称前面，「实名尾字」的尾字仍在昵称后面，两者可以同时使用。",
-                        style = MiuixTheme.textStyles.footnote1,
-                        color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
-                        modifier = Modifier.padding(horizontal = 18.dp, vertical = 12.dp)
                     )
                 }
             }
@@ -16889,7 +16902,7 @@ internal fun ChatPurifyMiuixPage(
                         sp,
                         ChatPurifyFeature.KEY_HIDE_SYSTEM_TIP,
                         "隐藏系统灰字提示",
-                        "聊天里类型为 10000 的系统提示（撤回、拍一拍、入群提示等）整行隐藏",
+                        "隐藏普通系统灰字；保留已登记的新防撤回提示和微信原生红包领取提示",
                         ChatPurifyFeature.DEFAULT_HIDE_SYSTEM_TIP
                     )
                 }
@@ -16899,7 +16912,8 @@ internal fun ChatPurifyMiuixPage(
                 SettingsCard {
                     Text(
                         text = "两项都只处理识别得到的目标：分割线按装饰类名判断，系统提示按消息类型判断，" +
-                            "识别不到就不动界面，不会按文字内容猜、也不会误伤正常消息。",
+                            "防撤回和原生开包回调生成的领取提示通过精确来源登记保留，不按文字猜测，也不补插重复消息。" +
+                            "红包文案、详情链接和原生显示位置不变；旧版本未登记来源的历史提示可关闭此开关查看。",
                         style = MiuixTheme.textStyles.footnote1,
                         color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
                         modifier = Modifier.padding(horizontal = 18.dp, vertical = 12.dp)

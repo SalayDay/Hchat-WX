@@ -6,7 +6,7 @@ import android.os.Looper
 import android.view.ContextMenu
 import android.view.MenuItem
 import android.widget.Toast
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.event.Events
 import h.Hchat.hooks.api.core.WeChatApis
 import h.Hchat.hooks.core.BaseFeature
@@ -102,11 +102,7 @@ private class QuickGroupChatLabelRuntime(
     @Synchronized
     fun installConversationMenuHook(): Boolean {
         val create = ConversationMenuLocator.menuCreateMethod(context, logger) ?: return false
-        return hook(create, object : XC_MethodHook() {
-            override fun afterHookedMethod(param: MethodHookParam) {
-                addMenuItem(param)
-            }
-        })
+        return hook(create, ConversationMenuHook(this))
     }
 
     fun destroy() {
@@ -114,17 +110,6 @@ private class QuickGroupChatLabelRuntime(
         bindings.clear()
     }
 
-    private fun addMenuItem(param: XC_MethodHook.MethodHookParam) {
-        if (!enabled()) return
-        val menu = param.args?.getOrNull(0) as? ContextMenu ?: return
-        if (!installMenuClickHook(param.thisObject)) return
-        val target = resolveTarget(param.thisObject) ?: return
-        menu.removeItem(MENU_ITEM_ID)
-        val groupId = runCatching { menu.getItem(0).groupId }.getOrDefault(0)
-        val item = menu.add(groupId, MENU_ITEM_ID, 0, MENU_TITLE)
-        moveMenuItemToFront(menu, item)
-        bindings[item] = target
-    }
 
     private fun installMenuClickHook(listener: Any?): Boolean {
         listener ?: return false
@@ -144,15 +129,7 @@ private class QuickGroupChatLabelRuntime(
                 candidate.returnType == Void.TYPE &&
                     candidate.declaringClass.name.startsWith("com.tencent.mm.ui.conversation.")
             } ?: return false
-        return hook(method, object : XC_MethodHook() {
-            override fun beforeHookedMethod(param: MethodHookParam) {
-                val item = param.args?.getOrNull(0) as? MenuItem ?: return
-                if (item.itemId != MENU_ITEM_ID) return
-                val target = bindings.remove(item) ?: return
-                param.setResult(null)
-                main.post { showLabelActions(target) }
-            }
-        })
+        return hook(method, MenuClickHook(this))
     }
 
     private fun resolveTarget(listener: Any?): MenuTarget? {
@@ -340,7 +317,7 @@ private class QuickGroupChatLabelRuntime(
         }
     }
 
-    private fun hook(method: Method, callback: XC_MethodHook): Boolean {
+    private fun hook(method: Method, callback: XposedInterface.Hooker): Boolean {
         if (Modifier.isAbstract(method.modifiers) || method.declaringClass.isInterface) return false
         if (!hookedMethods.add(method)) return true
         return runCatching {
@@ -356,5 +333,36 @@ private class QuickGroupChatLabelRuntime(
     companion object {
         private const val MENU_ITEM_ID = 0x4843514C
         private const val MENU_TITLE = "群聊标签"
+    }
+
+    private class ConversationMenuHook(private val owner: QuickGroupChatLabelRuntime) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            return with(owner) {
+                val outcome = chain.proceed()
+                val args = chain.args
+                if (!enabled()) return outcome
+                val menu = args.getOrNull(0) as? ContextMenu ?: return outcome
+                if (!installMenuClickHook(chain.thisObject)) return outcome
+                val target = resolveTarget(chain.thisObject) ?: return outcome
+                menu.removeItem(MENU_ITEM_ID)
+                val groupId = runCatching { menu.getItem(0).groupId }.getOrDefault(0)
+                val item = menu.add(groupId, MENU_ITEM_ID, 0, MENU_TITLE)
+                moveMenuItemToFront(menu, item)
+                bindings[item] = target
+                return outcome
+            }
+        }
+    }
+
+    private class MenuClickHook(private val owner: QuickGroupChatLabelRuntime) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            return with(owner) {
+                val item = chain.args.getOrNull(0) as? MenuItem ?: return chain.proceed()
+                if (item.itemId != MENU_ITEM_ID) return chain.proceed()
+                val target = bindings.remove(item) ?: return chain.proceed()
+                main.post { showLabelActions(target) }
+                return null
+            }
+        }
     }
 }

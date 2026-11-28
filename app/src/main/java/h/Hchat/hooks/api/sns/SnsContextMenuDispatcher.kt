@@ -7,7 +7,7 @@ import android.view.MenuItem
 import android.view.View
 import android.widget.TextView
 import android.widget.Toast
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.hooks.api.core.WeChatApis
 import h.Hchat.hooks.core.FeatureContext
 import h.Hchat.hooks.core.HookRegistry
@@ -76,25 +76,13 @@ internal object SnsContextMenuDispatcher {
         this.resolver = resolver
         this.logger = logger
         val createHooked = SnsContextMenuLocator.menuCreateMethods(context, logger).count { method ->
-            hook(method, object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    addMenus(param)
-                }
-            })
+            hook(method, MenuCreateHooker())
         }
         val clickHooked = SnsContextMenuLocator.menuClickMethods(context, logger).count { method ->
-            hook(method, object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    handleClick(param)
-                }
-            })
+            hook(method, MenuClickHooker())
         }
         val foldHooked = SnsContextMenuLocator.foldBindCompletionMethods(context, logger).count { method ->
-            hook(method, object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    bindFoldLongClick(param)
-                }
-            })
+            hook(method, FoldBindHooker())
         }
         if (createHooked <= 0) logger("朋友圈共享菜单创建Hook未安装", null)
         if (clickHooked <= 0) logger("朋友圈共享菜单点击Hook未安装", null)
@@ -102,7 +90,31 @@ internal object SnsContextMenuDispatcher {
         return createHooked > 0 && clickHooked > 0
     }
 
-    private fun hook(method: Method, callback: XC_MethodHook): Boolean {
+    private class MenuCreateHooker : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val result = chain.proceed()
+            addMenus(chain)
+            return result
+        }
+    }
+
+    private class MenuClickHooker : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val result = chain.proceed()
+            handleClick(chain)
+            return result
+        }
+    }
+
+    private class FoldBindHooker : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val result = chain.proceed()
+            bindFoldLongClick(chain)
+            return result
+        }
+    }
+
+    private fun hook(method: Method, callback: XposedInterface.Hooker): Boolean {
         if (Modifier.isAbstract(method.modifiers) || method.declaringClass.isInterface) return false
         if (!hookedMethods.add(method)) return true
         return runCatching {
@@ -115,12 +127,12 @@ internal object SnsContextMenuDispatcher {
         }
     }
 
-    private fun addMenus(param: XC_MethodHook.MethodHookParam) {
-        val target = resolveTarget(param) ?: return
+    private fun addMenus(chain: XposedInterface.Chain) {
+        val target = resolveTarget(chain) ?: return
         val active = activeEntries(target)
         if (active.isEmpty()) return
-        val menu = param.args?.getOrNull(0) ?: return
-        val view = param.args?.getOrNull(1) as? View
+        val menu = chain.args.getOrNull(0) ?: return
+        val view = chain.args.getOrNull(1) as? View
         bindings.clear()
         pendingByItemId.clear()
         active.forEach { entry ->
@@ -130,8 +142,8 @@ internal object SnsContextMenuDispatcher {
         }
     }
 
-    private fun bindFoldLongClick(param: XC_MethodHook.MethodHookParam) {
-        val owner = param.thisObject ?: return
+    private fun bindFoldLongClick(chain: XposedInterface.Chain) {
+        val owner = chain.thisObject ?: return
         val fields = KavaReflector.declaredFields(owner.javaClass)
             .filterNot { Modifier.isStatic(it.modifiers) }
         val textView = fields.asSequence()
@@ -310,15 +322,15 @@ internal object SnsContextMenuDispatcher {
     }
 
     @Synchronized
-    private fun handleClick(param: XC_MethodHook.MethodHookParam) {
-        val item = param.args?.firstNotNullOfOrNull { it as? MenuItem } ?: return
+    private fun handleClick(chain: XposedInterface.Chain) {
+        val item = chain.args.firstNotNullOfOrNull { it as? MenuItem } ?: return
         val entry = entries.values.firstOrNull { it.itemId == item.itemId } ?: return
         if (!runCatching(entry.isEnabled).getOrDefault(false)) return
         val now = SystemClock.elapsedRealtime()
         if (lastHandledItem?.get() === item && now - lastHandledAt < CLICK_DEDUP_MS) return
         val target = bindings.remove(item)
             ?: pendingByItemId.remove(item.itemId)?.get()
-            ?: resolveTarget(param)
+            ?: resolveTarget(chain)
             ?: return
         bindings.clear()
         pendingByItemId.clear()
@@ -332,10 +344,11 @@ internal object SnsContextMenuDispatcher {
         }
     }
 
-    private fun resolveTarget(param: XC_MethodHook.MethodHookParam): SnsContextMenuTarget? {
+    private fun resolveTarget(chain: XposedInterface.Chain): SnsContextMenuTarget? {
         val currentResolver = resolver ?: return null
-        val snapshot = currentResolver.resolve(param.thisObject, param.args) ?: return null
-        var nativeInfo = currentResolver.resolveNativeSnsInfo(param.thisObject, param.args)
+        val args = chain.args.toTypedArray()
+        val snapshot = currentResolver.resolve(chain.thisObject, args) ?: return null
+        var nativeInfo = currentResolver.resolveNativeSnsInfo(chain.thisObject, args)
         val nativeId = nativeInfo?.let(::snsIdFromNative)
         val snapshotId = normalizeSnsId(snapshot.id)
         // nativeId 读不到时不能当成"对不上"：那样每次都会把 nativeInfo 丢掉，
@@ -351,7 +364,7 @@ internal object SnsContextMenuDispatcher {
             snsId = stableId,
             snapshot = snapshot,
             nativeInfo = nativeInfo,
-            anchorView = param.args?.firstNotNullOfOrNull { it as? View }?.let { WeakReference(it) }
+            anchorView = chain.args.firstNotNullOfOrNull { it as? View }?.let { WeakReference(it) }
         )
     }
 

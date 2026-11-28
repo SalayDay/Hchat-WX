@@ -10,7 +10,7 @@ import h.Hchat.utils.KavaReflector;
 
 import java.lang.reflect.Method;
 
-import de.robv.android.xposed.XC_MethodHook;
+import io.github.libxposed.api.XposedInterface;
 
 /**
  * 数据库插入兜底监听。
@@ -81,14 +81,7 @@ public class RedPacketDatabaseHook {
                 }
                 if (!hasContentValuesArg(method)) continue;
 
-                HookRegistry.get().hook(method, new XC_MethodHook() {
-                    @Override
-                    public void beforeHookedMethod(MethodHookParam param) {
-                        ContentValues values = findContentValuesArg(param.args);
-                        if (values == null) return;
-                        handleDatabaseInsert(findTableNameArg(param.args), values);
-                    }
-                });
+                HookRegistry.get().hook(method, new DatabaseMessageHooker(this));
                 hookedCount++;
             }
             if (hookedCount > 0) log("数据库兜底Hook: " + className + " count=" + hookedCount);
@@ -213,4 +206,27 @@ public class RedPacketDatabaseHook {
     private void log(String message) {
         if (logger != null) logger.log(message);
     }
+
+    private void inspectDatabaseMessage(Object receiver, Object[] args) {
+        ContentValues values = findContentValuesArg(args);
+        if (values == null) return;
+        handleDatabaseInsert(findTableNameArg(args), values);
+    }
+
+    private static final class DatabaseMessageHooker implements XposedInterface.Hooker {
+        private final RedPacketDatabaseHook owner;
+
+        DatabaseMessageHooker(RedPacketDatabaseHook owner) {
+            this.owner = owner;
+        }
+
+        @Override
+        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+            Object receiver = chain.getThisObject();
+            Object[] args = chain.getArgs().toArray();
+            owner.inspectDatabaseMessage(receiver, args);
+            return chain.proceed(args);
+        }
+    }
+
 }

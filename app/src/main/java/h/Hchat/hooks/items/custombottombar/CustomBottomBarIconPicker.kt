@@ -2,8 +2,10 @@ package h.Hchat.hooks.items.custombottombar
 
 import android.app.Activity
 import android.content.Intent
-import de.robv.android.xposed.XC_MethodHook
-import de.robv.android.xposed.XposedBridge
+import io.github.libxposed.api.XposedInterface
+import h.Hchat.hooks.core.HookRegistry
+import h.Hchat.utils.HLog
+import h.Hchat.utils.KavaReflector
 import java.lang.ref.WeakReference
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
@@ -86,52 +88,18 @@ object CustomBottomBarIconPicker {
     private fun hookActivityResult(clazz: Class<*>) {
         if (!resultHookedClasses.add(clazz)) return
         runCatching {
-            XposedBridge.hookAllMethods(clazz, "onActivityResult", object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    val requestCode = param.args.getOrNull(0) as? Int ?: return
-                    val request = pending[requestCode] ?: return
-                    val activity = request.activity.get()
-                    if (activity == null) {
-                        pending.remove(requestCode, request)
-                        return
-                    }
-                    if (param.thisObject !== activity) return
-                    val resultCode = param.args.getOrNull(1) as? Int ?: return
-                    val data = param.args.getOrNull(2) as? Intent
-                    val uri = data?.data
-                    if (resultCode != Activity.RESULT_OK || uri == null) {
-                        if (pending.remove(requestCode, request)) {
-                            request.callback(CustomBottomBarIconPickResult.CANCELLED)
+            val handles = HookRegistry.get().hookAllMethods(clazz, "onActivityResult", IconResultHook())
+            val expected = KavaReflector.declaredMethods(clazz).count { it.name == "onActivityResult" }
+            if (handles.size != expected) {
+                handles.forEach { handle ->
+                    runCatching { HookRegistry.get().unhook(handle) }
+                        .onFailure { error ->
+                            HookRegistry.get().add(handle)
+                            HLog.e("[Hchat] 回滚结果 Hook 失败: ${clazz.name}#onActivityResult", error)
                         }
-                        return
-                    }
-                    if (!request.processing.compareAndSet(false, true)) return
-                    val appContext = activity.applicationContext
-                    Thread({
-                        val path = runCatching {
-                            CustomBottomBarIconStore.saveFromUri(appContext, request.tabKey, uri)
-                        }.getOrNull()
-                        val owner = request.activity.get()
-                        if (owner == null) {
-                            pending.remove(requestCode, request)
-                            CustomBottomBarIconStore.delete(appContext, path)
-                            return@Thread
-                        }
-                        owner.runOnUiThread {
-                            if (!pending.remove(requestCode, request) ||
-                                owner.isFinishing || owner.isDestroyed
-                            ) {
-                                CustomBottomBarIconStore.delete(appContext, path)
-                                return@runOnUiThread
-                            }
-                            request.callback(
-                                path?.let(CustomBottomBarIconPickResult::Saved)
-                                    ?: CustomBottomBarIconPickResult.FAILED
-                            )
-                        }
-                    }, "Hchat-CustomBottomBarIcon").start()
                 }
-            })
+                error("结果 Hook 安装不完整: ${clazz.name}#onActivityResult ${handles.size}/$expected")
+            }
         }.onFailure { resultHookedClasses.remove(clazz) }
     }
 
@@ -139,22 +107,88 @@ object CustomBottomBarIconPicker {
     private fun hookActivityDestroy(clazz: Class<*>) {
         if (!destroyHookedClasses.add(clazz)) return
         runCatching {
-            XposedBridge.hookAllMethods(clazz, "onDestroy", object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    val activity = param.thisObject as? Activity ?: return
-                    pending.entries.forEach { entry ->
-                        val owner = entry.value.activity.get()
-                        if (owner == null || owner === activity) {
-                            pending.remove(entry.key, entry.value)
+            val handles = HookRegistry.get().hookAllMethods(clazz, "onDestroy", ActivityDestroyHook())
+            val expected = KavaReflector.declaredMethods(clazz).count { it.name == "onDestroy" }
+            if (handles.size != expected) {
+                handles.forEach { handle ->
+                    runCatching { HookRegistry.get().unhook(handle) }
+                        .onFailure { error ->
+                            HookRegistry.get().add(handle)
+                            HLog.e("[Hchat] 回滚结果 Hook 失败: ${clazz.name}#onDestroy", error)
                         }
-                    }
                 }
-            })
+                error("结果 Hook 安装不完整: ${clazz.name}#onDestroy ${handles.size}/$expected")
+            }
         }.onFailure { destroyHookedClasses.remove(clazz) }
     }
 
     private const val REQUEST_CODE_START = 0x7710
     private const val REQUEST_CODE_END = 0x77ff
+
+    private class IconResultHook : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val outcome = chain.proceed()
+            val args = chain.args
+            val requestCode = args.getOrNull(0) as? Int ?: return outcome
+            val request = pending[requestCode] ?: return outcome
+            val activity = request.activity.get()
+            if (activity == null) {
+                pending.remove(requestCode, request)
+                return outcome
+            }
+            if (chain.thisObject !== activity) return outcome
+            val resultCode = args.getOrNull(1) as? Int ?: return outcome
+            val data = args.getOrNull(2) as? Intent
+            val uri = data?.data
+            if (resultCode != Activity.RESULT_OK || uri == null) {
+                if (pending.remove(requestCode, request)) {
+                    request.callback(CustomBottomBarIconPickResult.CANCELLED)
+                }
+                return outcome
+            }
+            if (!request.processing.compareAndSet(false, true)) return outcome
+            val appContext = activity.applicationContext
+            Thread({
+                val path = runCatching {
+                    CustomBottomBarIconStore.saveFromUri(appContext, request.tabKey, uri)
+                }.getOrNull()
+                val owner = request.activity.get()
+                if (owner == null) {
+                    pending.remove(requestCode, request)
+                    CustomBottomBarIconStore.delete(appContext, path)
+                    return@Thread
+                }
+                owner.runOnUiThread {
+                    if (!pending.remove(requestCode, request) ||
+                        owner.isFinishing || owner.isDestroyed
+                    ) {
+                        CustomBottomBarIconStore.delete(appContext, path)
+                        return@runOnUiThread
+                    }
+                    request.callback(
+                        path?.let(CustomBottomBarIconPickResult::Saved)
+                            ?: CustomBottomBarIconPickResult.FAILED
+                    )
+                }
+            }, "Hchat-CustomBottomBarIcon").start()
+            return outcome
+        }
+    }
+
+    private class ActivityDestroyHook : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val outcome = chain.proceed()
+
+            val activity = chain.thisObject as? Activity ?: return outcome
+            pending.entries.forEach { entry ->
+                val owner = entry.value.activity.get()
+                if (owner == null || owner === activity) {
+                    pending.remove(entry.key, entry.value)
+                }
+            }
+            return outcome
+        }
+    }
 }
 
 sealed class CustomBottomBarIconPickResult {

@@ -22,7 +22,7 @@ class KeywordNotificationFeature : BaseFeature() {
                 HLog.e("$TAG 消息观察 API 未就绪")
                 return@subscribe
             }
-            trackSubscription(observe.subscribe { message ->
+            trackSubscription(observe.subscribe(ID) { message ->
                 KeywordNotificationRuntime.handleMessage(context.hostContext(), message)
             })
         }

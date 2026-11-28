@@ -1,6 +1,6 @@
 package h.Hchat.hooks.items.zombiecheck
 
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.dexkit.DexMethodCache
 import h.Hchat.event.Events
 import h.Hchat.hooks.api.core.WeChatApis
@@ -80,18 +80,7 @@ internal class ZombieCheckHooker(
             val callback = locateCallbackMethod(constructor) ?: return false
             locateDeleteMethod()
             WeChatApis.network()?.installNetworkHook(context.dexFinder())
-            HookRegistry.get().hook(callback, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    val args = param.args ?: return
-                    if (args.size != 3) return
-                    runtime.onProbeCallback(
-                        scene = param.thisObject,
-                        errCode = (args[0] as? Number)?.toInt() ?: return,
-                        errMessage = args[1]?.toString().orEmpty(),
-                        response = args[2] as? JSONObject
-                    )
-                }
-            })
+            HookRegistry.get().hook(callback, ProbeCallbackHooker(runtime))
             probeConstructor = constructor
             installed = true
             runtime.markReady()
@@ -99,6 +88,22 @@ internal class ZombieCheckHooker(
         }.getOrElse {
             logger("僵尸粉检测 Hook 安装失败", it)
             false
+        }
+    }
+
+    private class ProbeCallbackHooker(private val runtime: ZombieCheckRuntime) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val args = chain.args
+            val errCode = (args.getOrNull(0) as? Number)?.toInt()
+            if (args.size == 3 && errCode != null) {
+                runtime.onProbeCallback(
+                    scene = chain.thisObject,
+                    errCode = errCode,
+                    errMessage = args[1]?.toString().orEmpty(),
+                    response = args[2] as? JSONObject
+                )
+            }
+            return chain.proceed()
         }
     }
 

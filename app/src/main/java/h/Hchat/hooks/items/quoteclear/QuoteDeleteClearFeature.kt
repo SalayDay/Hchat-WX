@@ -6,7 +6,7 @@ import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputConnection
 import android.view.inputmethod.InputConnectionWrapper
 import android.widget.TextView
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.dexkit.DexMethodCache
 import h.Hchat.event.Events
 import h.Hchat.hooks.core.BaseFeature
@@ -87,22 +87,9 @@ private class QuoteDeleteClearRuntime(
         val onAttached = KavaReflector.findMethodRecursive(footerClass, "onAttachedToWindow") ?: return false
         val onDetached = KavaReflector.findMethodRecursive(footerClass, "onDetachedFromWindow")
         return runCatching {
-            HookRegistry.get().hook(onAttached, object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    val footer = param.thisObject
-                    if (footer is View) {
-                        currentFooterRef = WeakReference(footer)
-                    }
-                }
-            })
+            HookRegistry.get().hook(onAttached, FooterAttachedHooker(this))
             if (onDetached != null) {
-                HookRegistry.get().hook(onDetached, object : XC_MethodHook() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        if (currentFooterRef.get() === param.thisObject) {
-                            currentFooterRef = WeakReference(null)
-                        }
-                    }
-                })
+                HookRegistry.get().hook(onDetached, FooterDetachedHooker(this))
             }
             footerLifecycleHookInstalled = true
             true
@@ -120,17 +107,7 @@ private class QuoteDeleteClearRuntime(
             EditorInfo::class.java
         ) ?: return false
         return runCatching {
-            HookRegistry.get().hook(method, object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    val input = param.thisObject as? TextView ?: return
-                    val footer = footerForInput(input) ?: return
-                    val target = param.result as? InputConnection ?: return
-                    val footerRef = WeakReference(footer)
-                    param.result = QuoteDeleteInputConnection(target) {
-                        clearQuoteByInputDelete(input, footerRef)
-                    }
-                }
-            })
+            HookRegistry.get().hook(method, CreateInputConnectionHooker(this))
             inputConnectionHookInstalled = true
             true
         }.getOrElse {
@@ -146,13 +123,7 @@ private class QuoteDeleteClearRuntime(
             return false
         }
         return runCatching {
-            HookRegistry.get().hook(method, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    if (handleOnKeyDelete(param)) {
-                        param.setResult(true)
-                    }
-                }
-            })
+            HookRegistry.get().hook(method, DeleteKeyHooker(this))
             onKeyHookInstalled = true
             true
         }.getOrElse {
@@ -161,12 +132,59 @@ private class QuoteDeleteClearRuntime(
         }
     }
 
-    private fun handleOnKeyDelete(param: XC_MethodHook.MethodHookParam): Boolean {
+    private class FooterAttachedHooker(
+        private val runtime: QuoteDeleteClearRuntime
+    ) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val result = chain.proceed()
+            val footer = chain.thisObject
+            if (footer is View) runtime.currentFooterRef = WeakReference(footer)
+            return result
+        }
+    }
+
+    private class FooterDetachedHooker(
+        private val runtime: QuoteDeleteClearRuntime
+    ) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val result = chain.proceed()
+            if (runtime.currentFooterRef.get() === chain.thisObject) {
+                runtime.currentFooterRef = WeakReference(null)
+            }
+            return result
+        }
+    }
+
+    private class CreateInputConnectionHooker(
+        private val runtime: QuoteDeleteClearRuntime
+    ) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val result = chain.proceed()
+            val input = chain.thisObject as? TextView ?: return result
+            val footer = runtime.footerForInput(input) ?: return result
+            val target = result as? InputConnection ?: return result
+            val footerRef = WeakReference(footer)
+            return QuoteDeleteInputConnection(target) {
+                runtime.clearQuoteByInputDelete(input, footerRef)
+            }
+        }
+    }
+
+    private class DeleteKeyHooker(
+        private val runtime: QuoteDeleteClearRuntime
+    ) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            if (runtime.handleOnKeyDelete(chain.thisObject, chain.args.toTypedArray())) return true
+            return chain.proceed()
+        }
+    }
+
+    private fun handleOnKeyDelete(owner: Any?, args: Array<Any?>): Boolean {
         if (!isEnabled()) return false
-        val event = param.args?.getOrNull(2) as? KeyEvent ?: return false
+        val event = args.getOrNull(2) as? KeyEvent ?: return false
         if (event.action != KeyEvent.ACTION_DOWN || event.keyCode != KeyEvent.KEYCODE_DEL) return false
-        val footer = findChatFooter(param) ?: currentFooter() ?: return false
-        if (inputText(param, footer).isNotEmpty()) return false
+        val footer = findChatFooter(owner, args) ?: currentFooter() ?: return false
+        if (inputText(args, footer).isNotEmpty()) return false
         return clearQuoteAndRefresh(footer)
     }
 
@@ -185,11 +203,11 @@ private class QuoteDeleteClearRuntime(
         return true
     }
 
-    private fun findChatFooter(param: XC_MethodHook.MethodHookParam): Any? {
-        (param.args?.getOrNull(0) as? View)?.let { view ->
+    private fun findChatFooter(owner: Any?, args: Array<Any?>): Any? {
+        (args.getOrNull(0) as? View)?.let { view ->
             findChatFooterInParents(view)?.let { return it }
         }
-        return findChatFooterFromObject(param.thisObject, 0)
+        return findChatFooterFromObject(owner, 0)
     }
 
     private fun footerForInput(input: View): Any? {
@@ -292,8 +310,8 @@ private class QuoteDeleteClearRuntime(
         return (KavaReflector.invokeMethod(footer, "getLastText") as? CharSequence)?.toString().orEmpty()
     }
 
-    private fun inputText(param: XC_MethodHook.MethodHookParam, footer: Any): String {
-        val input = param.args?.getOrNull(0) as? TextView
+    private fun inputText(args: Array<Any?>, footer: Any): String {
+        val input = args.getOrNull(0) as? TextView
         return input?.text?.toString() ?: lastText(footer)
     }
 

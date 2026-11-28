@@ -47,7 +47,7 @@ class GroupLeaveMonitorRuntime(
         if (observeApi != null && observeApi.isAvailable()) {
             runCatching { observeApi.install() }
                 .onFailure { logger("邀请详情消息监听安装失败", it) }
-            track(observeApi.subscribe { message ->
+            track(observeApi.subscribe(GroupLeaveMonitorFeature.ID) { message ->
                 handleObservedMessage(message)
             })
         }

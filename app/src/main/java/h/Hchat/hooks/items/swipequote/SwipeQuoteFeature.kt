@@ -18,7 +18,7 @@ import android.view.inputmethod.InputMethodManager
 import android.widget.TextView
 import android.widget.EditText
 import android.widget.Toast
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.dexkit.DexMethodCache
 import h.Hchat.event.Events
 import h.Hchat.hooks.api.core.WeChatApis
@@ -144,15 +144,7 @@ private class SwipeQuoteAdapter(
         if (Modifier.isAbstract(method.modifiers) || method.declaringClass.isInterface) return false
         if (!repeatMenuHookedMethods.add(method)) return true
         return runCatching {
-            HookRegistry.get().hook(method, object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    if (menuCreate) addRepeatMenu(param)
-                }
-
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    if (!menuCreate) handleRepeatMenuClick(param)
-                }
-            })
+            HookRegistry.get().hook(method, if (menuCreate) RepeatMenuHook(this) else RepeatMenuClickHook(this))
             true
         }.getOrElse {
             repeatMenuHookedMethods.remove(method)
@@ -161,10 +153,88 @@ private class SwipeQuoteAdapter(
         }
     }
 
-    private fun addRepeatMenu(param: XC_MethodHook.MethodHookParam) {
+    private class RepeatMenuHook(private val owner: SwipeQuoteAdapter) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val result = chain.proceed()
+            owner.addRepeatMenu(chain.thisObject, chain.args.toTypedArray())
+            return result
+        }
+    }
+
+    private class RepeatMenuClickHook(private val owner: SwipeQuoteAdapter) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            owner.handleRepeatMenuClick(chain.thisObject, chain.args.toTypedArray())
+            return chain.proceed()
+        }
+    }
+
+    private class MessageRootBindHook(private val owner: SwipeQuoteAdapter) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val result = chain.proceed()
+            owner.bindMessageRoot(chain.thisObject, chain.args.toTypedArray())
+            return result
+        }
+    }
+
+    private class FooterAttachedHook(private val owner: SwipeQuoteAdapter) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val result = chain.proceed()
+            (chain.thisObject as? View)?.let { owner.lastFooterRef = WeakReference(it) }
+            return result
+        }
+    }
+
+    private class FooterDetachedHook(private val owner: SwipeQuoteAdapter) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val result = chain.proceed()
+            if (owner.lastFooterRef.get() === chain.thisObject) owner.lastFooterRef = WeakReference(null)
+            return result
+        }
+    }
+
+    private class SilentRepeatDoneHook : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val activity = chain.thisObject as? android.app.Activity ?: return chain.proceed()
+            if (!activity.intent.getBooleanExtra(EXTRA_HCHAT_SILENT_REPEAT, false)) return chain.proceed()
+            val targets = ArrayList<String>()
+            activity.intent.getStringExtra("Select_Conv_User")
+                ?.split(',')?.map { it.trim() }?.filter { it.isNotEmpty() }?.let { targets.addAll(it) }
+            val result = Intent().apply {
+                putStringArrayListExtra("SendMsgUsernames", targets)
+                putExtra("sendResult", 0)
+            }
+            activity.setResult(android.app.Activity.RESULT_OK, result)
+            activity.finish()
+            return null
+        }
+    }
+
+    private class RecyclerTouchHook(
+        private val owner: SwipeQuoteAdapter,
+        private val fromIntercept: Boolean
+    ) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val view = chain.thisObject as? View ?: return chain.proceed()
+            val event = chain.args.getOrNull(0) as? MotionEvent ?: return chain.proceed()
+            if (!owner.isEnabled()) return chain.proceed()
+            // DOWN records the target; later events reuse it without traversing unrelated lists.
+            if (event.actionMasked != MotionEvent.ACTION_DOWN) {
+                val state = synchronized(owner.recyclerStates) { owner.recyclerStates[view] }
+                if (state == null || !state.tracking) return chain.proceed()
+                if (state.hit != null) {
+                    if (owner.handleTouch(view, event, null, owner.recyclerStates, fromIntercept)) return true
+                    return chain.proceed()
+                }
+            }
+            val hit = owner.findRecyclerTarget(view, event.x, event.y)
+            if (owner.handleTouch(view, event, hit, owner.recyclerStates, fromIntercept)) return true
+            return chain.proceed()
+        }
+    }
+
+    private fun addRepeatMenu(receiver: Any?, args: Array<Any?>) {
         clearRepeatMenuTargets()
         if (!isRepeatMenuEnabled()) return
-        val args = param.args ?: return
         val menu = args.getOrNull(0) ?: return
         val view = args.getOrNull(1) as? View ?: return
         val source = view.tag ?: return
@@ -179,8 +249,8 @@ private class SwipeQuoteAdapter(
         repeatMenuTargetsByGroup[menuItem.groupId] = target
     }
 
-    private fun handleRepeatMenuClick(param: XC_MethodHook.MethodHookParam) {
-        val menuItem = param.args?.firstNotNullOfOrNull { it as? MenuItem } ?: return
+    private fun handleRepeatMenuClick(receiver: Any?, args: Array<Any?>) {
+        val menuItem = args?.firstNotNullOfOrNull { it as? MenuItem } ?: return
         if (menuItem.itemId != MENU_REPEAT_ID) return
         val target = consumeRepeatMenuTarget(menuItem)
         if (target == null || !repeatNativeMessage(target)) {
@@ -334,11 +404,7 @@ private class SwipeQuoteAdapter(
             return false
         }
         return runCatching {
-            HookRegistry.get().hook(method, object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    bindMessageRoot(param)
-                }
-            })
+            HookRegistry.get().hook(method, MessageRootBindHook(this))
             adapterBindInstalled = true
             true
         }.getOrElse {
@@ -371,22 +437,9 @@ private class SwipeQuoteAdapter(
         val onAttached = KavaReflector.findMethodRecursive(footerClass, "onAttachedToWindow") ?: return false
         val onDetached = KavaReflector.findMethodRecursive(footerClass, "onDetachedFromWindow")
         return runCatching {
-            HookRegistry.get().hook(onAttached, object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    val footer = param.thisObject
-                    if (footer is View) {
-                        lastFooterRef = WeakReference(footer)
-                    }
-                }
-            })
+            HookRegistry.get().hook(onAttached, FooterAttachedHook(this))
             if (onDetached != null) {
-                HookRegistry.get().hook(onDetached, object : XC_MethodHook() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        if (lastFooterRef.get() === param.thisObject) {
-                            lastFooterRef = WeakReference(null)
-                        }
-                    }
-                })
+                HookRegistry.get().hook(onDetached, FooterDetachedHook(this))
             }
             footerLifecycleInstalled = true
             true
@@ -403,25 +456,7 @@ private class SwipeQuoteAdapter(
         for (method in methods) {
             val accessible = KavaReflector.accessible(method) ?: continue
             runCatching {
-                HookRegistry.get().hook(accessible, object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        val activity = param.thisObject as? android.app.Activity ?: return
-                        if (!activity.intent.getBooleanExtra(EXTRA_HCHAT_SILENT_REPEAT, false)) return
-                        val targets = ArrayList<String>()
-                        activity.intent.getStringExtra("Select_Conv_User")
-                            ?.split(',')
-                            ?.map { it.trim() }
-                            ?.filter { it.isNotEmpty() }
-                            ?.let { targets.addAll(it) }
-                        val result = Intent().apply {
-                            putStringArrayListExtra("SendMsgUsernames", targets)
-                            putExtra("sendResult", 0)
-                        }
-                        activity.setResult(android.app.Activity.RESULT_OK, result)
-                        activity.finish()
-                        param.setResult(null)
-                    }
-                })
+                HookRegistry.get().hook(accessible, SilentRepeatDoneHook())
             }.onFailure {
                 logger("左滑右滑重发完成Hook失败", it)
                 return false
@@ -472,36 +507,7 @@ private class SwipeQuoteAdapter(
             MotionEvent::class.java
         )?.takeIf { it.declaringClass.name == recyclerViewClass.name } ?: return false
         return runCatching {
-            HookRegistry.get().hook(method, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    val view = param.thisObject as? View ?: return
-                    val event = param.args?.getOrNull(0) as? MotionEvent ?: return
-                    if (!isEnabled()) return
-                    val fromIntercept = methodName == "onInterceptTouchEvent"
-                    val action = event.actionMasked
-
-                    // 快速路径：非 ACTION_DOWN 且当前列表没有进行中的手势，直接放弃。
-                    // 这是全局 RecyclerView 的 hook，通讯录、朋友圈、表情面板等都没有
-                    // 引用目标，原实现仍会对每个 MOVE 遍历整棵可见子树（每秒数万次
-                    // 加锁查表），是"所有列表滚动都发涩"的主要来源。
-                    if (action != MotionEvent.ACTION_DOWN) {
-                        val state = synchronized(recyclerStates) { recyclerStates[view] }
-                        if (state == null || !state.tracking) return
-                        // DOWN 时已经记下命中目标，后续 MOVE/UP 无需重新做命中测试。
-                        if (state.hit != null) {
-                            if (handleTouch(view, event, null, recyclerStates, fromIntercept)) {
-                                param.setResult(true)
-                            }
-                            return
-                        }
-                    }
-
-                    val hit = findRecyclerTarget(view, event.x, event.y)
-                    if (handleTouch(view, event, hit, recyclerStates, fromIntercept)) {
-                        param.setResult(true)
-                    }
-                }
-            })
+            HookRegistry.get().hook(method, RecyclerTouchHook(this, methodName == "onInterceptTouchEvent"))
             true
         }.getOrElse {
             logger("左滑引用列表触摸Hook失败: $methodName", it)
@@ -509,12 +515,11 @@ private class SwipeQuoteAdapter(
         }
     }
 
-    private fun bindMessageRoot(param: XC_MethodHook.MethodHookParam) {
-        val args = param.args ?: return
+    private fun bindMessageRoot(receiver: Any?, args: Array<Any?>) {
         if (args.size < 2) return
         val holder = args[0] ?: return
         val position = args[1] as? Int ?: return
-        val item = adapterItem(param.thisObject ?: return, position) ?: return
+        val item = adapterItem(receiver ?: return, position) ?: return
         val msg = resolveNativeMessage(item) ?: return
         val msgId = messageId(msg)
         if (msgId <= 0L) return

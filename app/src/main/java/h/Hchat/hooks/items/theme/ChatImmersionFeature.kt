@@ -5,7 +5,7 @@ import android.graphics.Color
 import android.graphics.drawable.Drawable
 import android.view.View
 import android.view.ViewGroup
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.event.Events
 import h.Hchat.hooks.core.BaseFeature
 import h.Hchat.hooks.core.DexInstallScheduler
@@ -91,18 +91,22 @@ private class ChatImmersionRuntime(
                 return false
             }
         return runCatching {
-            HookRegistry.get().hook(method, object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    val activity = param.thisObject as? Activity ?: return
-                    activity.window?.decorView?.post { applyTo(activity) }
-                }
-            })
+            HookRegistry.get().hook(method, ResumeHooker(this))
             installed = true
             logger("聊天沉浸式：已挂载 ChattingUI#onResume，开关 ${if (enabled()) "开" else "关"}", null)
             true
         }.getOrElse {
             logger("聊天沉浸式 Hook 安装失败", it)
             false
+        }
+    }
+
+    private class ResumeHooker(private val runtime: ChatImmersionRuntime) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val result = chain.proceed()
+            val activity = chain.thisObject as? Activity ?: return result
+            activity.window?.decorView?.post { runtime.applyTo(activity) }
+            return result
         }
     }
 

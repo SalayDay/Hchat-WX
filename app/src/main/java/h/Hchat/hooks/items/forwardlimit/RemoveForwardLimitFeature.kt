@@ -3,7 +3,7 @@ package h.Hchat.hooks.items.forwardlimit
 import android.app.Activity
 import android.content.Intent
 import android.os.Bundle
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.dexkit.DexMethodCache
 import h.Hchat.hooks.core.BaseFeature
 import h.Hchat.hooks.core.DexInstallScheduler
@@ -103,28 +103,41 @@ private class RemoveForwardLimitHooker(
         return true
     }
 
-    private fun hookLimitMethod(method: Method): Boolean {
-        return hook(method, "转发会话数量限制") {
-            if (isEnabled()) it.result = false
+    private class ConversationLimitHook(private val owner: RemoveForwardLimitHooker) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            if (owner.isEnabled()) return false
+            return chain.proceed()
         }
+    }
+
+    private class ContactPageHook(private val owner: RemoveForwardLimitHooker) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            if (owner.isEnabled()) {
+                (chain.thisObject as? Activity)?.intent?.let(owner::rewriteForwardLimit)
+            }
+            return chain.proceed()
+        }
+    }
+
+    private class UicConfigHook(private val owner: RemoveForwardLimitHooker) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            if (owner.isEnabled()) {
+                (KavaReflector.invokeMethod(chain.thisObject, "getIntent") as? Intent)?.let(owner::rewriteForwardLimit)
+            }
+            return chain.proceed()
+        }
+    }
+
+    private fun hookLimitMethod(method: Method): Boolean {
+        return hook(method, "转发会话数量限制", ConversationLimitHook(this))
     }
 
     private fun hookContactPageMethod(method: Method): Boolean {
-        return hook(method, "转发完整联系人选择页") { param ->
-            if (!isEnabled()) return@hook
-            val activity = param.thisObject as? Activity ?: return@hook
-            val intent = activity.intent ?: return@hook
-            rewriteForwardLimit(intent)
-        }
+        return hook(method, "转发完整联系人选择页", ContactPageHook(this))
     }
 
     private fun hookUicConfigMethod(method: Method): Boolean {
-        return hook(method, "新版转发联系人配置") { param ->
-            if (!isEnabled()) return@hook
-            val intent = KavaReflector.invokeMethod(param.thisObject, "getIntent") as? Intent
-                ?: return@hook
-            rewriteForwardLimit(intent)
-        }
+        return hook(method, "新版转发联系人配置", UicConfigHook(this))
     }
 
     private fun rewriteForwardLimit(intent: Intent) {
@@ -141,18 +154,10 @@ private class RemoveForwardLimitHooker(
             intent.hasExtra(RETRANSMIT_VIEW_MODEL_EXTRA_KEY)
     }
 
-    private fun hook(
-        method: Method,
-        label: String,
-        before: (XC_MethodHook.MethodHookParam) -> Unit
-    ): Boolean {
+    private fun hook(method: Method, label: String, hooker: XposedInterface.Hooker): Boolean {
         if (!hookedMethods.add(method)) return true
         return runCatching {
-            HookRegistry.get().hook(method, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    before(param)
-                }
-            })
+            HookRegistry.get().hook(method, hooker)
             true
         }.getOrElse {
             hookedMethods.remove(method)

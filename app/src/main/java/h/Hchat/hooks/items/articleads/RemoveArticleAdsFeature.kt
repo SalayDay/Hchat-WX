@@ -3,7 +3,7 @@ package h.Hchat.hooks.items.articleads
 import android.content.SharedPreferences
 import android.view.View
 import android.webkit.ValueCallback
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.hooks.core.BaseFeature
 import h.Hchat.hooks.core.FeatureContext
 import h.Hchat.hooks.core.HookRegistry
@@ -136,35 +136,10 @@ class RemoveArticleAdsFeature : BaseFeature() {
                 val webField = KavaReflector.findDeclaredField(activity, "f")
                     ?: error("网页字段不存在")
                 check(webField.type == mmWeb && evaluate.returnType == Void.TYPE && getUrl.returnType == String::class.java)
-                HookRegistry.get().hook(finish, object : XC_MethodHook() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        if (param.hasThrowable() || destroyed) return
-                        val view = param.args?.getOrNull(0) as? View ?: return
-                        if (!mmWeb.isInstance(view)) return
-                        val url = param.args?.getOrNull(1) as? String ?: return
-                        rememberPage(view, url)
-                    }
-                })
+                HookRegistry.get().hook(finish, ArticleFinishedHooker(this, mmWeb))
                 for (name in listOf("onResume", "onPause", "onDestroy")) {
                     val method = KavaReflector.findDeclaredMethod(activity, name) ?: continue
-                    HookRegistry.get().hook(method, object : XC_MethodHook() {
-                        override fun beforeHookedMethod(param: MethodHookParam) {
-                            if (name != "onPause" || destroyed) return
-                            val view = KavaReflector.readField(webField, param.thisObject) as? View ?: return
-                            // 切到后台只停扫描、保留已隐藏结果，避免返回时广告重新闪一下。
-                            val state = currentPage(view) ?: return
-                            if (state.applied) dispatch(view, state, enabled(), true)
-                        }
-                        override fun afterHookedMethod(param: MethodHookParam) {
-                            if (destroyed) return
-                            val view = KavaReflector.readField(webField, param.thisObject) as? View ?: return
-                            if (name == "onDestroy") {
-                                synchronized(pages) { pages.remove(view) }
-                            } else if (name == "onResume") {
-                                currentUrl(view)?.let { rememberPage(view, it) }
-                            }
-                        }
-                    })
+                    HookRegistry.get().hook(method, ArticleLifecycleHooker(this, name, webField))
                 }
                 prefs.registerOnSharedPreferenceChangeListener(listener)
                 mounted = true
@@ -322,6 +297,52 @@ class RemoveArticleAdsFeature : BaseFeature() {
                 }
                 synchronized(pages) { pages.clear() }
             }
+
+    private class ArticleFinishedHooker(private val owner: ArticleAdsRuntime, private val mmWeb: Class<*>) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val args = chain.args.toTypedArray()
+            val receiver = chain.thisObject
+            var result = chain.proceed()
+            with(owner) {
+            run update@{
+                if (destroyed) return@update
+                val view = args?.getOrNull(0) as? View ?: return@update
+                if (!mmWeb.isInstance(view)) return@update
+                val url = args?.getOrNull(1) as? String ?: return@update
+                rememberPage(view, url)
+            }
+            return result
+            }
         }
+    }
+
+    private class ArticleLifecycleHooker(private val owner: ArticleAdsRuntime, private val name: String, private val webField: java.lang.reflect.Field) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val args = chain.args.toTypedArray()
+            val receiver = chain.thisObject
+            with(owner) {
+            run patch@{
+                if (name != "onPause" || destroyed) return@patch
+                val view = KavaReflector.readField(webField, receiver) as? View ?: return@patch
+                // 切到后台只停扫描、保留已隐藏结果，避免返回时广告重新闪一下。
+                val state = currentPage(view) ?: return@patch
+                if (state.applied) dispatch(view, state, enabled(), true)
+            }
+            var result = chain.proceed(args)
+            run update@{
+                if (destroyed) return@update
+                val view = KavaReflector.readField(webField, receiver) as? View ?: return@update
+                if (name == "onDestroy") {
+                    synchronized(pages) { pages.remove(view) }
+                } else if (name == "onResume") {
+                    currentUrl(view)?.let { rememberPage(view, it) }
+                }
+            }
+            return result
+            }
+        }
+    }
+
+}
     }
 }

@@ -9,7 +9,7 @@ import android.graphics.Paint
 import android.graphics.Shader
 import android.graphics.drawable.Icon
 import android.widget.ImageView
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.dexkit.DexMethodCache
 import h.Hchat.event.Events
 import h.Hchat.hooks.core.BaseFeature
@@ -114,17 +114,7 @@ private class RoundAvatarRuntime(
     private fun hookRadius(member: Member, radiusIndex: Int, maskIndex: Int): Boolean {
         if (hookedMembers.contains(member)) return true
         return runCatching {
-            HookRegistry.get().hook(member, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    if (!RoundAvatarSettings.enabled(context.hostContext())) return
-                    if (radiusIndex !in param.args.indices) return
-                    param.args[radiusIndex] = RoundAvatarSettings.radiusFactor(context.hostContext())
-                    if (maskIndex in param.args.indices) {
-                        val mask = (param.args[maskIndex] as? Number)?.toInt() ?: return
-                        param.args[maskIndex] = mask and DEFAULT_RADIUS_MASK.inv()
-                    }
-                }
-            })
+            HookRegistry.get().hook(member, AvatarRadiusHook(this, radiusIndex, maskIndex))
             hookedMembers += member
             true
         }.getOrElse {
@@ -141,16 +131,7 @@ private class RoundAvatarRuntime(
         ) ?: return
         if (!notificationHookedMembers.add(method)) return
         runCatching {
-            HookRegistry.get().hook(method, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    if (!RoundAvatarSettings.enabled(context.hostContext())) return
-                    val source = param.args.firstOrNull() as? Bitmap ?: return
-                    param.args[0] = RoundAvatarBitmapProcessor.round(
-                        source,
-                        RoundAvatarSettings.radiusFactor(context.hostContext())
-                    )
-                }
-            })
+            HookRegistry.get().hook(method, NotificationBitmapHook(this))
         }.onFailure {
             notificationHookedMembers.remove(method)
             HLog.e("$TAG 安装通知 Bitmap 头像 Hook 失败: ${it.message}", it)
@@ -165,18 +146,7 @@ private class RoundAvatarRuntime(
         ) ?: return
         if (!notificationHookedMembers.add(method)) return
         runCatching {
-            HookRegistry.get().hook(method, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    if (!RoundAvatarSettings.enabled(context.hostContext())) return
-                    val icon = param.args.firstOrNull() as? Icon ?: return
-                    val source = KavaReflector.invokeMethod(icon, "getBitmap") as? Bitmap ?: return
-                    val rounded = RoundAvatarBitmapProcessor.round(
-                        source,
-                        RoundAvatarSettings.radiusFactor(context.hostContext())
-                    )
-                    if (rounded !== source) param.args[0] = Icon.createWithBitmap(rounded)
-                }
-            })
+            HookRegistry.get().hook(method, NotificationIconHook(this))
         }.onFailure {
             notificationHookedMembers.remove(method)
             HLog.e("$TAG 安装通知 Icon 头像 Hook 失败: ${it.message}", it)
@@ -186,17 +156,7 @@ private class RoundAvatarRuntime(
     private fun hookNotificationPost(method: Method?) {
         if (method == null || !notificationHookedMembers.add(method)) return
         runCatching {
-            HookRegistry.get().hook(method, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    if (!RoundAvatarSettings.enabled(context.hostContext())) return
-                    val notification = param.args.firstOrNull { it is Notification } as? Notification ?: return
-                    val source = notification.largeIcon ?: return
-                    notification.largeIcon = RoundAvatarBitmapProcessor.round(
-                        source,
-                        RoundAvatarSettings.radiusFactor(context.hostContext())
-                    )
-                }
-            })
+            HookRegistry.get().hook(method, NotificationPostHook(this))
         }.onFailure {
             notificationHookedMembers.remove(method)
             HLog.e("$TAG 安装通知提交头像 Hook 失败: ${it.message}", it)
@@ -359,6 +319,70 @@ private class RoundAvatarRuntime(
         const val WORKER_SCOPE = "workerScope"
         const val USERNAME = "username"
         const val DEFAULT_RADIUS_MASK = 1 shl 2
+    }
+
+    private class AvatarRadiusHook(private val owner: RoundAvatarRuntime, private val radiusIndex: Int, private val maskIndex: Int) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            return with(owner) {
+                if (!RoundAvatarSettings.enabled(context.hostContext())) return chain.proceed()
+                val args = chain.args.toTypedArray()
+                if (radiusIndex !in args.indices) return chain.proceed(args)
+                args[radiusIndex] = RoundAvatarSettings.radiusFactor(context.hostContext())
+                if (maskIndex in args.indices) {
+                    val mask = (args[maskIndex] as? Number)?.toInt() ?: return chain.proceed(args)
+                    args[maskIndex] = mask and DEFAULT_RADIUS_MASK.inv()
+                }
+                return chain.proceed(args)
+            }
+        }
+    }
+
+    private class NotificationBitmapHook(private val owner: RoundAvatarRuntime) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            return with(owner) {
+                if (!RoundAvatarSettings.enabled(context.hostContext())) return chain.proceed()
+                val args = chain.args.toTypedArray()
+                val source = args.firstOrNull() as? Bitmap ?: return chain.proceed(args)
+                args[0] = RoundAvatarBitmapProcessor.round(
+                    source,
+                    RoundAvatarSettings.radiusFactor(context.hostContext())
+                )
+                return chain.proceed(args)
+            }
+        }
+    }
+
+    private class NotificationIconHook(private val owner: RoundAvatarRuntime) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            return with(owner) {
+                if (!RoundAvatarSettings.enabled(context.hostContext())) return chain.proceed()
+                val args = chain.args.toTypedArray()
+                val icon = args.firstOrNull() as? Icon ?: return chain.proceed(args)
+                val source = KavaReflector.invokeMethod(icon, "getBitmap") as? Bitmap ?: return chain.proceed(args)
+                val rounded = RoundAvatarBitmapProcessor.round(
+                    source,
+                    RoundAvatarSettings.radiusFactor(context.hostContext())
+                )
+                if (rounded !== source) args[0] = Icon.createWithBitmap(rounded)
+                return chain.proceed(args)
+            }
+        }
+    }
+
+    private class NotificationPostHook(private val owner: RoundAvatarRuntime) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            return with(owner) {
+                val args = chain.args
+                if (!RoundAvatarSettings.enabled(context.hostContext())) return chain.proceed()
+                val notification = args.firstOrNull { it is Notification } as? Notification ?: return chain.proceed()
+                val source = notification.largeIcon ?: return chain.proceed()
+                notification.largeIcon = RoundAvatarBitmapProcessor.round(
+                    source,
+                    RoundAvatarSettings.radiusFactor(context.hostContext())
+                )
+                return chain.proceed()
+            }
+        }
     }
 }
 

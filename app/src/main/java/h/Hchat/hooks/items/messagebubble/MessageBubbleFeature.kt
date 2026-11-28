@@ -9,7 +9,7 @@ import android.graphics.drawable.Drawable
 import android.view.View
 import android.view.ViewGroup
 import android.widget.TextView
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.R
 import h.Hchat.dexkit.DexMethodCache
 import h.Hchat.hooks.api.model.WeChatMessage
@@ -27,7 +27,6 @@ import org.luckypray.dexkit.query.FindMethod
 import org.luckypray.dexkit.query.matchers.MethodMatcher
 import java.lang.reflect.Field
 import java.lang.reflect.Method
-import java.util.ArrayDeque
 import java.util.Collections
 import java.util.WeakHashMap
 import java.util.concurrent.ConcurrentHashMap
@@ -86,7 +85,6 @@ private class MessageBubbleRenderer(
     private val holderWithoutMainContainerMethod = ConcurrentHashMap.newKeySet<Class<*>>()
     private val messageNestedFieldCache = ConcurrentHashMap<Class<*>, List<Field>>()
     private val nativeMessageClassCache = ConcurrentHashMap<Class<*>, Boolean>()
-    private val bindStates = ThreadLocal<ArrayDeque<BindState>>()
     private val bubbleViewIds by lazy {
         BUBBLE_VIEW_RESOURCES.associateWith { name ->
             context.hostContext().resources.getIdentifier(name, "id", HOST_PACKAGE)
@@ -113,33 +111,27 @@ private class MessageBubbleRenderer(
             return false
         }
         return runCatching {
-            HookRegistry.get().hook(method, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    // 开关判断前置：这里挂的是全局消息绑定，每条消息都走一遍。
-                    // 关闭时若继续执行，会对每个 bind 参数做反射找 rootView，
-                    // 聊天列表滚动时白做几百次反射。
-                    if (!bubbleEnabled()) return
-                    val state = captureBindState(param.args)
-                    state.root?.let(::restoreBoundBubble)
-                    val stack = bindStates.get() ?: ArrayDeque<BindState>().also(bindStates::set)
-                    stack.addLast(state)
-                }
-
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    if (!bubbleEnabled()) return
-                    val stack = bindStates.get()
-                    val state = stack?.pollLast() ?: return
-                    if (stack.isEmpty()) bindStates.remove()
-                    val boundHolder = state.root?.tag?.takeIf(::isNativeMessageHolder)
-                        ?: state.nativeHolder
-                    applyBubble(param.args, state.copy(nativeHolder = boundHolder))
-                }
-            })
+            HookRegistry.get().hook(method, BubbleBindHook(this))
             adapterBindInstalled = true
             true
         }.getOrElse {
             HLog.e("$TAG 安装聊天气泡 Hook 失败: ${it.message}", it)
             false
+        }
+    }
+
+    private class BubbleBindHook(private val owner: MessageBubbleRenderer) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            if (!owner.bubbleEnabled()) return chain.proceed()
+            val args = chain.args.toTypedArray()
+            val state = owner.captureBindState(args)
+            state.root?.let(owner::restoreBoundBubble)
+            val result = chain.proceed()
+            if (owner.bubbleEnabled()) {
+                val boundHolder = state.root?.tag?.takeIf(owner::isNativeMessageHolder) ?: state.nativeHolder
+                owner.applyBubble(args, state.copy(nativeHolder = boundHolder))
+            }
+            return result
         }
     }
 

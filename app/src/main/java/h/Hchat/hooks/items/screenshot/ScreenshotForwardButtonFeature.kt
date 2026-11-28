@@ -1,6 +1,6 @@
 package h.Hchat.hooks.items.screenshot
 
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.dexkit.DexMethodCache
 import h.Hchat.hooks.api.core.WeChatApis
 import h.Hchat.hooks.core.BaseFeature
@@ -143,16 +143,7 @@ class ScreenshotForwardButtonFeature : BaseFeature() {
             return false
         }
         methods.forEach { method ->
-            HookRegistry.get().hook(method, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    if (!enabled()) return
-                    // 空列表就是微信自己在门槛分支里的返回值，不会让调用方异常。
-                    param.setResult(emptyList<Any>())
-                    if (providerHitLogged.compareAndSet(false, true)) {
-                        HLog.e("$TAG 已拦截转发截图动作: ${method.declaringClass.name}#${method.name}")
-                    }
-                }
-            })
+            HookRegistry.get().hook(method, ForwardProviderHook(this, enabled, method))
         }
         return true
     }
@@ -168,7 +159,7 @@ class ScreenshotForwardButtonFeature : BaseFeature() {
         // 8.0.76 起浮层类被混淆，「类名固定」的前提不再成立：
         // 按候选名找，再退到包内按方法签名找（单 List 参数 + 有返回值）。
         val clazz = OVERLAY_CANDIDATE_CLASSES.asSequence()
-            .mapNotNull { runCatching { Class.forName(it, false, loader) }.getOrNull() }
+            .mapNotNull { KavaReflector.loadClass(it, loader) }
             .firstOrNull { candidate ->
                 KavaReflector.declaredMethods(candidate).any(::isActionBindMethod)
             }
@@ -182,28 +173,7 @@ class ScreenshotForwardButtonFeature : BaseFeature() {
             return false
         }
         targets.forEach { method ->
-            HookRegistry.get().hook(method, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    if (!enabled()) return
-                    val list = param.args?.getOrNull(0) as? List<*> ?: return
-                    if (list.isEmpty()) return
-                    val kept = ArrayList<Any?>(list.size)
-                    var dropped = 0
-                    for (item in list) {
-                        val texts = ScreenshotActionTexts.of(item)
-                        if (texts.any(ScreenshotActionLabelPolicy::shouldHide)) dropped++ else kept += item
-                        if (probeLogged.compareAndSet(false, true)) {
-                            HLog.e("$TAG 截图动作浮层候选项: ${texts.joinToString("|")}")
-                        }
-                    }
-                    if (dropped == 0) return
-                    // 换掉整个 List 而不是 removeIf：原集合可能是只读实现，会抛。
-                    param.args[0] = kept
-                    if (overlayHitLogged.compareAndSet(false, true)) {
-                        HLog.e("$TAG 浮层已摘掉转发按钮: 丢弃 $dropped 项，保留 ${kept.size}/${list.size}")
-                    }
-                }
-            })
+            HookRegistry.get().hook(method, OverlayActionsHook(this, enabled))
         }
         return true
     }
@@ -262,6 +232,45 @@ class ScreenshotForwardButtonFeature : BaseFeature() {
         private val providerHitLogged = java.util.concurrent.atomic.AtomicBoolean(false)
         private val overlayHitLogged = java.util.concurrent.atomic.AtomicBoolean(false)
         private val probeLogged = java.util.concurrent.atomic.AtomicBoolean(false)
+    }
+
+    private class ForwardProviderHook(private val owner: ScreenshotForwardButtonFeature, private val enabled: () -> Boolean, private val method: Method) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            return with(owner) {
+                if (!enabled()) return chain.proceed()
+                if (providerHitLogged.compareAndSet(false, true)) {
+                    HLog.e("$TAG 已拦截转发截图动作: ${method.declaringClass.name}#${method.name}")
+                }
+                return emptyList<Any>()
+            }
+        }
+    }
+
+    private class OverlayActionsHook(private val owner: ScreenshotForwardButtonFeature, private val enabled: () -> Boolean) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            return with(owner) {
+                val args = chain.args.toTypedArray()
+                if (!enabled()) return chain.proceed(args)
+                val list = args.getOrNull(0) as? List<*> ?: return chain.proceed(args)
+                if (list.isEmpty()) return chain.proceed(args)
+                val kept = ArrayList<Any?>(list.size)
+                var dropped = 0
+                for (item in list) {
+                    val texts = ScreenshotActionTexts.of(item)
+                    if (texts.any(ScreenshotActionLabelPolicy::shouldHide)) dropped++ else kept += item
+                    if (probeLogged.compareAndSet(false, true)) {
+                        HLog.e("$TAG 截图动作浮层候选项: ${texts.joinToString("|")}")
+                    }
+                }
+                if (dropped == 0) return chain.proceed(args)
+                // 换掉整个 List 而不是 removeIf：原集合可能是只读实现，会抛。
+                args[0] = kept
+                if (overlayHitLogged.compareAndSet(false, true)) {
+                    HLog.e("$TAG 浮层已摘掉转发按钮: 丢弃 $dropped 项，保留 ${kept.size}/${list.size}")
+                }
+                return chain.proceed(args)
+            }
+        }
     }
 }
 

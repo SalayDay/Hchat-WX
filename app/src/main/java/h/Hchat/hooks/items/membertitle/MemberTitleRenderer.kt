@@ -3,7 +3,7 @@ package h.Hchat.hooks.items.membertitle
 import android.text.SpannableStringBuilder
 import android.view.View
 import android.widget.TextView
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.dexkit.DexMethodCache
 import h.Hchat.hooks.api.contact.WeChatChatroomApi
 import h.Hchat.hooks.api.core.WeChatApis
@@ -61,11 +61,7 @@ class MemberTitleRenderer(
         if (usernameBindInstalled) return true
         val method = locateUsernameBindMethod() ?: return false
         return try {
-            HookRegistry.get().hook(method, object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    handleUsernameBind(param)
-                }
-            })
+            HookRegistry.get().hook(method, UsernameBindHook(this))
             usernameBindInstalled = true
             true
         } catch (e: Throwable) {
@@ -74,35 +70,6 @@ class MemberTitleRenderer(
         }
     }
 
-    private fun handleUsernameBind(param: XC_MethodHook.MethodHookParam) {
-        if (!store.isEnabled()) return
-        val roomId = currentRoomId()
-        if (!isRoom(roomId)) return
-        val args = param.args ?: return
-        val holder = args.firstOrNull() ?: return
-        val tv = findUserTextView(holder) ?: return
-        var msg: Any? = null
-        var raw = ""
-        val stringCandidates = mutableListOf<String>()
-        args.forEach {
-            if (it is String) {
-                if (raw.isEmpty()) raw = it
-                val value = it.trim()
-                if (MemberTitleStore.isValidMemberId(value)) stringCandidates += value
-            }
-            if (it != null && isLikelyMessageClass(it.javaClass)) msg = it
-        }
-        if (isOutgoingMessage(msg)) {
-            clearBoundTitle(tv)
-            return
-        }
-        val sender = resolveBindSender(msg, raw, stringCandidates)
-        if (!MemberTitleStore.isValidMemberId(sender) || isSelf(sender)) {
-            clearBoundTitle(tv)
-            return
-        }
-        if (!applyTitle(tv, roomId, sender)) scheduleDelayedApply(tv, roomId, sender)
-    }
 
     private fun applyTitle(tv: TextView, roomId: String, sender: String): Boolean {
         if (!MemberTitleStore.isValidMemberId(sender) || !isRoom(roomId)) return false
@@ -418,5 +385,42 @@ class MemberTitleRenderer(
 
     companion object {
         private const val OLD_BADGE_OBJECT = "\uFFFC"
+    }
+
+    private class UsernameBindHook(private val owner: MemberTitleRenderer) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            return with(owner) {
+                val outcome = chain.proceed()
+                val args = chain.args
+                if (!store.isEnabled()) return outcome
+                val roomId = currentRoomId()
+                if (!isRoom(roomId)) return outcome
+
+                val holder = args.firstOrNull() ?: return outcome
+                val tv = findUserTextView(holder) ?: return outcome
+                var msg: Any? = null
+                var raw = ""
+                val stringCandidates = mutableListOf<String>()
+                args.forEach {
+                    if (it is String) {
+                        if (raw.isEmpty()) raw = it
+                        val value = it.trim()
+                        if (MemberTitleStore.isValidMemberId(value)) stringCandidates += value
+                    }
+                    if (it != null && isLikelyMessageClass(it.javaClass)) msg = it
+                }
+                if (isOutgoingMessage(msg)) {
+                    clearBoundTitle(tv)
+                    return outcome
+                }
+                val sender = resolveBindSender(msg, raw, stringCandidates)
+                if (!MemberTitleStore.isValidMemberId(sender) || isSelf(sender)) {
+                    clearBoundTitle(tv)
+                    return outcome
+                }
+                if (!applyTitle(tv, roomId, sender)) scheduleDelayedApply(tv, roomId, sender)
+                return outcome
+            }
+        }
     }
 }

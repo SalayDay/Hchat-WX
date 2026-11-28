@@ -7,7 +7,6 @@ import android.os.Process;
 import androidx.annotation.NonNull;
 
 import h.Hchat.crash.CrashReportRuntime;
-import h.Hchat.compat.RuntimeHooks;
 import h.Hchat.dexkit.DexFinder;
 import h.Hchat.hooks.api.media.WeChatImageApi;
 import h.Hchat.hooks.core.DexInstallScheduler;
@@ -15,6 +14,8 @@ import h.Hchat.hooks.core.FeatureContext;
 import h.Hchat.hooks.core.FeatureManager;
 import h.Hchat.hooks.core.FeatureRegistry;
 import h.Hchat.hooks.core.HookRegistry;
+import h.Hchat.hooks.core.HostRuntime;
+import h.Hchat.hooks.core.ModuleRuntime;
 import h.Hchat.hooks.items.fakelocation.FakeLocationFeature;
 import h.Hchat.hooks.items.custombottombar.CustomBottomBarFeature;
 import h.Hchat.hooks.items.conversationtabs.ConversationTabsFeature;
@@ -36,23 +37,21 @@ import h.Hchat.dexkit.DexBridgeHolder;
 import h.Hchat.event.EventBus;
 import h.Hchat.ui.UIRegistry;
 import h.Hchat.utils.HLog;
+import h.Hchat.utils.KavaReflector;
 
 import org.luckypray.dexkit.DexKitBridge;
 
 import java.lang.reflect.Method;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 
+import io.github.libxposed.api.XposedInterface;
 import io.github.libxposed.api.XposedModule;
 import io.github.libxposed.api.XposedModuleInterface;
 
-import de.robv.android.xposed.XC_MethodHook;
-import de.robv.android.xposed.XposedBridge;
-import de.robv.android.xposed.XposedHelpers;
-import de.robv.android.xposed.callbacks.XC_LoadPackage;
-
 /**
- * 模块入口（LibXposed API 102）。
+ * 模块入口（LibXposed API 102 原生实现）。
  *
  * 启动流程：
  * 1. onPackageReady → 过滤目标包 + 目标进程
@@ -62,20 +61,14 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  *
  * 进程过滤：普通功能只在微信主进程加载；:appbrand* 使用独立的轻量运行时。
  *
- * 迁移说明（Xposed API 82 → LibXposed API 102）：
- * - 入口从 `IXposedHookLoadPackage.handleLoadPackage` 改为继承 {@link XposedModule}
- *   并覆写 {@link XposedModuleInterface#onPackageReady}；
- * - 旧 `XC_LoadPackage.LoadPackageParam` 的四个字段（packageName / processName /
- *   classLoader / appInfo）由 `PackageReadyParam` 一一对应提供，兼容层
- *   `de.robv.android.xposed.callbacks.XC_LoadPackage` 负责拼装，
- *   因此模块内部 25 处 `lpparam.*` 引用无需改动；
- * - `XC_MethodHook` / `XposedBridge` / `XposedHelpers` 保留旧类名，但实现全部
- *   改走 LibXposed 的 `hook(...).intercept(chain)` 与 Invoker（见 de.robv.android.xposed 包）；
- * - `assets/xposed_init` 改为 `META-INF/xposed/java_init.list`。
+ * 入口直接消费原生 PackageReadyParam，宿主信息保存为不可变 HostRuntime；
+ * 所有 Hook 都是独立的静态 Hooker，注册表只保存原生 HookHandle。
  */
 public class ModuleEntry extends XposedModule {
     private static final String TAG = "[Hchat:Entry]";
     private static final String WECHAT_PKG = "com.tencent.mm";
+    private static final String TINKER_APPLICATION = "com.tencent.tinker.loader.app.TinkerApplication";
+    private static final String TINKER_ATTACH = "onBaseContextAttached";
     private static final Object DEXKIT_CREATE_LOCK = new Object();
     private static final Map<String, DexKitBridge> DEXKIT_BRIDGES = new ConcurrentHashMap<>();
 
@@ -93,11 +86,8 @@ public class ModuleEntry extends XposedModule {
      *
      * 冷启动必现掉帧的主因：这些线程跑的是 DexKit 全 dex 解析 / 反射定位这类
      * CPU 密集任务，默认优先级和微信主线程相同（0），于是和首页渲染抢 CPU。
-     * 表现就是"每次重新打开微信后首页持续掉帧一段时间"，而不是偶发。
-     *
-     * 同项目的 SettingsUiPrewarm 早就设了 THREAD_PRIORITY_LOWEST，真正吃 CPU 的
-     * 这几个线程反而没设——这里统一补齐。用 BACKGROUND 而不是 LOWEST：
-     * 后台任务仍需在合理时间内完成（功能安装不能拖太久），LOWEST 可能饿死。
+     * 用 BACKGROUND 而不是 LOWEST：后台任务仍需在合理时间内完成，
+     * LOWEST 可能饿死功能安装。
      */
     private static Thread backgroundThread(Runnable task, String name) {
         return new Thread(() -> {
@@ -113,117 +103,86 @@ public class ModuleEntry extends XposedModule {
     private FeatureManager featureManager;
     private FeatureContext featureContext;
 
-    /** 进程名：onModuleLoaded 时记录，供 lpparam 拼装使用。 */
+    /** 一个进程只处理首个目标包，避免重复安装。 */
+    private final AtomicBoolean packageInstalled = new AtomicBoolean();
+
+    /** 进程名由原生模块加载回调提供。 */
     @NonNull
     private String processName = "";
 
     public ModuleEntry() {
-        // LibXposed 反射实例化入口：先无参构造，再由框架 attachFramework 注入。
+        // LibXposed 反射实例化入口：无参构造，生命周期回调由框架驱动。
     }
 
     @Override
     public void onModuleLoaded(@NonNull XposedModuleInterface.ModuleLoadedParam loadedParam) {
         super.onModuleLoaded(loadedParam);
         processName = loadedParam.getProcessName();
-        // 兼容层绑定：XC_MethodHook / XposedBridge 等旧入口在底层全部转走 LibXposed。
-        RuntimeHooks.INSTANCE.bind(this);
-        RuntimeHooks.INSTANCE.log("[Hchat:Entry] onModuleLoaded: " + processName);
+        ModuleRuntime.bind(this);
+        log(android.util.Log.INFO, TAG + " onModuleLoaded: " + processName);
     }
 
     @Override
     public void onPackageReady(@NonNull XposedModuleInterface.PackageReadyParam readyParam) {
-        // 拼装旧 LoadPackageParam：字段一一对应，25 处 lpparam.* 引用无需改动。
-        XC_LoadPackage.LoadPackageParam lpparam = new XC_LoadPackage.LoadPackageParam(
+        if (!isWeChatPackage(readyParam.getPackageName())) return;
+        if (!packageInstalled.compareAndSet(false, true)) return;
+        if (!readyParam.isFirstPackage()) {
+            // 非首个包也只在当前进程安装一次；这里只记录，不用它做硬门禁，
+            // 避免宿主先加载其它包时整个模块静默不工作。
+            log(android.util.Log.INFO, TAG + " 当前包不是进程首个包，仍按一次性安装: "
+                    + readyParam.getPackageName());
+        }
+        HostRuntime runtime = new HostRuntime(
                 readyParam.getPackageName(),
                 processName,
                 readyParam.getClassLoader(),
                 readyParam.getApplicationInfo(),
                 readyParam.isFirstPackage());
-        handleLoadPackage(lpparam);
+        try {
+            initializePackage(runtime);
+        } catch (Throwable failure) {
+            HLog.e(TAG + " 进程入口安装失败: " + processName, failure);
+        }
     }
 
-    /** 兼容旧 handleLoadPackage 的主流程；包名/进程过滤逻辑保持不变。 */
-    private void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
+    /** 初始化目标宿主包；只在当前进程首次包就绪时执行。 */
+    private void initializePackage(HostRuntime runtime) {
         // 1. 包名过滤
-        if (!isWeChatPackage(lpparam.packageName)) return;
+        if (!isWeChatPackage(runtime.getPackageName())) return;
         if (!Process.is64Bit()) {
-            HLog.e(TAG + " 当前版本仅支持 ARM64 微信进程，跳过32位进程: " + lpparam.processName);
+            HLog.e(TAG + " 当前版本仅支持 ARM64 微信进程，跳过32位进程: " + runtime.getProcessName());
             return;
         }
 
         // 热更新加载发生在 Tinker attach 阶段，必须早于普通功能初始化安装。
-        installHotUpdateEarlyHook(lpparam);
+        installHotUpdateEarlyHook(runtime);
 
         // 平板模式需要在微信所有进程保持一致，避免升级/降级后登录态校验看到不同设备形态。
-        installTabletEarlyHook(lpparam);
+        installTabletEarlyHook(runtime);
 
         // 2. 子进程只安装明确需要的最小 Hook。
-        if (!isMainProcess(lpparam)) {
-            if (isAppBrandProcess(lpparam)) {
-                installAppBrandProcessHook(lpparam);
+        if (!isMainProcess(runtime)) {
+            if (isAppBrandProcess(runtime)) {
+                installAppBrandProcessHook(runtime);
             }
             return;
         }
 
         // 3. Mars CDN 管理器可能早于模块 API 初始化创建，先按稳定类名捕获实例。
         WeChatImageApi.installMarsCdnManagerHook(
-                lpparam.classLoader,
+                runtime.getClassLoader(),
                 message -> HLog.e("[Hchat:WechatApi] " + message));
 
         // 底栏在 LauncherUI 首帧前创建，必须早于完整 DexKit 初始化安装 Hook。
-        installCustomBottomBarEarlyHook(lpparam);
+        installCustomBottomBarEarlyHook(runtime);
 
         // 4. Hook Application.onCreate，等 Application 完全初始化后再启动模块
-        HookRegistry.get().add(XposedHelpers.findAndHookMethod(
-                Application.class,
-                "onCreate",
-                new XC_MethodHook() {
-                    @Override
-                    public void beforeHookedMethod(MethodHookParam param) {
-                        Application app = (Application) param.thisObject;
-                        if (TermsGate.INSTANCE.isAccepted(app)) {
-                            CrashReportRuntime.prepare(app);
-                        }
-                    }
-
-                    @Override
-                    public void afterHookedMethod(MethodHookParam param) {
-                        Application app = (Application) param.thisObject;
-                        if (TermsGate.INSTANCE.isAccepted(app)) {
-                            CrashReportRuntime.install(app, ModuleEntry.this.getClass().getClassLoader());
-                            // 标签栏先捕获首页根视图，不能等待后台 DexKit 初始化后再挂载。
-                            try {
-                                ConversationTabsFeature.installEarly(resolveHostClassLoader(app, lpparam));
-                            } catch (Throwable e) {
-                                HLog.e(TAG + " 标签分组早期安装失败", e);
-                            }
-                            // 悬浮入口不依赖 DexKit，先注册生命周期，避免错过首个 Activity。
-                            try {
-                                FloatingShortcutRuntime.INSTANCE.install(app);
-                            } catch (Throwable e) {
-                                HLog.e(TAG + " 悬浮快捷菜单早期安装失败", e);
-                            }
-                        }
-                        installCustomBottomBarEarly(app, resolveHostClassLoader(app, lpparam));
-
-                        // 「记录运行日志」不能等 initModule 的后台线程：
-                        // 那条线程要先 loadDexKit 再全量解析 dex（秒级），一旦它被拖慢，
-                        // 设置页看到的就是"日志抓不到"。这里在 onCreate 返回时就恢复采集，
-                        // initCapture 自身幂等，后面 initModule 再调一次不会有额外开销。
-                        try {
-                            HLog.initCapture(app);
-                        } catch (Throwable e) {
-                            HLog.e(TAG + " 日志采集早期初始化失败: " + e.getMessage(), e);
-                        }
-
-                        // 公众号信息流广告：onCreate 之后立刻用独立后台线程安装，
-                        // 早于 initModule 的 DexKit 全量解析，但不在 attach 阶段做重活。
-                        installSubscribeAdsAfterStartup(app, lpparam);
-
-                        backgroundThread(() -> initModule(app, lpparam), "Hchat-Init").start();
-                    }
-                }
-        ));
+        try {
+            HookRegistry.get().hook(requireMethod(Application.class, "onCreate"),
+                    new MainApplicationHooker(this, runtime));
+        } catch (Throwable failure) {
+            HLog.e(TAG + " Application.onCreate Hook 安装失败", failure);
+        }
     }
 
     // ============ 包名与进程判断 ============
@@ -240,62 +199,39 @@ public class ModuleEntry extends XposedModule {
      * 判断是否为主进程。
      * 微信主进程的 processName 等于 packageName。
      */
-    private boolean isMainProcess(XC_LoadPackage.LoadPackageParam lpparam) {
-        String process = lpparam.processName;
-        return process == null || process.equals(lpparam.packageName);
+    private boolean isMainProcess(HostRuntime runtime) {
+        String process = runtime.getProcessName();
+        return process == null || process.isEmpty() || process.equals(runtime.getPackageName());
     }
 
-    private boolean isAppBrandProcess(XC_LoadPackage.LoadPackageParam lpparam) {
-        String process = lpparam.processName;
-        String packageName = lpparam.packageName;
+    private boolean isAppBrandProcess(HostRuntime runtime) {
+        String process = runtime.getProcessName();
+        String packageName = runtime.getPackageName();
         return process != null && packageName != null && process.startsWith(packageName + ":appbrand");
     }
 
-    private void installAppBrandProcessHook(XC_LoadPackage.LoadPackageParam lpparam) {
-        try {
-            HookRegistry.get().add(XposedHelpers.findAndHookMethod(
-                    "com.tencent.tinker.loader.app.TinkerApplication",
-                    lpparam.classLoader,
-                    "onBaseContextAttached",
-                    Context.class,
-                    long.class,
-                    long.class,
-                    new XC_MethodHook() {
-                        @Override
-                        public void afterHookedMethod(MethodHookParam param) {
-                            Context context = (Context) param.args[0];
-                            ClassLoader loader = resolveTinkerClassLoader(param.thisObject);
-                            if (loader == null) {
-                                loader = resolveHostClassLoader(context, lpparam);
-                            }
-                            installAppBrandProcessHook(context, loader, lpparam, false);
-                        }
-                    }
-            ));
-        } catch (Throwable e) {
-            HLog.e(TAG + " 小程序进程早期入口安装失败: " + e.getMessage(), e);
+    private void installAppBrandProcessHook(HostRuntime runtime) {
+        Method attach = findTinkerAttach(runtime.getClassLoader());
+        if (attach != null) {
+            try {
+                HookRegistry.get().hook(attach, new AppBrandAttachHooker(this, runtime));
+            } catch (Throwable failure) {
+                HLog.e(TAG + " 小程序进程早期入口安装失败: " + failure.getMessage(), failure);
+            }
+        } else {
+            HLog.e(TAG + " 小程序进程早期入口未找到: " + TINKER_APPLICATION + "#" + TINKER_ATTACH);
         }
         try {
-            HookRegistry.get().add(XposedHelpers.findAndHookMethod(
-                    Application.class,
-                    "onCreate",
-                    new XC_MethodHook() {
-                        @Override
-                        public void afterHookedMethod(MethodHookParam param) {
-                            Application app = (Application) param.thisObject;
-                            ClassLoader loader = resolveHostClassLoader(app, lpparam);
-                            installAppBrandProcessHook(app, loader, lpparam, true);
-                        }
-                    }
-            ));
-        } catch (Throwable e) {
-            HLog.e(TAG + " 小程序进程兜底入口安装失败: " + e.getMessage(), e);
+            HookRegistry.get().hook(requireMethod(Application.class, "onCreate"),
+                    new AppBrandApplicationHooker(this, runtime));
+        } catch (Throwable failure) {
+            HLog.e(TAG + " 小程序进程兜底入口安装失败: " + failure.getMessage(), failure);
         }
     }
 
     private void installAppBrandProcessHook(Context context,
                                             ClassLoader classLoader,
-                                            XC_LoadPackage.LoadPackageParam lpparam,
+                                            HostRuntime runtime,
                                             boolean applicationReady) {
         if (!TermsGate.INSTANCE.isAccepted(context)) return;
         // 子进程也接入同一份日志存储；初始化只排队，不阻塞 attach 主线程。
@@ -320,125 +256,84 @@ public class ModuleEntry extends XposedModule {
             ScriptPluginRuntime.installAppBrandProcess(
                     context,
                     classLoader,
-                    lpparam.processName
+                    runtime.getProcessName()
             );
         }
         if (failed && applicationReady) {
-            HLog.e(TAG + " 小程序进程Hook安装失败: " + lpparam.processName);
+            HLog.e(TAG + " 小程序进程Hook安装失败: " + runtime.getProcessName());
         }
     }
 
     // ============ 模块初始化 ============
 
-    private void installHotUpdateEarlyHook(XC_LoadPackage.LoadPackageParam lpparam) {
+    private void installHotUpdateEarlyHook(HostRuntime runtime) {
+        Method attach = findTinkerAttach(runtime.getClassLoader());
+        if (attach == null) {
+            HLog.e(TAG + " 热更新早期入口未找到: " + TINKER_APPLICATION + "#" + TINKER_ATTACH);
+            return;
+        }
         try {
-            HookRegistry.get().add(XposedHelpers.findAndHookMethod(
-                    "com.tencent.tinker.loader.app.TinkerApplication",
-                    lpparam.classLoader,
-                    "onBaseContextAttached",
-                    Context.class,
-                    long.class,
-                    long.class,
-                    new XC_MethodHook() {
-                        @Override
-                        public void beforeHookedMethod(MethodHookParam param) {
-                            installHotUpdateForAttach(lpparam, param, "before");
-                        }
-
-                        @Override
-                        public void afterHookedMethod(MethodHookParam param) {
-                            installHotUpdateForAttach(lpparam, param, "after");
-                        }
-                    }
-            ));
-        } catch (Throwable e) {
-            HLog.e(TAG + " 热更新早期入口安装失败: " + e.getMessage(), e);
+            HookRegistry.get().hook(attach, new HotUpdateAttachHooker(this, runtime));
+        } catch (Throwable failure) {
+            HLog.e(TAG + " 热更新早期入口安装失败: " + failure.getMessage(), failure);
         }
     }
 
-    private void installHotUpdateForAttach(XC_LoadPackage.LoadPackageParam lpparam,
-                                           XC_MethodHook.MethodHookParam param,
+    private void installHotUpdateForAttach(HostRuntime runtime,
+                                           Context context,
+                                           Object tinkerApplication,
                                            String stage) {
         try {
-            Context context = (Context) param.args[0];
             if (!TermsGate.INSTANCE.isAccepted(context)) return;
             if (!DisableHotUpdateFeature.isEnabled(context)) return;
             if ("before".equals(stage)) {
-                DisableHotUpdateFeature.installEarly(context, lpparam.classLoader);
+                DisableHotUpdateFeature.installEarly(context, runtime.getClassLoader());
                 return;
             }
             backgroundThread(() -> {
                 DexInstallScheduler.runDexKitTask(() -> {
                     try {
-                        ClassLoader hostClassLoader = resolveTinkerClassLoader(param.thisObject);
+                        ClassLoader hostClassLoader = resolveTinkerClassLoader(tinkerApplication);
                         if (hostClassLoader == null) {
-                            hostClassLoader = resolveHostClassLoader(context, lpparam);
+                            hostClassLoader = resolveHostClassLoader(context, runtime);
                         }
                         NativeLibraryLoader nativeLibraryLoader = new NativeLibraryLoader();
                         nativeLibraryLoader.loadDexKit(context, ModuleEntry.this.getClass().getClassLoader());
-                        DexKitBridge dexKit = createDexKitBridge(hostClassLoader, lpparam.appInfo.sourceDir);
+                        DexKitBridge dexKit = createDexKitBridge(
+                                hostClassLoader, runtime.getApplicationInfo().sourceDir);
                         DisableHotUpdateFeature.install(context, hostClassLoader, dexKit);
-                    } catch (Throwable e) {
-                        HLog.e(TAG + " 热更新后置安装失败: " + e.getMessage(), e);
+                    } catch (Throwable failure) {
+                        HLog.e(TAG + " 热更新后置安装失败: " + failure.getMessage(), failure);
                     }
                 });
             }, "Hchat-HotUpdateHook").start();
-        } catch (SecurityException e) {
-            throw e;
-        } catch (Throwable e) {
-            HLog.e(TAG + " 热更新早期Hook失败(" + stage + "): " + e.getMessage(), e);
+        } catch (SecurityException security) {
+            throw security;
+        } catch (Throwable failure) {
+            HLog.e(TAG + " 热更新早期Hook失败(" + stage + "): " + failure.getMessage(), failure);
         }
     }
 
-    private void installTabletEarlyHook(XC_LoadPackage.LoadPackageParam lpparam) {
+    private void installTabletEarlyHook(HostRuntime runtime) {
+        Method attach = findTinkerAttach(runtime.getClassLoader());
+        if (attach == null) {
+            HLog.e(TAG + " 平板模式早期入口未找到: " + TINKER_APPLICATION + "#" + TINKER_ATTACH);
+            return;
+        }
         try {
-            HookRegistry.get().add(XposedHelpers.findAndHookMethod(
-                    "com.tencent.tinker.loader.app.TinkerApplication",
-                    lpparam.classLoader,
-                    "onBaseContextAttached",
-                    Context.class,
-                    long.class,
-                    long.class,
-                    new XC_MethodHook() {
-                        @Override
-                        public void beforeHookedMethod(MethodHookParam param) {
-                            installTabletHookForAttach(lpparam, param, "before");
-                        }
-
-                        @Override
-                        public void afterHookedMethod(MethodHookParam param) {
-                            installTabletHookForAttach(lpparam, param, "after");
-                        }
-                    }
-            ));
-        } catch (Throwable e) {
-            HLog.e(TAG + " 平板模式早期入口安装失败: " + e.getMessage(), e);
+            HookRegistry.get().hook(attach, new TabletAttachHooker(this, runtime));
+        } catch (Throwable failure) {
+            HLog.e(TAG + " 平板模式早期入口安装失败: " + failure.getMessage(), failure);
         }
     }
 
-    private void installCustomBottomBarEarlyHook(XC_LoadPackage.LoadPackageParam lpparam) {
+    private void installCustomBottomBarEarlyHook(HostRuntime runtime) {
+        Method attach = findTinkerAttach(runtime.getClassLoader());
+        if (attach == null) return;
         try {
-            HookRegistry.get().add(XposedHelpers.findAndHookMethod(
-                    "com.tencent.tinker.loader.app.TinkerApplication",
-                    lpparam.classLoader,
-                    "onBaseContextAttached",
-                    Context.class,
-                    long.class,
-                    long.class,
-                    new XC_MethodHook() {
-                        @Override
-                        public void afterHookedMethod(MethodHookParam param) {
-                            Context context = (Context) param.args[0];
-                            ClassLoader classLoader = resolveTinkerClassLoader(param.thisObject);
-                            if (classLoader == null) {
-                                classLoader = resolveHostClassLoader(context, lpparam);
-                            }
-                            installCustomBottomBarEarly(context, classLoader);
-                        }
-                    }
-            ));
-        } catch (Throwable e) {
-            HLog.e(TAG + " 自定义底栏早期入口安装失败: " + e.getMessage(), e);
+            HookRegistry.get().hook(attach, new CustomBottomBarAttachHooker(this, runtime));
+        } catch (Throwable failure) {
+            HLog.e(TAG + " 自定义底栏早期入口安装失败: " + failure.getMessage(), failure);
         }
     }
 
@@ -446,8 +341,8 @@ public class ModuleEntry extends XposedModule {
         try {
             if (!TermsGate.INSTANCE.isAccepted(context)) return;
             CustomBottomBarFeature.installEarly(context, classLoader);
-        } catch (Throwable e) {
-            HLog.e(TAG + " 自定义底栏早期Hook失败: " + e.getMessage(), e);
+        } catch (Throwable failure) {
+            HLog.e(TAG + " 自定义底栏早期Hook失败: " + failure.getMessage(), failure);
         }
     }
 
@@ -458,9 +353,8 @@ public class ModuleEntry extends XposedModule {
      *
      * 1. attach 阶段 ClassLoader 还没切到补丁后的版本，这时候 Class.forName 拿到的可能是
      *    随后被替换掉的旧 Class，hook 会挂在废弃类上——白装，还查不出来；
-     * 2. 这次安装要做最多 10 次 XposedBridge.hookMethod，每次都 suspend 全部线程。
-     *    在 Application 构造期间做，会把启动主线程长时间按住，日志采集线程也起不来，
-     *    表现就是"设置页抓不到日志"；
+     * 2. 这次安装要做最多 10 次方法 Hook，在 Application 构造期间做，会把启动主线程
+     *    长时间按住，日志采集线程也起不来，表现就是"设置页抓不到日志"；
      * 3. 提前把 wx.i1 / mu0.i 这类 Flutter 运行时类拉进内存并解析整张方法表，
      *    这些反射对象和类结构会一直常驻，进程内存明显上涨。
      *
@@ -470,33 +364,33 @@ public class ModuleEntry extends XposedModule {
      * 远晚于 onCreate；而 initModule 的后台线程此时还卡在 DexKit 全量解析上（秒级）。
      * 所以 onCreate 之后单独起一条只做反射的线程，既足够早，又不占主线程。
      */
-    private void installSubscribeAdsAfterStartup(Context context, XC_LoadPackage.LoadPackageParam lpparam) {
+    private void installSubscribeAdsAfterStartup(Context context, HostRuntime runtime) {
         try {
             if (!TermsGate.INSTANCE.isAccepted(context)) return;
             if (!RemoveSubscribeAdsFeature.isEnabled(context)) return;
-            final ClassLoader classLoader = resolveHostClassLoader(context, lpparam);
+            final ClassLoader classLoader = resolveHostClassLoader(context, runtime);
             backgroundThread(() -> {
                 try {
                     RemoveSubscribeAdsFeature.install(context, classLoader);
-                } catch (Throwable e) {
-                    HLog.e(TAG + " 信息流广告安装失败: " + e.getMessage(), e);
+                } catch (Throwable failure) {
+                    HLog.e(TAG + " 信息流广告安装失败: " + failure.getMessage(), failure);
                 }
             }, "Hchat-SubscribeAds").start();
-        } catch (Throwable e) {
-            HLog.e(TAG + " 信息流广告安装线程启动失败: " + e.getMessage(), e);
+        } catch (Throwable failure) {
+            HLog.e(TAG + " 信息流广告安装线程启动失败: " + failure.getMessage(), failure);
         }
     }
 
-    private void installTabletHookForAttach(XC_LoadPackage.LoadPackageParam lpparam,
-                                            XC_MethodHook.MethodHookParam param,
+    private void installTabletHookForAttach(HostRuntime runtime,
+                                            Context context,
+                                            Object tinkerApplication,
                                             String stage) {
         try {
-            Context context = (Context) param.args[0];
             if (!TermsGate.INSTANCE.isAccepted(context)) return;
             if (!WeChatTabletFeature.isEnabled(context)) return;
-            ClassLoader resolvedClassLoader = resolveTinkerClassLoader(param.thisObject);
+            ClassLoader resolvedClassLoader = resolveTinkerClassLoader(tinkerApplication);
             if (resolvedClassLoader == null) {
-                resolvedClassLoader = resolveHostClassLoader(context, lpparam);
+                resolvedClassLoader = resolveHostClassLoader(context, runtime);
             }
             final ClassLoader hostClassLoader = resolvedClassLoader;
             // 缓存安装不使用 DexKit，避免主线程等待后台预热持有的串行门。
@@ -507,32 +401,31 @@ public class ModuleEntry extends XposedModule {
                     if (!DisableHotUpdateFeature.isEnabled(context)) return;
                     NativeLibraryLoader nativeLibraryLoader = new NativeLibraryLoader();
                     nativeLibraryLoader.loadDexKit(context, ModuleEntry.this.getClass().getClassLoader());
-                    DexKitBridge dexKit = createDexKitBridge(lpparam.classLoader, lpparam.appInfo.sourceDir);
-                    WeChatTabletFeature.install(context, lpparam.classLoader, dexKit);
+                    DexKitBridge dexKit = createDexKitBridge(
+                            runtime.getClassLoader(), runtime.getApplicationInfo().sourceDir);
+                    WeChatTabletFeature.install(context, runtime.getClassLoader(), dexKit);
                     return;
                 }
                 NativeLibraryLoader nativeLibraryLoader = new NativeLibraryLoader();
                 nativeLibraryLoader.loadDexKit(context, ModuleEntry.this.getClass().getClassLoader());
-                DexKitBridge dexKit = createDexKitBridge(hostClassLoader, lpparam.appInfo.sourceDir);
+                DexKitBridge dexKit = createDexKitBridge(
+                        hostClassLoader, runtime.getApplicationInfo().sourceDir);
                 WeChatTabletFeature.install(context, hostClassLoader, dexKit);
             });
-        } catch (SecurityException e) {
-            throw e;
-        } catch (Throwable e) {
-            HLog.e(TAG + " 平板模式早期Hook失败(" + stage + "): " + e.getMessage(), e);
+        } catch (SecurityException security) {
+            throw security;
+        } catch (Throwable failure) {
+            HLog.e(TAG + " 平板模式早期Hook失败(" + stage + "): " + failure.getMessage(), failure);
         }
     }
 
     private ClassLoader resolveTinkerClassLoader(Object tinkerApplication) {
-        try {
-            Object value = XposedHelpers.callMethod(tinkerApplication, "getClassLoader");
-            return value instanceof ClassLoader ? (ClassLoader) value : null;
-        } catch (Throwable ignored) {
-            return null;
-        }
+        if (tinkerApplication == null) return null;
+        Object value = KavaReflector.invokeMethod(tinkerApplication, "getClassLoader");
+        return value instanceof ClassLoader ? (ClassLoader) value : null;
     }
 
-    private void initModule(Context hostContext, XC_LoadPackage.LoadPackageParam lpparam) {
+    private void initModule(Context hostContext, HostRuntime runtime) {
         try {
             // 0. 尽早恢复日志存储（崩溃证据与看门狗面包屑仍依赖它），此时只是一次配置读取。
             HLog.initCapture(hostContext);
@@ -546,12 +439,12 @@ public class ModuleEntry extends XposedModule {
             Context moduleContext = createModuleContext(hostContext);
             ConfigStore configStore = new ConfigStore(hostContext);
 
-            ModuleResourceMenuFallback.INSTANCE.install(resolveHostClassLoader(hostContext, lpparam));
+            ModuleResourceMenuFallback.INSTANCE.install(resolveHostClassLoader(hostContext, runtime));
 
             DexInstallScheduler.runDexKitTask(() -> {
                 // 3. 初始化 DexKit。优先使用 Tinker 之后的运行时 ClassLoader。
-                String apkPath = lpparam.appInfo.sourceDir;
-                ClassLoader hostClassLoader = resolveHostClassLoader(hostContext, lpparam);
+                String apkPath = runtime.getApplicationInfo().sourceDir;
+                ClassLoader hostClassLoader = resolveHostClassLoader(hostContext, runtime);
                 DexKitBridge dexKit = createDexKitBridge(hostClassLoader, apkPath);
                 DexFinder finder = new DexFinder(dexKit, hostClassLoader, hostContext);
                 WeChatImageApi.installMarsCdnManagerHook(
@@ -568,7 +461,7 @@ public class ModuleEntry extends XposedModule {
                         hostContext,
                         moduleContext != null ? moduleContext : hostContext,
                         hostClassLoader,
-                        lpparam,
+                        runtime,
                         dexKit,
                         finder,
                         eventBus,
@@ -598,15 +491,15 @@ public class ModuleEntry extends XposedModule {
                 installMsgDescTextFallback(finder);
             });
 
-        } catch (Throwable e) {
-            HLog.e(TAG + " 初始化失败: " + e, e);
+        } catch (Throwable failure) {
+            HLog.e(TAG + " 初始化失败: " + failure, failure);
         }
     }
 
     /**
      * 防崩兜底：微信 8.0.76 的 pt0.r.l(Context, boolean) 存在未初始化局部变量，
      * 收到特殊小程序电商卡片消息（type 44 + ecsInfo）时 String.isEmpty() 对 null 调用导致崩溃。
-     * 这里 hook 该方法，手动调用原方法并捕获异常，崩溃时兜底返回空串。
+     * 这里 hook 该方法，原方法抛错时兜底返回空串。
      */
     private void installMsgDescTextFallback(DexFinder finder) {
         try {
@@ -615,34 +508,16 @@ public class ModuleEntry extends XposedModule {
                 HLog.e("[Hchat:WechatApi] 消息描述防崩兜底未定位到方法");
                 return;
             }
-            for (Method m : finder.msgDescTextMethods) {
-                if (m == null) continue;
+            for (Method method : finder.msgDescTextMethods) {
+                if (method == null) continue;
                 try {
-                    HookRegistry.get().add(XposedHelpers.findAndHookMethod(
-                            m.getDeclaringClass(), m.getName(), Context.class, boolean.class,
-                            new XC_MethodHook() {
-                                @Override
-                                public void beforeHookedMethod(MethodHookParam param) throws Throwable {
-                                    try {
-                                        // 绝不能用 Method.invoke：反射调用仍会经过 hook 入口，
-                                        // 形成 before → invoke → before 的无限递归，直到 StackOverflowError。
-                                        // 内层 catch 把溢出吞成 setResult("") 后逐层返回，结果是该方法
-                                        // 此后恒返回空串（消息描述文本丢失），且每次调用白烧一整条栈。
-                                        // invokeOriginalMethod 是 Xposed 提供的直通原实现入口，不会重入 hook。
-                                        param.setResult(XposedBridge.invokeOriginalMethod(
-                                                param.method, param.thisObject, param.args));
-                                    } catch (Throwable t) {
-                                        param.setResult("");
-                                    }
-                                }
-                            }
-                    ));
-                } catch (Throwable e) {
-                    HLog.e("[Hchat:WechatApi] 消息描述防崩兜底安装失败: " + m, e);
+                    HookRegistry.get().hook(method, new MsgDescTextFallbackHooker());
+                } catch (Throwable failure) {
+                    HLog.e("[Hchat:WechatApi] 消息描述防崩兜底安装失败: " + method, failure);
                 }
             }
-        } catch (Throwable e) {
-            HLog.e(TAG + " 消息描述防崩兜底安装失败: " + e.getMessage(), e);
+        } catch (Throwable failure) {
+            HLog.e(TAG + " 消息描述防崩兜底安装失败: " + failure.getMessage(), failure);
         }
     }
 
@@ -657,22 +532,23 @@ public class ModuleEntry extends XposedModule {
                     "h.Hchat",
                     Context.CONTEXT_IGNORE_SECURITY | Context.CONTEXT_INCLUDE_CODE
             );
-        } catch (Throwable e) {
+        } catch (Throwable ignored) {
             return null;
         }
     }
 
-    private ClassLoader resolveHostClassLoader(Context hostContext,
-                                               XC_LoadPackage.LoadPackageParam lpparam) {
-        ClassLoader lpClassLoader = lpparam.classLoader;
+    private ClassLoader resolveHostClassLoader(Context hostContext, HostRuntime runtime) {
+        ClassLoader lpClassLoader = runtime.getClassLoader();
         ClassLoader contextClassLoader = null;
         ClassLoader threadClassLoader = null;
         try {
             contextClassLoader = hostContext.getClassLoader();
-        } catch (Throwable ignored) {}
+        } catch (Throwable ignored) {
+        }
         try {
             threadClassLoader = Thread.currentThread().getContextClassLoader();
-        } catch (Throwable ignored) {}
+        } catch (Throwable ignored) {
+        }
 
         if (isTinkerClassLoader(contextClassLoader)) return contextClassLoader;
         if (isTinkerClassLoader(threadClassLoader)) return threadClassLoader;
@@ -706,5 +582,238 @@ public class ModuleEntry extends XposedModule {
         if (classLoader == null) return false;
         String text = String.valueOf(classLoader);
         return text.contains("/tinker/") || text.contains("DelegateLastClassLoader");
+    }
+
+    /** 反射获取 Tinker attach 入口；类或方法不存在时返回 null，由调用方记录缺失。 */
+    private static Method findTinkerAttach(ClassLoader classLoader) {
+        Class<?> clazz = KavaReflector.loadClass(TINKER_APPLICATION, classLoader);
+        return KavaReflector.findMethodRecursive(
+                clazz, TINKER_ATTACH, Context.class, long.class, long.class);
+    }
+
+    private static Method requireMethod(Class<?> clazz, String name, Class<?>... parameters) {
+        Method method = KavaReflector.findMethodRecursive(clazz, name, parameters);
+        if (method == null) {
+            throw new IllegalStateException("找不到目标方法: " + clazz.getName() + "#" + name);
+        }
+        return method;
+    }
+
+    private void log(int priority, String message) {
+        try {
+            log(priority, "Hchat", message);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    // ============ 原生 Hooker ============
+
+    /** 主进程：Application.onCreate 前后完成崩溃采集、早期入口和模块初始化。 */
+    private static final class MainApplicationHooker implements XposedInterface.Hooker {
+        private final ModuleEntry owner;
+        private final HostRuntime runtime;
+
+        MainApplicationHooker(ModuleEntry owner, HostRuntime runtime) {
+            this.owner = owner;
+            this.runtime = runtime;
+        }
+
+        @Override
+        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+            Application app = (Application) chain.getThisObject();
+            if (app == null) return chain.proceed();
+            if (TermsGate.INSTANCE.isAccepted(app)) {
+                CrashReportRuntime.prepare(app);
+            }
+            Object result;
+            try {
+                result = chain.proceed();
+            } catch (Throwable failure) {
+                // 原实现 after 仍会在宿主异常时执行；此时进程即将退出，
+                // 只补做崩溃采集与日志恢复的低风险部分，再原样抛出。
+                runAfter(app);
+                throw failure;
+            }
+            runAfter(app);
+            return result;
+        }
+
+        private void runAfter(Application app) {
+            if (TermsGate.INSTANCE.isAccepted(app)) {
+                CrashReportRuntime.install(app, ModuleEntry.class.getClassLoader());
+                // 标签栏先捕获首页根视图，不能等待后台 DexKit 初始化后再挂载。
+                try {
+                    ConversationTabsFeature.installEarly(
+                            owner.resolveHostClassLoader(app, runtime));
+                } catch (Throwable failure) {
+                    HLog.e(TAG + " 标签分组早期安装失败", failure);
+                }
+                // 悬浮入口不依赖 DexKit，先注册生命周期，避免错过首个 Activity。
+                try {
+                    FloatingShortcutRuntime.INSTANCE.install(app);
+                } catch (Throwable failure) {
+                    HLog.e(TAG + " 悬浮快捷菜单早期安装失败", failure);
+                }
+            }
+            owner.installCustomBottomBarEarly(
+                    app, owner.resolveHostClassLoader(app, runtime));
+
+            // 「记录运行日志」不能等 initModule 的后台线程：
+            // 那条线程要先 loadDexKit 再全量解析 dex（秒级），一旦它被拖慢，
+            // 设置页看到的就是"日志抓不到"。这里在 onCreate 返回时就恢复采集，
+            // initCapture 自身幂等，后面 initModule 再调一次不会有额外开销。
+            try {
+                HLog.initCapture(app);
+            } catch (Throwable failure) {
+                HLog.e(TAG + " 日志采集早期初始化失败: " + failure.getMessage(), failure);
+            }
+
+            // 公众号信息流广告：onCreate 之后立刻用独立后台线程安装，
+            // 早于 initModule 的 DexKit 全量解析，但不在 attach 阶段做重活。
+            owner.installSubscribeAdsAfterStartup(app, runtime);
+
+            backgroundThread(() -> owner.initModule(app, runtime), "Hchat-Init").start();
+        }
+    }
+
+    /** 小程序子进程：Tinker attach 后使用补丁后的 ClassLoader 安装轻量功能。 */
+    private static final class AppBrandAttachHooker implements XposedInterface.Hooker {
+        private final ModuleEntry owner;
+        private final HostRuntime runtime;
+
+        AppBrandAttachHooker(ModuleEntry owner, HostRuntime runtime) {
+            this.owner = owner;
+            this.runtime = runtime;
+        }
+
+        @Override
+        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+            Context context = (Context) chain.getArg(0);
+            Object tinkerApplication = chain.getThisObject();
+            Object result = chain.proceed();
+            if (context == null) return result;
+            ClassLoader loader = owner.resolveTinkerClassLoader(tinkerApplication);
+            if (loader == null) {
+                loader = owner.resolveHostClassLoader(context, runtime);
+            }
+            owner.installAppBrandProcessHook(context, loader, runtime, false);
+            return result;
+        }
+    }
+
+    /** 小程序子进程兜底：Application.onCreate 之后补装。 */
+    private static final class AppBrandApplicationHooker implements XposedInterface.Hooker {
+        private final ModuleEntry owner;
+        private final HostRuntime runtime;
+
+        AppBrandApplicationHooker(ModuleEntry owner, HostRuntime runtime) {
+            this.owner = owner;
+            this.runtime = runtime;
+        }
+
+        @Override
+        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+            Application app = (Application) chain.getThisObject();
+            Object result = chain.proceed();
+            if (app == null) return result;
+            ClassLoader loader = owner.resolveHostClassLoader(app, runtime);
+            owner.installAppBrandProcessHook(app, loader, runtime, true);
+            return result;
+        }
+    }
+
+    /** 屏蔽热更新：attach 前安装早期拦截，attach 后再定位并补齐。 */
+    private static final class HotUpdateAttachHooker implements XposedInterface.Hooker {
+        private final ModuleEntry owner;
+        private final HostRuntime runtime;
+
+        HotUpdateAttachHooker(ModuleEntry owner, HostRuntime runtime) {
+            this.owner = owner;
+            this.runtime = runtime;
+        }
+
+        @Override
+        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+            Context context = (Context) chain.getArg(0);
+            Object tinkerApplication = chain.getThisObject();
+            if (context == null) return chain.proceed();
+            owner.installHotUpdateForAttach(runtime, context, tinkerApplication, "before");
+            Object result;
+            try {
+                result = chain.proceed();
+            } catch (Throwable failure) {
+                owner.installHotUpdateForAttach(runtime, context, tinkerApplication, "after");
+                throw failure;
+            }
+            owner.installHotUpdateForAttach(runtime, context, tinkerApplication, "after");
+            return result;
+        }
+    }
+
+    /** 平板模式：所有微信进程在 attach 前后都尝试按缓存或 DexKit 安装。 */
+    private static final class TabletAttachHooker implements XposedInterface.Hooker {
+        private final ModuleEntry owner;
+        private final HostRuntime runtime;
+
+        TabletAttachHooker(ModuleEntry owner, HostRuntime runtime) {
+            this.owner = owner;
+            this.runtime = runtime;
+        }
+
+        @Override
+        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+            Context context = (Context) chain.getArg(0);
+            Object tinkerApplication = chain.getThisObject();
+            if (context == null) return chain.proceed();
+            owner.installTabletHookForAttach(runtime, context, tinkerApplication, "before");
+            Object result;
+            try {
+                result = chain.proceed();
+            } catch (Throwable failure) {
+                owner.installTabletHookForAttach(runtime, context, tinkerApplication, "after");
+                throw failure;
+            }
+            owner.installTabletHookForAttach(runtime, context, tinkerApplication, "after");
+            return result;
+        }
+    }
+
+    /** 自定义底栏：必须赶在 LauncherUI 首帧前安装。 */
+    private static final class CustomBottomBarAttachHooker implements XposedInterface.Hooker {
+        private final ModuleEntry owner;
+        private final HostRuntime runtime;
+
+        CustomBottomBarAttachHooker(ModuleEntry owner, HostRuntime runtime) {
+            this.owner = owner;
+            this.runtime = runtime;
+        }
+
+        @Override
+        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+            Context context = (Context) chain.getArg(0);
+            Object tinkerApplication = chain.getThisObject();
+            Object result = chain.proceed();
+            if (context == null) return result;
+            ClassLoader classLoader = owner.resolveTinkerClassLoader(tinkerApplication);
+            if (classLoader == null) {
+                classLoader = owner.resolveHostClassLoader(context, runtime);
+            }
+            owner.installCustomBottomBarEarly(context, classLoader);
+            return result;
+        }
+    }
+
+    /** 消息描述文本防崩兜底：原实现异常时返回空串，不重试、不二次调用。 */
+    private static final class MsgDescTextFallbackHooker implements XposedInterface.Hooker {
+        @Override
+        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+            try {
+                return chain.proceed();
+            } catch (Throwable failure) {
+                HLog.e("[Hchat:WechatApi] 消息描述文本兜底: "
+                        + chain.getExecutable().toGenericString(), failure);
+                return "";
+            }
+        }
     }
 }

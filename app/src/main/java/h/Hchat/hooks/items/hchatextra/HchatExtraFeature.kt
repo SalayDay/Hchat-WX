@@ -26,7 +26,7 @@ import android.widget.RelativeLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.dexkit.DexMethodCache
 import h.Hchat.event.Events
 import h.Hchat.hooks.api.model.WeChatMessage
@@ -382,45 +382,28 @@ private class HchatExtraHooker(
             "web_risk_intercept_enabled",
             listOf("MicroMsg.WebViewHighRiskAdH5Interceptor", "isInterceptEnabled, expt=")
         ) ?: return false
-        hooked = hookOnce(intercept) { param ->
-            if (enabled(HchatExtraSettings.KEY_SKIP_WEB_RISK, HchatExtraSettings.DEFAULT_SKIP_WEB_RISK)) {
-                param.setResult(false)
-            }
-        } || hooked
+        hooked = hookOnce(intercept, WebRiskInterceptionHook(this, intercept.name)) || hooked
         val safe = locateMethodsInClass(
             "web_risk_url_safe",
             intercept.declaringClass,
             listOf("http", "https")
         ).firstOrNull { it.returnType == java.lang.Boolean.TYPE || it.returnType == java.lang.Boolean::class.java }
             ?: return hooked
-        hooked = hookOnce(safe) { param ->
-            if (enabled(HchatExtraSettings.KEY_SKIP_WEB_RISK, HchatExtraSettings.DEFAULT_SKIP_WEB_RISK)) {
-                param.setResult(true)
-            }
-        } || hooked
+        hooked = hookOnce(safe, WebRiskSafetyHook(this, safe.name)) || hooked
         return hooked
     }
 
     private fun installRedPacketDetails(): Boolean {
         var hooked = false
         locateRedPacketTimeFormatterMethod()?.let { method ->
-            hooked = hookAfterOnce(method) { param ->
-                if (!enabled(HchatExtraSettings.KEY_RED_PACKET_DETAILS, HchatExtraSettings.DEFAULT_RED_PACKET_DETAILS)) return@hookAfterOnce
-                val timestamp = (param.args?.getOrNull(1) as? Number)?.toLong()
-                    ?.takeIf { it in RED_PACKET_TIME_MILLIS_RANGE }
-                    ?: return@hookAfterOnce
-                param.result = formatRedPacketRecordTime(timestamp)
-            } || hooked
+            hooked = hookOnce(method, RedPacketTimeHook(this, method.name)) || hooked
         }
         val bindMethod = locateMethod(
             "lucky_money_detail_bind_direct",
             listOf("MicroMsg.LuckyMoneyDetailUI", "try get user contact: %s")
         )
         if (bindMethod != null) {
-            hooked = hookAfterOnce(bindMethod) { param ->
-                if (!enabled(HchatExtraSettings.KEY_RED_PACKET_DETAILS, HchatExtraSettings.DEFAULT_RED_PACKET_DETAILS)) return@hookAfterOnce
-                bindRedPacketRecordTime(param.args?.getOrNull(0), param.args?.getOrNull(1))
-            } || hooked
+            hooked = hookOnce(bindMethod, RedPacketBindHook(this, bindMethod.name)) || hooked
         }
 
         val classes = locateClasses(
@@ -439,11 +422,7 @@ private class HchatExtraHooker(
                         method.parameterTypes[1] == String::class.java &&
                         JSONObject::class.java.isAssignableFrom(method.parameterTypes[2])
                 }?.let { method ->
-                    hooked = hookOnce(method) { param ->
-                        if (!enabled(HchatExtraSettings.KEY_RED_PACKET_DETAILS, HchatExtraSettings.DEFAULT_RED_PACKET_DETAILS)) return@hookOnce
-                        val json = param.args?.getOrNull(2) as? JSONObject ?: return@hookOnce
-                        processRedPacketJson(json)
-                    } || hooked
+                    hooked = hookOnce(method, RedPacketSceneHook(this, method.name)) || hooked
                 }
         }
         return hooked
@@ -489,21 +468,10 @@ private class HchatExtraHooker(
             ?: return false
         val firstInstall = hookedClasses.add(clazz)
         KavaReflector.findMethodRecursive(clazz, "initView")?.let { method ->
-            hooked = hookAfterOnce(method) { param ->
-                val activity = param.thisObject as? Activity ?: return@hookAfterOnce
-                if (!enabled(HchatExtraSettings.KEY_GROUP_MEMBER_HISTORY, HchatExtraSettings.DEFAULT_GROUP_MEMBER_HISTORY)) return@hookAfterOnce
-                installGroupMemberHistoryFromList(activity)
-            } || hooked
+            hooked = hookOnce(method, GroupHistoryInitHook(this, method.name)) || hooked
         }
         methodsRecursive(clazz).firstOrNull { it.name == "onPreferenceTreeClick" }?.let { method ->
-            hooked = hookOnce(method) { param ->
-                val activity = param.thisObject as? Activity ?: return@hookOnce
-                if (!enabled(HchatExtraSettings.KEY_GROUP_MEMBER_HISTORY, HchatExtraSettings.DEFAULT_GROUP_MEMBER_HISTORY)) return@hookOnce
-                val pref = groupHistoryClickedPreference(param.args)
-                    ?: return@hookOnce
-                openGroupMemberHistory(activity)
-                param.setResult(true)
-            } || hooked
+            hooked = hookOnce(method, GroupHistoryClickHook(this, method.name)) || hooked
         }
         if (!hooked && firstInstall) hookedClasses.remove(clazz)
         return hooked
@@ -519,43 +487,7 @@ private class HchatExtraHooker(
         for (bind in binds) {
             if (!hookedMethods.add(bind)) continue
             val installed = runCatching {
-                HookRegistry.get().hook(bind, object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        // 开关判断必须放在最前：此方法挂在全局消息绑定上，每条消息都会调用。
-                        // 关闭状态下若继续执行，会对每个 bind 参数做反射 + 父链上溯 + 全局锁，
-                        // 聊天列表滚动时形成明显的掉帧。
-                        if (!messageDetailsConfig.enabled) return
-                        // The payload method belongs to a shared base adapter. Only chat rows apply.
-                        if (bind in adapterBinds && adapterClass?.isInstance(param.thisObject) != true) return
-                        val state = runCatching {
-                            captureMessageDetailsBindState(param.args)
-                        }.getOrElse {
-                                logger("消息显示时间绑定前状态读取失败", it)
-                                MessageDetailsBindState(null)
-                            }
-                        val stack = messageDetailsBindStates.get()
-                            ?: ArrayDeque<MessageDetailsBindState>().also(messageDetailsBindStates::set)
-                        stack.addLast(state)
-                    }
-
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        // 与 before 保持同一顺序，保证状态栈配对；关闭时直接退出。
-                        if (!messageDetailsConfig.enabled) return
-                        if (bind in adapterBinds && adapterClass?.isInstance(param.thisObject) != true) return
-                        val stack = messageDetailsBindStates.get()
-                        val state = stack?.pollLast() ?: MessageDetailsBindState(null)
-                        val outer = stack?.lastOrNull { state.root != null && it.root === state.root }
-                        if (outer != null && state.message != null) outer.message = state.message
-                        if (stack?.isEmpty() == true) messageDetailsBindStates.remove()
-                        if (outer != null || !messageDetailsConfig.enabled || param.hasThrowable()) return
-                        runCatching {
-                            bindBottomMessageDetails(
-                                param.thisObject, param.args, 0,
-                                state.holder, state.message, state.root
-                            )
-                        }.onFailure { logger("消息显示时间绑定失败", it) }
-                    }
-                })
+                HookRegistry.get().hook(bind, MessageDetailsBindHook(this, bind in adapterBinds, adapterClass))
                 true
             }.getOrElse {
                 hookedMethods.remove(bind)
@@ -584,30 +516,144 @@ private class HchatExtraHooker(
         return state
     }
 
-    private fun hookOnce(method: Method, block: (XC_MethodHook.MethodHookParam) -> Unit): Boolean {
-        if (!hookedMethods.add(method)) return true
-        return runCatching {
-            HookRegistry.get().hook(method, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    runCatching { block(param) }.onFailure { logger("Hchat扩展Hook执行失败: ${method.name}", it) }
-                }
-            })
-            true
-        }.getOrElse {
-            hookedMethods.remove(method)
-            logger("Hchat扩展Hook安装失败: ${method.name}", it)
-            false
+    private class WebRiskInterceptionHook(
+        private val owner: HchatExtraHooker, private val methodName: String
+    ) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val skip = runCatching {
+                owner.enabled(HchatExtraSettings.KEY_SKIP_WEB_RISK, HchatExtraSettings.DEFAULT_SKIP_WEB_RISK)
+            }.onFailure { owner.logger("Hchat扩展Hook执行失败: $methodName", it) }.getOrDefault(false)
+            if (skip) return false
+            return chain.proceed()
         }
     }
 
-    private fun hookAfterOnce(method: Method, block: (XC_MethodHook.MethodHookParam) -> Unit): Boolean {
+    private class WebRiskSafetyHook(
+        private val owner: HchatExtraHooker, private val methodName: String
+    ) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val skip = runCatching {
+                owner.enabled(HchatExtraSettings.KEY_SKIP_WEB_RISK, HchatExtraSettings.DEFAULT_SKIP_WEB_RISK)
+            }.onFailure { owner.logger("Hchat扩展Hook执行失败: $methodName", it) }.getOrDefault(false)
+            if (skip) return true
+            return chain.proceed()
+        }
+    }
+
+    private class RedPacketTimeHook(
+        private val owner: HchatExtraHooker, private val methodName: String
+    ) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val result = chain.proceed()
+            return runCatching {
+                if (!owner.enabled(HchatExtraSettings.KEY_RED_PACKET_DETAILS, HchatExtraSettings.DEFAULT_RED_PACKET_DETAILS)) return@runCatching result
+                val timestamp = (chain.args.getOrNull(1) as? Number)?.toLong()
+                    ?.takeIf { it in RED_PACKET_TIME_MILLIS_RANGE } ?: return@runCatching result
+                owner.formatRedPacketRecordTime(timestamp)
+            }.onFailure { owner.logger("Hchat扩展Hook执行失败: $methodName", it) }.getOrDefault(result)
+        }
+    }
+
+    private class RedPacketBindHook(
+        private val owner: HchatExtraHooker, private val methodName: String
+    ) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val result = chain.proceed()
+            runCatching {
+                if (owner.enabled(HchatExtraSettings.KEY_RED_PACKET_DETAILS, HchatExtraSettings.DEFAULT_RED_PACKET_DETAILS)) {
+                    owner.bindRedPacketRecordTime(chain.args.getOrNull(0), chain.args.getOrNull(1))
+                }
+            }.onFailure { owner.logger("Hchat扩展Hook执行失败: $methodName", it) }
+            return result
+        }
+    }
+
+    private class RedPacketSceneHook(
+        private val owner: HchatExtraHooker, private val methodName: String
+    ) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            runCatching {
+                if (owner.enabled(HchatExtraSettings.KEY_RED_PACKET_DETAILS, HchatExtraSettings.DEFAULT_RED_PACKET_DETAILS)) {
+                    (chain.args.getOrNull(2) as? JSONObject)?.let(owner::processRedPacketJson)
+                }
+            }.onFailure { owner.logger("Hchat扩展Hook执行失败: $methodName", it) }
+            return chain.proceed()
+        }
+    }
+
+    private class GroupHistoryInitHook(
+        private val owner: HchatExtraHooker, private val methodName: String
+    ) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val result = chain.proceed()
+            runCatching {
+                val activity = chain.thisObject as? Activity ?: return@runCatching
+                if (owner.enabled(HchatExtraSettings.KEY_GROUP_MEMBER_HISTORY, HchatExtraSettings.DEFAULT_GROUP_MEMBER_HISTORY)) {
+                    owner.installGroupMemberHistoryFromList(activity)
+                }
+            }.onFailure { owner.logger("Hchat扩展Hook执行失败: $methodName", it) }
+            return result
+        }
+    }
+
+    private class GroupHistoryClickHook(
+        private val owner: HchatExtraHooker, private val methodName: String
+    ) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val consumed = runCatching {
+                val activity = chain.thisObject as? Activity ?: return@runCatching false
+                if (!owner.enabled(HchatExtraSettings.KEY_GROUP_MEMBER_HISTORY, HchatExtraSettings.DEFAULT_GROUP_MEMBER_HISTORY)) return@runCatching false
+                owner.groupHistoryClickedPreference(chain.args.toTypedArray()) ?: return@runCatching false
+                owner.openGroupMemberHistory(activity)
+                true
+            }.onFailure { owner.logger("Hchat扩展Hook执行失败: $methodName", it) }.getOrDefault(false)
+            if (consumed) return true
+            return chain.proceed()
+        }
+    }
+
+    private class MessageDetailsBindHook(
+        private val owner: HchatExtraHooker,
+        private val adapterBind: Boolean,
+        private val adapterClass: Class<*>?
+    ) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            // Keep the global binder disabled path free of reflection and thread-local work.
+            if (!owner.messageDetailsConfig.enabled) return chain.proceed()
+            val receiver = chain.thisObject
+            if (adapterBind && adapterClass?.isInstance(receiver) != true) return chain.proceed()
+            val args = chain.args.toTypedArray()
+            val state = runCatching { owner.captureMessageDetailsBindState(args) }.getOrElse {
+                owner.logger("消息显示时间绑定前状态读取失败", it)
+                MessageDetailsBindState(null)
+            }
+            val stack = owner.messageDetailsBindStates.get()
+                ?: ArrayDeque<MessageDetailsBindState>().also(owner.messageDetailsBindStates::set)
+            stack.addLast(state)
+            var completed = false
+            try {
+                val result = chain.proceed()
+                completed = true
+                return result
+            } finally {
+                // Always pair the captured state, even if the switch changes or the host throws.
+                stack.pollLast()
+                val outer = stack.lastOrNull { state.root != null && it.root === state.root }
+                if (outer != null && state.message != null) outer.message = state.message
+                if (stack.isEmpty()) owner.messageDetailsBindStates.remove()
+                if (completed && outer == null && owner.messageDetailsConfig.enabled) {
+                    runCatching {
+                        owner.bindBottomMessageDetails(receiver, args, 0, state.holder, state.message, state.root)
+                    }.onFailure { owner.logger("消息显示时间绑定失败", it) }
+                }
+            }
+        }
+    }
+
+    private fun hookOnce(method: Method, hooker: XposedInterface.Hooker): Boolean {
         if (!hookedMethods.add(method)) return true
         return runCatching {
-            HookRegistry.get().hook(method, object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    runCatching { block(param) }.onFailure { logger("Hchat扩展Hook执行失败: ${method.name}", it) }
-                }
-            })
+            HookRegistry.get().hook(method, hooker)
             true
         }.getOrElse {
             hookedMethods.remove(method)

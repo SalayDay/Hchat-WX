@@ -26,6 +26,10 @@ public final class RustScriptInterpreter implements Closeable {
             + "import java.util.stream.*;import java.util.regex.*;import java.util.function.*;import java.util.*;"
             + "import java.net.*;import java.math.*;import java.io.*;import java.lang.*;";
     private final BshEngine engine;
+    /** 宿主 Hook 回调的 busy 标记。只在调用线程上复用，不跨线程共享。 */
+    private static final ThreadLocal<boolean[]> HOOK_BUSY = ThreadLocal.withInitial(() -> new boolean[1]);
+    /** {@link #tryInvokeHook} 拿不到解释器执行权时的返回标记。脚本不可能拿到这个对象。 */
+    public static final Object HOOK_BUSY_MARK = new Object();
     public static final class Environment {
         public String cwd = System.getProperty("user.dir", ".");
     }
@@ -56,6 +60,21 @@ public final class RustScriptInterpreter implements Closeable {
         requireOpen();
         if ("bsh.cwd".equals(name)) environment.cwd = Objects.toString(value, ".");
         else engine.setVariable(name, value);
+    }
+
+    /**
+     * 同步调用一个脚本函数，只给宿主 Hook 回调使用。
+     *
+     * <p>宿主 interceptor chain 只能在收到它的线程上使用，所以这里既不排队也不阻塞：
+     * 解释器执行权当前不可用时返回 {@link #HOOK_BUSY_MARK}，调用方必须直接放行宿主方法。
+     * 脚本自身抛出的异常按原来的方式以 RuntimeException 形式抛给调用方。</p>
+     */
+    public Object tryInvokeHook(String functionName, Object[] args) {
+        requireOpen();
+        boolean[] busy = HOOK_BUSY.get();
+        busy[0] = false;
+        Object value = engine.tryInvokeHook(functionName, args, busy);
+        return busy[0] ? HOOK_BUSY_MARK : value;
     }
 
     public Object get(String name) {

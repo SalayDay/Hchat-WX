@@ -20,7 +20,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
-import de.robv.android.xposed.XC_MethodHook;
+import io.github.libxposed.api.XposedInterface;
 import h.Hchat.dexkit.DexFinder;
 import h.Hchat.hooks.api.core.WeChatApis;
 import h.Hchat.hooks.core.HookRegistry;
@@ -64,12 +64,7 @@ public class ProtobufPacketHook {
                     if (method.getParameterTypes().length != 3) continue;
                     String desc = base.getName() + "#" + method.toString();
                     if (!hookedDesc.add(desc)) continue;
-                    HookRegistry.get().hook(method, new XC_MethodHook() {
-                        @Override
-                        public void beforeHookedMethod(MethodHookParam param) {
-                            handleDispatch(param);
-                        }
-                    });
+                    HookRegistry.get().hook(method, new PacketDispatchHooker(this));
                     hooked++;
                 }
             }
@@ -234,14 +229,14 @@ public class ProtobufPacketHook {
         }
     }
 
-    private void handleDispatch(XC_MethodHook.MethodHookParam param) {
+    private void handleDispatch(Object receiver, Object[] args) {
         boolean logEnabled = enabled();
         boolean listenerEnabled = ProtobufPacketRuntime.hasListeners();
         if (!logEnabled && !listenerEnabled) return;
         try {
-            if (param.args == null || param.args.length < 3) return;
-            Object reqResp = param.args[1];
-            Object callback = param.args[2];
+            if (args == null || args.length < 3) return;
+            Object reqResp = args[1];
+            Object callback = args[2];
             if (reqResp == null) return;
             String uri = safeString(call(reqResp, "getUri"));
             if (uri.length() == 0) uri = "null";
@@ -252,7 +247,7 @@ public class ProtobufPacketHook {
             final int finalCgiId = cgiId;
             final Object finalReqResp = reqResp;
 
-            PacketSnapshot snapshot = captureRequest(param.thisObject, reqResp, uri, cgiId);
+            PacketSnapshot snapshot = captureRequest(receiver, reqResp, uri, cgiId);
             if (snapshot != null) {
                 snapshots.put(snapshot.key(), snapshot);
                 trimSnapshots();
@@ -274,16 +269,20 @@ public class ProtobufPacketHook {
                     Object proxy = Proxy.newProxyInstance(
                             dexFinder.protobufOnGYNetEndClass.getClassLoader(),
                             new Class[]{dexFinder.protobufOnGYNetEndClass},
-                            (proxyObj, method, args) -> {
+                            (proxyObj, method, callbackArgs) -> {
                                 if ("hashCode".equals(method.getName())) return callback.hashCode();
                                 if ("toString".equals(method.getName())) return callback.toString();
-                                if ("equals".equals(method.getName())) return callback == (args != null && args.length > 0 ? args[0] : null);
-                                if ("onGYNetEnd".equals(method.getName())) {
-                                    captureResponse(finalUri, finalCgiId, finalReqResp, args);
+                                if ("equals".equals(method.getName())) {
+                                    return callback == (callbackArgs != null && callbackArgs.length > 0
+                                            ? callbackArgs[0] : null);
                                 }
-                                return KavaReflector.invoke(method, callback, args == null ? new Object[0] : args);
+                                if ("onGYNetEnd".equals(method.getName())) {
+                                    captureResponse(finalUri, finalCgiId, finalReqResp, callbackArgs);
+                                }
+                                return KavaReflector.invoke(method, callback,
+                                        callbackArgs == null ? new Object[0] : callbackArgs);
                             });
-                    param.args[2] = proxy;
+                    args[2] = proxy;
             }
         } catch (Throwable e) {
             error("dispatch处理失败: " + e.getMessage());
@@ -321,15 +320,7 @@ public class ProtobufPacketHook {
         if (!isSceneEndMethod(method)) return 0;
         String desc = method.getDeclaringClass().getName() + "#" + method.toString();
         if (!hookedDesc.add(desc)) return 0;
-        HookRegistry.get().hook(method, new XC_MethodHook() {
-            @Override
-            public void beforeHookedMethod(MethodHookParam param) {
-                if (param.args == null || param.args.length < 4) return;
-                Object scene = param.args[3];
-                if (!ProtobufPacketRuntime.isGenericScene(scene)) return;
-                param.setResult(null);
-            }
-        });
+        HookRegistry.get().hook(method, new GenericSceneEndHooker(this));
         return 1;
     }
 
@@ -756,4 +747,35 @@ public class ProtobufPacketHook {
             }
         }
     }
+
+    private static final class PacketDispatchHooker implements XposedInterface.Hooker {
+        private final ProtobufPacketHook owner;
+
+        PacketDispatchHooker(ProtobufPacketHook owner) {
+            this.owner = owner;
+        }
+
+        @Override
+        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+            Object[] args = chain.getArgs().toArray();
+            owner.handleDispatch(chain.getThisObject(), args);
+            return chain.proceed(args);
+        }
+    }
+
+    private static final class GenericSceneEndHooker implements XposedInterface.Hooker {
+        private final ProtobufPacketHook owner;
+
+        GenericSceneEndHooker(ProtobufPacketHook owner) {
+            this.owner = owner;
+        }
+
+        @Override
+        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+            java.util.List<Object> args = chain.getArgs();
+            if (args.size() >= 4 && ProtobufPacketRuntime.isGenericScene(args.get(3))) return null;
+            return chain.proceed();
+        }
+    }
+
 }

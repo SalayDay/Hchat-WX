@@ -62,7 +62,8 @@ public class WechatApiFeature implements Feature {
                 databaseApi, accountApi, context.dexFinder(), this::log);
         WeChatMessageApi messageApi = new WeChatMessageApi(
                 context.dexFinder(), dispatcher, accountApi, contactApi, messageStoreApi, context.eventBus(), this::log);
-        WeChatLocalMessageApi localMessageApi = new WeChatLocalMessageApi(context.dexFinder(), this::log);
+        WeChatLocalMessageApi localMessageApi = new WeChatLocalMessageApi(
+                context.dexFinder(), this::log, context.hostContext());
         WeChatConversationApi conversationApi = new WeChatConversationApi(
                 databaseApi, contactApi, notifyApi, context.dexFinder(), this::log);
         WeChatUserApi userApi = new WeChatUserApi(accountApi, contactApi, this::log);
@@ -134,6 +135,9 @@ public class WechatApiFeature implements Feature {
                 DexInstallScheduler.Stage.BRIDGE, 1000, () -> {
             try {
                 context.dexFinder().resolveAll();
+                localMessageApi.ensureReady();
+                installApiHook("luckyMoneyNoticeWarmup", () ->
+                        localMessageApi.installLuckyMoneyNoticeProtection(context));
                 networkApi.installNetworkHook(context.dexFinder());
                 installApiHook("snsInteractionWarmup", snsApi::warmupInteraction);
                 installApiHook("snsCachedPostsWarmup", snsApi::warmupCachedPosts);
@@ -172,6 +176,12 @@ public class WechatApiFeature implements Feature {
                     chatroomChangeApi.install();
                     return databaseListenerApi.isOperational() && messageChangeApi.isInstalled();
                 });
+        DexInstallScheduler.scheduleTask(
+                "wechat_api:lucky_money_notices",
+                "红包领取提示来源保护",
+                DexInstallScheduler.Stage.WARMUP,
+                100,
+                () -> localMessageApi.installLuckyMoneyNoticeProtection(context));
         DexInstallScheduler.scheduleTask(
                 "wechat_api:private_conversation_mute",
                 "私聊免打扰API补定位",

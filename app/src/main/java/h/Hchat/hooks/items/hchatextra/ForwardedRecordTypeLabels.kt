@@ -12,7 +12,7 @@ import android.widget.BaseAdapter
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.dexkit.DexMethodCache
 import h.Hchat.hooks.core.FeatureContext
 import h.Hchat.hooks.core.HookRegistry
@@ -39,7 +39,7 @@ internal class ForwardedRecordTypeLabels(
     // Values must not strongly retain a descendant of the weak row key.
     private val rows = WeakHashMap<View, RowState>()
     private val adapters = WeakHashMap<BaseAdapter, Boolean>()
-    private var unhook: XC_MethodHook.Unhook? = null
+    private var unhook: XposedInterface.HookHandle? = null
     @Volatile private var destroyed = false
     private var lastFailure = 0L
 
@@ -50,38 +50,42 @@ internal class ForwardedRecordTypeLabels(
         if (unhook != null) return true
         return try {
             val targets = locate() ?: return false
-            unhook = HookRegistry.get().hook(targets.bind, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    if (Looper.myLooper() != Looper.getMainLooper()) return
-                    (param.args.getOrNull(1) as? View)?.let(::clearRow)
-                }
-
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    if (destroyed || param.hasThrowable() || Looper.myLooper() != Looper.getMainLooper()) return
-                    val row = param.result as? View ?: return
-                    clearRow(row)
-                    val activity = activity(row.context) ?: return
-                    if (!targets.detail.isInstance(activity)) return
-                    val adapter = param.thisObject as? BaseAdapter ?: return
-                    adapters[adapter] = true
-                    if (!enabled()) return
-                    try {
-                        val position = param.args.getOrNull(0) as? Int ?: return
-                        // BaseAdapter.getItem is the verified bridge to the same dataitem used by getView.
-                        val item = adapter.getItem(position) ?: return
-                        if (!targets.dataType.declaringClass.isInstance(item)) return
-                        val type = KavaReflector.readField(targets.dataType, item) as? Int
-                            ?: throw IllegalStateException("record datatype read failed: ${targets.dataType}")
-                        bindLabel(row, type)
-                    } catch (error: Throwable) {
-                        logFailure("聊天记录类型绑定失败: ${targets.bind}", error)
-                    }
-                }
-            })
+            unhook = HookRegistry.get().hook(targets.bind, RecordRowBindHook(this, targets))
             true
         } catch (error: Throwable) {
             logger("聊天记录类型Hook安装失败", error)
             false
+        }
+    }
+
+    private class RecordRowBindHook(
+        private val owner: ForwardedRecordTypeLabels,
+        private val targets: Targets
+    ) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            if (Looper.myLooper() == Looper.getMainLooper()) {
+                (chain.args.getOrNull(1) as? View)?.let(owner::clearRow)
+            }
+            val result = chain.proceed()
+            if (owner.destroyed || Looper.myLooper() != Looper.getMainLooper()) return result
+            val row = result as? View ?: return result
+            owner.clearRow(row)
+            val activity = owner.activity(row.context) ?: return result
+            if (!targets.detail.isInstance(activity)) return result
+            val adapter = chain.thisObject as? BaseAdapter ?: return result
+            owner.adapters[adapter] = true
+            if (!owner.enabled()) return result
+            try {
+                val position = chain.args.getOrNull(0) as? Int ?: return result
+                val item = adapter.getItem(position) ?: return result
+                if (!targets.dataType.declaringClass.isInstance(item)) return result
+                val type = KavaReflector.readField(targets.dataType, item) as? Int
+                    ?: throw IllegalStateException("record datatype read failed: ${targets.dataType}")
+                owner.bindLabel(row, type)
+            } catch (error: Throwable) {
+                owner.logFailure("聊天记录类型绑定失败: ${targets.bind}", error)
+            }
+            return result
         }
     }
 

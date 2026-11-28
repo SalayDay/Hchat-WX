@@ -1,6 +1,5 @@
 package h.Hchat.hooks.items.callmedialimit
 
-import de.robv.android.xposed.XC_MethodHook
 import h.Hchat.dexkit.DexMethodCache
 import h.Hchat.event.Events
 import h.Hchat.hooks.core.BaseFeature
@@ -9,6 +8,7 @@ import h.Hchat.hooks.core.FeatureContext
 import h.Hchat.hooks.core.HookRegistry
 import h.Hchat.preferences.HchatStorage
 import h.Hchat.utils.KavaReflector
+import io.github.libxposed.api.XposedInterface
 import org.luckypray.dexkit.query.FindMethod
 import org.luckypray.dexkit.query.enums.StringMatchType
 import org.luckypray.dexkit.query.matchers.MethodMatcher
@@ -78,34 +78,13 @@ internal class CallMediaLimitHooker(
             val voipEventAccess = locateVoipEventAccess() ?: return false
 
             occupyMethods.forEach { method ->
-                HookRegistry.get().hook(method, object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        if (!isEnabled()) return
-                        param.setResult(false)
-                    }
-                })
+                HookRegistry.get().hook(method, DeviceOccupyBlockHooker(this))
             }
-            HookRegistry.get().hook(voipEventAccess.dispatch, object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    if (!isVoicePlaybackGuardActive() || !isEnabled()) return
-                    clearVoipUsageResult(param.thisObject, voipEventAccess.resultField)
-                }
-            })
-            HookRegistry.get().hook(voicePlaybackGuard, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    val depth = voicePlaybackGuardDepth.get() ?: 0
-                    voicePlaybackGuardDepth.set(depth + 1)
-                }
-
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    val depth = (voicePlaybackGuardDepth.get() ?: 1) - 1
-                    if (depth <= 0) {
-                        voicePlaybackGuardDepth.remove()
-                    } else {
-                        voicePlaybackGuardDepth.set(depth)
-                    }
-                }
-            })
+            HookRegistry.get().hook(
+                voipEventAccess.dispatch,
+                VoipUsageResultClearHooker(this, voipEventAccess.resultField)
+            )
+            HookRegistry.get().hook(voicePlaybackGuard, VoicePlaybackGuardDepthHooker(this))
             installed = true
             true
         }.getOrElse {
@@ -257,6 +236,21 @@ internal class CallMediaLimitHooker(
     private fun isVoicePlaybackGuardActive(): Boolean =
         (voicePlaybackGuardDepth.get() ?: 0) > 0
 
+    /** 进入语音播放守卫：与 [exitVoicePlaybackGuard] 必须在同一线程成对调用。 */
+    private fun enterVoicePlaybackGuard() {
+        val depth = voicePlaybackGuardDepth.get() ?: 0
+        voicePlaybackGuardDepth.set(depth + 1)
+    }
+
+    private fun exitVoicePlaybackGuard() {
+        val depth = (voicePlaybackGuardDepth.get() ?: 1) - 1
+        if (depth <= 0) {
+            voicePlaybackGuardDepth.remove()
+        } else {
+            voicePlaybackGuardDepth.set(depth)
+        }
+    }
+
     private fun isVoicePlaybackGuardMethod(method: Method): Boolean {
         val types = method.parameterTypes
         return KavaReflector.isStatic(method) &&
@@ -346,5 +340,42 @@ internal class CallMediaLimitHooker(
             "isVoiceUsing",
             "checkAppBrandVoiceUsingAndShowToast isVoiceUsing:%b, isCameraUsing:%b"
         )
+    }
+
+    /** 设备占用判定：开启时直接返回 false，跳过原实现。 */
+    private class DeviceOccupyBlockHooker(
+        private val owner: CallMediaLimitHooker
+    ) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            if (!owner.isEnabled()) return chain.proceed()
+            return false
+        }
+    }
+
+    /** 通话事件派发后清空占用结果，只在语音播放守卫范围内生效。 */
+    private class VoipUsageResultClearHooker(
+        private val owner: CallMediaLimitHooker,
+        private val resultField: Field
+    ) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val result = chain.proceed()
+            if (!owner.isVoicePlaybackGuardActive() || !owner.isEnabled()) return result
+            owner.clearVoipUsageResult(chain.thisObject, resultField)
+            return result
+        }
+    }
+
+    /** 语音播放守卫深度：进入时 +1，退出时在 finally 恢复，异常路径也成对。 */
+    private class VoicePlaybackGuardDepthHooker(
+        private val owner: CallMediaLimitHooker
+    ) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            owner.enterVoicePlaybackGuard()
+            try {
+                return chain.proceed()
+            } finally {
+                owner.exitVoicePlaybackGuard()
+            }
+        }
     }
 }

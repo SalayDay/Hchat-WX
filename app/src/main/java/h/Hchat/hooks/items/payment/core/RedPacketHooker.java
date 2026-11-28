@@ -245,7 +245,7 @@ public class RedPacketHooker {
                 logx("消息观察API不可用，使用红包检测 fallback");
                 return false;
             }
-            Object subscription = observeApi.subscribe(this::handleObservedMessage);
+            Object subscription = observeApi.subscribe("auto_redpacket", this::handleObservedMessage);
             if (subscription == null) {
                 logx("消息观察订阅失败，使用红包检测 fallback");
                 return false;

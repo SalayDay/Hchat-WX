@@ -12,7 +12,7 @@ import android.os.Looper
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.event.Events
 import h.Hchat.hooks.core.BaseFeature
 import h.Hchat.hooks.core.DexInstallScheduler
@@ -117,18 +117,22 @@ private class GlobalBackgroundRuntime(
                 return false
             }
         return runCatching {
-            HookRegistry.get().hook(method, object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    val activity = param.thisObject as? Activity ?: return
-                    main.post { applyTo(activity) }
-                }
-            })
+            HookRegistry.get().hook(method, ResumeHooker(this))
             installed = true
             logger("全局背景：已挂载 LauncherUI#onResume，开关 ${if (enabled()) "开" else "关"}", null)
             true
         }.getOrElse {
             logger("全局背景 Hook 安装失败", it)
             false
+        }
+    }
+
+    private class ResumeHooker(private val runtime: GlobalBackgroundRuntime) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val result = chain.proceed()
+            val activity = chain.thisObject as? Activity ?: return result
+            runtime.main.post { runtime.applyTo(activity) }
+            return result
         }
     }
 

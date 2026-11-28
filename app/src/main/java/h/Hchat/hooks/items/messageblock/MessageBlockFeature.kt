@@ -1,7 +1,6 @@
 package h.Hchat.hooks.items.messageblock
 
-import de.robv.android.xposed.XC_MethodHook
-import de.robv.android.xposed.callbacks.XCallback
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.event.Events
 import h.Hchat.hooks.api.core.WeChatApis
 import h.Hchat.hooks.api.model.WeChatMessage
@@ -45,33 +44,38 @@ class MessageBlockFeature : BaseFeature() {
                 if (method.returnType != Void.TYPE) continue
                 val addMsgArgIndexes = addMsgArgIndexes(method, parser)
                 if (addMsgArgIndexes.isEmpty()) continue
-                HookRegistry.get().hook(method, object : XC_MethodHook(XCallback.PRIORITY_HIGHEST) {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        val args = param.args ?: return
-                        val settings = MessageBlockSettings(context.hostContext())
-                        if (!settings.isEnabled()) return
-                        val selfWxId = WeChatApis.account()?.selfWxId().orEmpty()
-                        for (index in addMsgArgIndexes) {
-                            val addMsg = args.getOrNull(index) ?: continue
-                            val parsed = runCatching { parser.parseAddMsg(addMsg, selfWxId) }.getOrNull()
-                                ?: continue
-                            if (shouldBlock(settings, parsed)) {
-                                if (KeywordNotificationRuntime.shouldAllowBlockedMessageIntoDatabase(context.hostContext(), parsed)) {
-                                    return
-                                }
-                                postBlockedMessage(context, parsed)
-                                param.setResult(null)
-                                return
-                            }
-                        }
-                    }
-                })
+                HookRegistry.get().hook(method, AddMessageBlockHook(this, context, parser, addMsgArgIndexes), XposedInterface.PRIORITY_HIGHEST)
                 count++
             }
         }
         installed = count > 0
         if (!installed) logError("AddMsg 屏蔽入口未找到", null)
         return installed
+    }
+
+    private class AddMessageBlockHook(
+        private val owner: MessageBlockFeature,
+        private val context: FeatureContext,
+        private val parser: h.Hchat.hooks.api.message.WeChatMessageParseApi,
+        private val addMsgArgIndexes: List<Int>
+    ) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val settings = MessageBlockSettings(context.hostContext())
+            if (!settings.isEnabled()) return chain.proceed()
+            val selfWxId = WeChatApis.account()?.selfWxId().orEmpty()
+            for (index in addMsgArgIndexes) {
+                val addMsg = chain.args.getOrNull(index) ?: continue
+                val parsed = runCatching { parser.parseAddMsg(addMsg, selfWxId) }.getOrNull() ?: continue
+                if (owner.shouldBlock(settings, parsed)) {
+                    if (KeywordNotificationRuntime.shouldAllowBlockedMessageIntoDatabase(context.hostContext(), parsed)) {
+                        return chain.proceed()
+                    }
+                    owner.postBlockedMessage(context, parsed)
+                    return null
+                }
+            }
+            return chain.proceed()
+        }
     }
 
     private fun postBlockedMessage(context: FeatureContext, parsed: WeChatParsedMessage) {

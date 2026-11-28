@@ -3,7 +3,7 @@ package h.Hchat.hooks.items.conversationgroup
 import android.database.Cursor
 import android.os.Handler
 import android.os.Looper
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.dexkit.DexMethodCache
 import h.Hchat.hooks.core.FeatureContext
 import h.Hchat.hooks.core.HookRegistry
@@ -88,13 +88,13 @@ internal object ConversationGroupHomeProjection {
     private fun readStorageString(receiver: Any?, name: String): String? {
         if (receiver == null) return null
         val field = storageField(receiver.javaClass, name) ?: return null
-        return runCatching { field.get(receiver) as? String }.getOrNull()
+        return runCatching { KavaReflector.readField(field, receiver) as? String }.getOrNull()
     }
 
     private fun readStorageInt(receiver: Any?, name: String): Int? {
         if (receiver == null) return null
         val field = storageField(receiver.javaClass, name) ?: return null
-        return runCatching { (field.get(receiver) as? Number)?.toInt() }.getOrNull()
+        return runCatching { (KavaReflector.readField(field, receiver) as? Number)?.toInt() }.getOrNull()
     }
     fun hasTabFilterInQuery(): Boolean = queryScopes.get()?.lastOrNull()
         ?.takeIf { isActive(it.installation) }?.filter?.active == true
@@ -162,17 +162,7 @@ internal object ConversationGroupHomeProjection {
             DexMethodCache.saveConstructor(prefs, runtime, cacheKey, candidates.single())
             candidates
         }
-        constructors.forEach { constructor -> hook(constructor, object : XC_MethodHook() {
-            override fun beforeHookedMethod(param: MethodHookParam) {
-                if (!isActive(installation)) return
-                val scope = queryScopes.get()?.lastOrNull() ?: return
-                if (scope.installation != installation) return
-                val filter = scope.filter ?: return
-                if (!filter.active || scope.rootApplied) return
-                val original = param.args.firstOrNull() as? String ?: return
-                param.args[0] = filter.query(original)
-            }
-        }, installation) }
+        constructors.forEach { constructor -> hook(constructor, TabSelectConstructorHook(installation), installation) }
         true
     }.getOrElse { HLog.e("$TAG 安装标签查询失败", it); false }
 
@@ -253,49 +243,10 @@ internal object ConversationGroupHomeProjection {
                 it.parameterTypes.isEmpty() && Cursor::class.java.isAssignableFrom(it.returnType)
             }
             check(queries.isNotEmpty()) { "旧版首页 Cursor 查询缺失" }
-            (queries + changes).forEach { method -> hook(method, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    if (!captureRefresh(installation, param.thisObject, Refresh(notice))) return
-                    enterQuery(installation)
-                    legacyDepth.set((legacyDepth.get() ?: 0) + 1)
-                }
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    if (queryScopes.get()?.lastOrNull()?.installation != installation) return
-                    val depth = (legacyDepth.get() ?: 1) - 1
-                    if (depth <= 0) legacyDepth.remove() else legacyDepth.set(depth)
-                    leaveQuery(installation)
-                }
-            }, installation) }
+            (queries + changes).forEach { method -> hook(method, LegacyQueryHook(installation, notice), installation) }
         }
         methods.filter(::isRoot).forEach { root ->
-            hook(root, object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    if (!isActive(installation) || param.hasThrowable()) return
-                    val original = param.result as? String ?: return
-                    synchronized(lifecycleLock) {
-                        if (!isActive(installation)) return
-                        legacyStorage = WeakReference(param.thisObject)
-                    }
-                    // 这里**不能**再要求处于 queryScopes 作用域内。
-                    // 8.0.80 的首页查询并不保证在分页方法内部拼 SQL：实测根条件方法常在
-                    // 作用域外被调用，于是旧逻辑每次都直接 return，谓词永远进不了 SQL，
-                    // 标签过滤就只剩下"逐行隐藏"，公众号这类需要"主动保留"的分组必然空白。
-                    val filter = tabFilter()
-                    val hidden = hiddenIds()
-                    if (filter?.active == true) {
-                        val rewritten = filter.rootWhere(original)
-                        param.result = rewritten
-                        markQueryFilterApplied()
-                        if (rootLogs.incrementAndGet() <= 3) {
-                            HLog.e("$TAG 根条件已下推 tab=${filter.tab.kind} " +
-                                "before=${original.take(140)} after=${rewritten.take(300)}")
-                        }
-                    } else if (hidden.isNotEmpty()) {
-                        param.result = ConversationGroupHomeVisibility.rootWhere(original, hidden)
-                        markQueryFilterApplied()
-                    }
-                }
-            }, installation)
+            hook(root, RootWhereHook(installation), installation)
         }
         modern.forEach { page ->
             fun conversions(strict: Boolean) = KavaReflector.declaredMethods(page.declaringClass).filter { method ->
@@ -330,138 +281,14 @@ internal object ConversationGroupHomeProjection {
                 val native = KavaReflector.readField(conversation, row) ?: return null
                 readStorageString(native, "field_username")?.takeIf { it.isNotEmpty() }?.let { return it }
                 // 回退：convertTo 是 Storage 对象的公开序列化接口，但只导出部分列。
-                val values = convertTo?.let { runCatching { it.invoke(native) }.getOrNull() }
+                val values = convertTo?.let { runCatching { KavaReflector.invoke(it, native) }.getOrNull() }
                     as? android.content.ContentValues
                 return values?.getAsString("username")
             }
-            hook(page, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    if (isActive(installation)) enterQuery(installation)
-                }
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    try {
-                    if (!isActive(installation)) return
-                    if (param.hasThrowable()) return
-                    updates.firstOrNull { it.declaringClass.isInstance(param.thisObject) }
-                        ?.let { captureRefresh(installation, param.thisObject, Refresh(it)) }
-                    // SQL 下推只是"尽力而为"：它能保证分页被填满，但一旦谓词没进 SQL，
-                    // 就只剩逐行隐藏，公众号这类需要"主动保留"的分组会整片空白。
-                    // 因此这里对分页结果再做一次投影，作为最终保底。
-                    val filter = tabFilter()
-                    val active = filter?.active == true
-                    val hidden = hiddenIds()
-                    if (!active && hidden.isEmpty()) return
-                    runCatching {
-                        val result = param.result ?: return
-                        val rows = KavaReflector.readField(listField, result) as? List<*> ?: return
-                        if (rows.isEmpty()) return
-                        val logPage = pageLogs.incrementAndGet() <= 4
-                        // 这里是微信首页的绑定路径，逐行反射本身就是免费不了的开销。
-                        // 原来每行要算两次 username（一次过滤、一次日志样本），日志那次还
-                        // 多走一遍 convertTo 兜底。改成只算一次、样本顺手攒着。
-                        val keep = ArrayList<Any?>(rows.size)
-                        val sample = StringBuilder()
-                        for ((index, row) in rows.withIndex()) {
-                            val native = KavaReflector.readField(conversation, row)
-                            val name = username(row)
-                            if (logPage && index < 5) {
-                                if (sample.isNotEmpty()) sample.append(',')
-                                sample.append(name.orEmpty())
-                            }
-                            // 读不到会话名时保留：宁可多显示一行，也不要把整页误判成某一类。
-                            if (name.isNullOrEmpty()) {
-                                keep += row
-                                continue
-                            }
-                            if (name in hidden) continue
-                            if (!active) {
-                                keep += row
-                                continue
-                            }
-                            // active 由 filter 推导，走到这里 filter 必然非空（K2 已智能转换）。
-                            val current = filter
-                            val verify = contact?.let { KavaReflector.readField(it, row) }
-                            if (current.accepts(
-                                    name,
-                                    readStorageInt(native, "field_unReadCount") ?: 0,
-                                    readStorageInt(native, "field_unReadMuteCount") ?: 0,
-                                    readStorageInt(verify, "field_verifyFlag") ?: 0
-                                )
-                            ) {
-                                keep += row
-                            }
-                        }
-                        if (logPage) {
-                            HLog.e("$TAG 分页投影 tab=${filter?.tab?.kind} rows=${rows.size} keep=${keep.size} " +
-                                "sample=$sample")
-                        }
-                        if (keep.size != rows.size) {
-                            if (rows is MutableList<*>) {
-                                @Suppress("UNCHECKED_CAST")
-                                val mutable = rows as MutableList<Any?>
-                                mutable.clear()
-                                mutable.addAll(keep)
-                            } else {
-                                check(KavaReflector.writeField(listField, result, ArrayList(keep)))
-                            }
-                        }
-                        // Keep native hasMore and next flag unchanged, including completely hidden pages.
-                    }.onFailure { HLog.e("$TAG 过滤首页分页失败", it) }
-                    } finally { leaveQuery(installation) }
-                }
-            }, installation)
-            hook(visible, object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    if (!isActive(installation)) return
-                    if (param.result != true) return
-                    val filter = tabFilter()
-                    if (filter?.active == true) {
-                        val row = param.args.firstOrNull()
-                        val native = KavaReflector.readField(conversation, row)
-                        val nativeContact = contact?.let { KavaReflector.readField(it, row) }
-                        val name = username(row)
-                        if (name.isNullOrEmpty()) {
-                            // 拿不到会话名时不要隐藏：否则会被当成"不是群、不是公众号"，
-                            // 整页都被归进私聊，其他分组就永远空白。
-                            if (probeLogged.compareAndSet(false, true)) {
-                                HLog.e("$TAG 首页行缺少 username(${row?.javaClass?.name})，本行不参与标签过滤")
-                            }
-                            return
-                        }
-                        val unread = readStorageInt(native, "field_unReadCount") ?: 0
-                        val muted = readStorageInt(native, "field_unReadMuteCount") ?: 0
-                        val verify = readStorageInt(nativeContact, "field_verifyFlag") ?: 0
-                        if (probeLogged.compareAndSet(false, true)) {
-                            HLog.e("$TAG 标签判定样本 user=$name unread=$unread muted=$muted verify=$verify tab=${filter.tab.kind}")
-                        }
-                        param.result = filter.accepts(name, unread, muted, verify)
-                        return
-                    }
-                    val hidden = hiddenIds()
-                    if (hidden.isNotEmpty() && username(param.args.firstOrNull()) in hidden) param.result = false
-                }
-            }, installation)
+            hook(page, ModernPageHook(installation, updates, listField, conversation, contact, ::username), installation)
+            hook(visible, RowVisibilityHook(installation, conversation, contact, ::username), installation)
         }
-        updates.forEach { update -> hook(update, object : XC_MethodHook() {
-            override fun beforeHookedMethod(param: MethodHookParam) {
-                val argument = param.args?.getOrNull(0)
-                captureRefresh(installation, param.thisObject, Refresh(
-                    update,
-                    if (update.parameterTypes.size == 3 && argument != null) {
-                        WeakReference(argument)
-                    } else null
-                ))
-            }
-            override fun afterHookedMethod(param: MethodHookParam) {
-                if (!isActive(installation)) return
-                if (tabFilter()?.active != true || param.hasThrowable()) return
-                // Native incremental updates may reject folded children before the visibility test.
-                // Reload at most once per burst; never recursively refresh our own type-5 reset.
-                val type = param.args.getOrNull(update.parameterTypes.size - 2) as? Int
-                if (type == 5) return
-                requestTabRefresh(installation)
-            }
-        }, installation) }
+        updates.forEach { update -> hook(update, ModernUpdateHook(installation, update), installation) }
         true
     }.getOrElse { HLog.e("$TAG 安装首页投影失败", it); false }
 
@@ -559,10 +386,213 @@ internal object ConversationGroupHomeProjection {
             types[types.size - 2] == Integer.TYPE && types.last() == String::class.java
     }
 
-    private fun hook(method: Member, callback: XC_MethodHook, installation: Installation): Unit = synchronized(lifecycleLock) {
+    private fun hook(method: Member, callback: XposedInterface.Hooker, installation: Installation): Unit = synchronized(lifecycleLock) {
         if (!isActive(installation)) throw CancellationException("首页安装代次已失效")
         if (!installed.add(method)) return
         try { HookRegistry.get().withInstallationGeneration(installation.hooks) { HookRegistry.get().hook(method, callback) } }
         catch (error: Throwable) { installed.remove(method); throw error }
+    }
+
+    private class TabSelectConstructorHook(private val installation: Installation) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            if (!isActive(installation)) return chain.proceed()
+            val scope = queryScopes.get()?.lastOrNull() ?: return chain.proceed()
+            if (scope.installation != installation) return chain.proceed()
+            val filter = scope.filter ?: return chain.proceed()
+            if (!filter.active || scope.rootApplied) return chain.proceed()
+            val original = chain.args.firstOrNull() as? String ?: return chain.proceed()
+            val args = chain.args.toTypedArray()
+            args[0] = filter.query(original)
+            return chain.proceed(args)
+        }
+    }
+
+    private class LegacyQueryHook(private val installation: Installation, private val notice: Method) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            if (!captureRefresh(installation, chain.thisObject, Refresh(notice))) return chain.proceed()
+            enterQuery(installation)
+            val previousDepth = legacyDepth.get() ?: 0
+            legacyDepth.set(previousDepth + 1)
+            try {
+                return chain.proceed()
+            } finally {
+                if (queryScopes.get()?.lastOrNull()?.installation == installation) {
+                    if (previousDepth == 0) legacyDepth.remove() else legacyDepth.set(previousDepth)
+                    leaveQuery(installation)
+                }
+            }
+        }
+    }
+
+    private class RootWhereHook(private val installation: Installation) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            var outcome = chain.proceed()
+
+            if (!isActive(installation)) return outcome
+            val original = outcome as? String ?: return outcome
+            synchronized(lifecycleLock) {
+                if (!isActive(installation)) return outcome
+                legacyStorage = WeakReference(chain.thisObject)
+            }
+            // 这里**不能**再要求处于 queryScopes 作用域内。
+            // 8.0.80 的首页查询并不保证在分页方法内部拼 SQL：实测根条件方法常在
+            // 作用域外被调用，于是旧逻辑每次都直接 return，谓词永远进不了 SQL，
+            // 标签过滤就只剩下"逐行隐藏"，公众号这类需要"主动保留"的分组必然空白。
+            val filter = tabFilter()
+            val hidden = hiddenIds()
+            if (filter?.active == true) {
+                val rewritten = filter.rootWhere(original)
+                outcome = rewritten
+                markQueryFilterApplied()
+                if (rootLogs.incrementAndGet() <= 3) {
+                    HLog.e("$TAG 根条件已下推 tab=${filter.tab.kind} " +
+                        "before=${original.take(140)} after=${rewritten.take(300)}")
+                }
+            } else if (hidden.isNotEmpty()) {
+                outcome = ConversationGroupHomeVisibility.rootWhere(original, hidden)
+                markQueryFilterApplied()
+            }
+            return outcome
+        }
+    }
+
+    private class ModernPageHook(private val installation: Installation, private val updates: List<Method>, private val listField: Field, private val conversation: Field, private val contact: Field?, private val username: (Any?) -> String?) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+
+            val entered = isActive(installation)
+            if (entered) enterQuery(installation)
+            try {
+                val outcome = chain.proceed()
+                if (!isActive(installation)) return outcome
+
+                updates.firstOrNull { it.declaringClass.isInstance(chain.thisObject) }
+                    ?.let { captureRefresh(installation, chain.thisObject, Refresh(it)) }
+                // SQL 下推只是"尽力而为"：它能保证分页被填满，但一旦谓词没进 SQL，
+                // 就只剩逐行隐藏，公众号这类需要"主动保留"的分组会整片空白。
+                // 因此这里对分页结果再做一次投影，作为最终保底。
+                val filter = tabFilter()
+                val active = filter?.active == true
+                val hidden = hiddenIds()
+                if (!active && hidden.isEmpty()) return outcome
+                runCatching {
+                    val result = outcome ?: return outcome
+                    val rows = KavaReflector.readField(listField, result) as? List<*> ?: return outcome
+                    if (rows.isEmpty()) return outcome
+                    val logPage = pageLogs.incrementAndGet() <= 4
+                    // 这里是微信首页的绑定路径，逐行反射本身就是免费不了的开销。
+                    // 原来每行要算两次 username（一次过滤、一次日志样本），日志那次还
+                    // 多走一遍 convertTo 兜底。改成只算一次、样本顺手攒着。
+                    val keep = ArrayList<Any?>(rows.size)
+                    val sample = StringBuilder()
+                    for ((index, row) in rows.withIndex()) {
+                        val native = KavaReflector.readField(conversation, row)
+                        val name = username(row)
+                        if (logPage && index < 5) {
+                            if (sample.isNotEmpty()) sample.append(',')
+                            sample.append(name.orEmpty())
+                        }
+                        // 读不到会话名时保留：宁可多显示一行，也不要把整页误判成某一类。
+                        if (name.isNullOrEmpty()) {
+                            keep += row
+                            continue
+                        }
+                        if (name in hidden) continue
+                        if (!active) {
+                            keep += row
+                            continue
+                        }
+                        // active 由 filter 推导，走到这里 filter 必然非空（K2 已智能转换）。
+                        val current = filter
+                        val verify = contact?.let { KavaReflector.readField(it, row) }
+                        if (current.accepts(
+                                name,
+                                readStorageInt(native, "field_unReadCount") ?: 0,
+                                readStorageInt(native, "field_unReadMuteCount") ?: 0,
+                                readStorageInt(verify, "field_verifyFlag") ?: 0
+                            )
+                        ) {
+                            keep += row
+                        }
+                    }
+                    if (logPage) {
+                        HLog.e("$TAG 分页投影 tab=${filter?.tab?.kind} rows=${rows.size} keep=${keep.size} " +
+                            "sample=$sample")
+                    }
+                    if (keep.size != rows.size) {
+                        if (rows is MutableList<*>) {
+                            @Suppress("UNCHECKED_CAST")
+                            val mutable = rows as MutableList<Any?>
+                            mutable.clear()
+                            mutable.addAll(keep)
+                        } else {
+                            check(KavaReflector.writeField(listField, result, ArrayList(keep)))
+                        }
+                    }
+                    // Keep native hasMore and next flag unchanged, including completely hidden pages.
+                }.onFailure { HLog.e("$TAG 过滤首页分页失败", it) }
+                return outcome
+            } finally {
+                if (entered) leaveQuery(installation)
+            }
+        }
+    }
+
+    private class RowVisibilityHook(private val installation: Installation, private val conversation: Field, private val contact: Field?, private val username: (Any?) -> String?) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            var outcome = chain.proceed()
+            val args = chain.args
+            if (!isActive(installation)) return outcome
+            if (outcome != true) return outcome
+            val filter = tabFilter()
+            if (filter?.active == true) {
+                val row = args.firstOrNull()
+                val native = KavaReflector.readField(conversation, row)
+                val nativeContact = contact?.let { KavaReflector.readField(it, row) }
+                val name = username(row)
+                if (name.isNullOrEmpty()) {
+                    // 拿不到会话名时不要隐藏：否则会被当成"不是群、不是公众号"，
+                    // 整页都被归进私聊，其他分组就永远空白。
+                    if (probeLogged.compareAndSet(false, true)) {
+                        HLog.e("$TAG 首页行缺少 username(${row?.javaClass?.name})，本行不参与标签过滤")
+                    }
+                    return outcome
+                }
+                val unread = readStorageInt(native, "field_unReadCount") ?: 0
+                val muted = readStorageInt(native, "field_unReadMuteCount") ?: 0
+                val verify = readStorageInt(nativeContact, "field_verifyFlag") ?: 0
+                if (probeLogged.compareAndSet(false, true)) {
+                    HLog.e("$TAG 标签判定样本 user=$name unread=$unread muted=$muted verify=$verify tab=${filter.tab.kind}")
+                }
+                outcome = filter.accepts(name, unread, muted, verify)
+                return outcome
+            }
+            val hidden = hiddenIds()
+            if (hidden.isNotEmpty() && username(args.firstOrNull()) in hidden) outcome = false
+            return outcome
+        }
+    }
+
+    private class ModernUpdateHook(private val installation: Installation, private val update: Method) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val args = chain.args
+            run {
+                val argument = args.getOrNull(0)
+                captureRefresh(installation, chain.thisObject, Refresh(
+                    update,
+                    if (update.parameterTypes.size == 3 && argument != null) {
+                        WeakReference(argument)
+                    } else null
+                ))
+            }
+            val outcome = chain.proceed()
+            if (!isActive(installation)) return outcome
+            if (tabFilter()?.active != true) return outcome
+            // Native incremental updates may reject folded children before the visibility test.
+            // Reload at most once per burst; never recursively refresh our own type-5 reset.
+            val type = args.getOrNull(update.parameterTypes.size - 2) as? Int
+            if (type == 5) return outcome
+            requestTabRefresh(installation)
+            return outcome
+        }
     }
 }

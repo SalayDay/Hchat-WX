@@ -15,7 +15,7 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 
-import de.robv.android.xposed.XC_MethodHook;
+import io.github.libxposed.api.XposedInterface;
 
 /**
  * 微信 SqliteDB wrapper 变更与查询监听 API。
@@ -267,26 +267,10 @@ public final class WeChatDatabaseListenerApi {
                 continue;
             }
             try {
-                HookRegistry.get().hook(method, new XC_MethodHook(de.robv.android.xposed.callbacks.XCallback.PRIORITY_LOWEST) {
-                    @Override
-                    public void beforeHookedMethod(MethodHookParam param) {
-                        if (query) {
-                            if (enterQuery()) transformQuery(param.args);
-                        } else {
-                            enterMutation();
-                            normalizeLegacyMsgSource(operation, param.thisObject, param.args);
-                        }
-                    }
-
-                    @Override
-                    public void afterHookedMethod(MethodHookParam param) {
-                        if (query) {
-                            leaveQuery();
-                        } else if (leaveMutation()) {
-                            dispatchIfSuccessful(operation, method, param.args, param.getResult());
-                        }
-                    }
-                });
+                XposedInterface.Hooker hooker = query
+                        ? new DatabaseQueryHooker(this)
+                        : new DatabaseMutationHooker(this, operation, method);
+                HookRegistry.get().hook(method, hooker, XposedInterface.PRIORITY_LOWEST);
                 hookedMethods.add(method);
                 if (allowObfuscatedWrapperMethod && operation != null) {
                     hookedWrapperMutationMethods.add(method);
@@ -622,4 +606,50 @@ public final class WeChatDatabaseListenerApi {
     private void log(String message) {
         if (logger != null) logger.log("[WeChatDatabaseListenerApi] " + message);
     }
+
+    private static final class DatabaseQueryHooker implements XposedInterface.Hooker {
+        private final WeChatDatabaseListenerApi owner;
+        private DatabaseQueryHooker(WeChatDatabaseListenerApi owner) { this.owner = owner; }
+        @Override
+        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+            Object[] args = chain.getArgs().toArray();
+            boolean outermost = owner.enterQuery();
+            try {
+                if (outermost) owner.transformQuery(args);
+                return chain.proceed(args);
+            } finally {
+                owner.leaveQuery();
+            }
+        }
+    }
+
+    private static final class DatabaseMutationHooker implements XposedInterface.Hooker {
+        private final WeChatDatabaseListenerApi owner;
+        private final String operation;
+        private final Method method;
+        private DatabaseMutationHooker(WeChatDatabaseListenerApi owner, String operation, Method method) {
+            this.owner = owner; this.operation = operation; this.method = method;
+        }
+        @Override
+        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+            Object[] args = chain.getArgs().toArray();
+            Object result = null;
+            boolean succeeded = false;
+            owner.enterMutation();
+            try {
+                owner.normalizeLegacyMsgSource(operation, chain.getThisObject(), args);
+                result = chain.proceed(args);
+                succeeded = true;
+                return result;
+            } finally {
+                long dispatchStarted = h.Hchat.utils.SlowPathLog.now();
+                boolean outermost = owner.leaveMutation();
+                if (succeeded && outermost) owner.dispatchIfSuccessful(operation, method, args, result);
+                h.Hchat.utils.SlowPathLog.report("db.mutation",
+                        h.Hchat.utils.SlowPathLog.elapsedSince(dispatchStarted),
+                        30L, "数据库变更派发", operation + " " + method.getName());
+            }
+        }
+    }
+
 }

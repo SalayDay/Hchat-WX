@@ -1,7 +1,7 @@
 package h.Hchat.hooks.items.payment.transfer
 
 import android.content.Context
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.dexkit.DexMethodCache
 import h.Hchat.hooks.api.core.WeChatApis
 import h.Hchat.hooks.core.FeatureContext
@@ -49,12 +49,7 @@ object TransferReceiveAccountStore {
                 DexMethodCache.save(prefs, cacheKey, "receive_account_parser", it)
             }
             ?: return false
-        HookRegistry.get().hook(method, object : XC_MethodHook() {
-            override fun beforeHookedMethod(param: MethodHookParam) {
-                val json = param.args.firstOrNull() as? JSONObject ?: return
-                captureItem(context.hostContext(), json)
-            }
-        })
+        HookRegistry.get().hook(method, AccountCaptureHooker(context))
         installed = true
         return true
     }
@@ -233,4 +228,19 @@ object TransferReceiveAccountStore {
         val wxId = WeChatApis.contact().account()?.selfWxId().orEmpty().trim()
         return if (wxId.isBlank()) KEY_ACCOUNTS else "$KEY_ACCOUNTS.$wxId"
     }
+
+    private class AccountCaptureHooker(private val context: FeatureContext) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val args = chain.args.toTypedArray()
+            val receiver = chain.thisObject
+            run {
+            run patch@{
+                val json = args.firstOrNull() as? JSONObject ?: return@patch
+                captureItem(context.hostContext(), json)
+            }
+            return chain.proceed(args)
+            }
+        }
+    }
+
 }

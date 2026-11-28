@@ -10,7 +10,7 @@ import h.Hchat.utils.KavaReflector;
 import java.lang.reflect.Method;
 import java.util.concurrent.CopyOnWriteArrayList;
 
-import de.robv.android.xposed.XC_MethodHook;
+import io.github.libxposed.api.XposedInterface;
 
 /**
  * 微信 Activity 启动监听 API。
@@ -83,13 +83,7 @@ public final class WeChatActivityStartApi {
         int count = 0;
         for (Method method : KavaReflector.declaredMethods(clazz)) {
             if (!isStartMethod(method)) continue;
-            HookRegistry.get().hook(method, new XC_MethodHook() {
-                @Override
-                public void beforeHookedMethod(MethodHookParam param) {
-                    Intent intent = findIntent(param.args);
-                    if (intent != null) dispatch(intent, param.thisObject, method);
-                }
-            });
+            HookRegistry.get().hook(method, new ActivityStartHooker(this, method));
             count++;
         }
         return count;
@@ -130,4 +124,19 @@ public final class WeChatActivityStartApi {
     private void log(String message) {
         if (logger != null) logger.log("[WeChatActivityStartApi] " + message);
     }
+
+    private static final class ActivityStartHooker implements XposedInterface.Hooker {
+        private final WeChatActivityStartApi owner;
+        private final Method method;
+        private ActivityStartHooker(WeChatActivityStartApi owner, Method method) {
+            this.owner = owner; this.method = method;
+        }
+        @Override
+        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+            Intent intent = owner.findIntent(chain.getArgs().toArray());
+            if (intent != null) owner.dispatch(intent, chain.getThisObject(), method);
+            return chain.proceed();
+        }
+    }
+
 }

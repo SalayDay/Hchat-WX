@@ -16,7 +16,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 
-import de.robv.android.xposed.XC_MethodHook;
+import io.github.libxposed.api.XposedInterface;
 
 /**
  * 微信消息事件 API。
@@ -34,6 +34,7 @@ public final class WeChatMessageEventApi {
     private volatile boolean hooked;
     private volatile boolean patHooked;
     private final ConcurrentHashMap<String, Long> recentPatEvents = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Long> recentDiagnosticLogs = new ConcurrentHashMap<>();
 
     public WeChatMessageEventApi(DexFinder dexFinder,
                                  WeChatAccountApi accountApi,
@@ -69,17 +70,7 @@ public final class WeChatMessageEventApi {
                     if (parseApi.isLikelyAddMsgClass(parameterTypes[i])) addMsgArgIndexes.add(i);
                 }
                 if (addMsgArgIndexes.isEmpty()) continue;
-                HookRegistry.get().hook(method, new XC_MethodHook() {
-                    @Override
-                    public void beforeHookedMethod(MethodHookParam param) {
-                        if (param.args == null) return;
-                        for (int index : addMsgArgIndexes) {
-                            if (index >= 0 && index < param.args.length && param.args[index] != null) {
-                                dispatchAddMsg(param.args[index]);
-                            }
-                        }
-                    }
-                });
+                HookRegistry.get().hook(method, new AddMessageHooker(this, addMsgArgIndexes));
                 count++;
             }
         }
@@ -107,27 +98,112 @@ public final class WeChatMessageEventApi {
         if (eventBus != null) eventBus.unsubscribe(subscription);
     }
 
-    private void dispatchAddMsg(Object addMsg) {
+    private void dispatchAddMsg(Object addMsg, AddMsgTiming timing) {
         try {
-            String selfWxId = accountApi != null ? accountApi.selfWxId() : "";
-            WeChatParsedMessage parsed = parseApi.parseAddMsg(addMsg, selfWxId);
+            long stageStarted = diagnosticNow();
+            String selfWxId;
+            try {
+                selfWxId = accountApi != null ? accountApi.selfWxId() : "";
+            } finally {
+                timing.accountMs += diagnosticElapsed(stageStarted);
+            }
+
+            stageStarted = diagnosticNow();
+            WeChatParsedMessage parsed;
+            try {
+                parsed = parseApi.parseAddMsg(addMsg, selfWxId);
+            } finally {
+                timing.parseMs += diagnosticElapsed(stageStarted);
+            }
             if (parsed == null) return;
-            eventBus.post(new Events.MessageReceived(
-                    parsed.xml, parsed.sender, parsed.talker, parsed.content,
-                    String.valueOf(parsed.type), parsed.createTimeSeconds, parsed.msgSvrId,
-                    parsed.msgSource, parsed.selfWxId));
+            timing.type = parsed.type;
+            timing.contentLength = parsed.content != null ? parsed.content.length() : 0;
+
+            stageStarted = diagnosticNow();
+            try {
+                eventBus.post(new Events.MessageReceived(
+                        parsed.xml, parsed.sender, parsed.talker, parsed.content,
+                        String.valueOf(parsed.type), parsed.createTimeSeconds, parsed.msgSvrId,
+                        parsed.msgSource, parsed.selfWxId));
+            } finally {
+                timing.messagePostMs += diagnosticElapsed(stageStarted);
+            }
             if (parsed.redPacketMessage) {
-                eventBus.post(new Events.RedPacketDetected(
-                        "WeChatMessageEventApi",
-                        parsed.xml,
-                        parsed.sender,
-                        parsed.talker,
-                        parsed.nativeUrl,
-                        parsed.exclusiveRecvUser));
+                stageStarted = diagnosticNow();
+                try {
+                    eventBus.post(new Events.RedPacketDetected(
+                            "WeChatMessageEventApi",
+                            parsed.xml,
+                            parsed.sender,
+                            parsed.talker,
+                            parsed.nativeUrl,
+                            parsed.exclusiveRecvUser));
+                } finally {
+                    timing.redPacketPostMs += diagnosticElapsed(stageStarted);
+                }
             }
         } catch (Throwable e) {
             log("派发消息事件失败: " + e.getMessage());
         }
+    }
+
+    private void reportAddMsgTiming(AddMsgTiming timing) {
+        if (timing == null || timing.totalMs < 20L) return;
+        try {
+            if (!h.Hchat.utils.HLog.isCaptureEnabled() || !claimDiagnosticLog("message.addmsg")) return;
+            StringBuilder detail = new StringBuilder(128)
+                    .append("account=").append(timing.accountMs).append("ms")
+                    .append(" parse=").append(timing.parseMs).append("ms")
+                    .append(" message_post=").append(timing.messagePostMs).append("ms")
+                    .append(" red_packet_post=").append(timing.redPacketPostMs).append("ms")
+                    .append(" total=").append(timing.totalMs).append("ms")
+                    .append(" thread=").append(Thread.currentThread().getName());
+            if (timing.type >= 0) detail.append(" type=").append(timing.type);
+            if (timing.contentLength >= 0) detail.append(" content_length=").append(timing.contentLength);
+            h.Hchat.utils.SlowPathLog.report(
+                    "message.addmsg", timing.totalMs, 20L, "AddMsg 事件派发", detail.toString());
+        } catch (Throwable ignored) {
+            // Diagnostics must never change message delivery.
+        }
+    }
+
+    private boolean claimDiagnosticLog(String key) {
+        try {
+            long now = android.os.SystemClock.elapsedRealtime();
+            Long previous = recentDiagnosticLogs.putIfAbsent(key, now);
+            if (previous == null) return true;
+            if (now - previous < 10_000L) return false;
+            return recentDiagnosticLogs.replace(key, previous, now);
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private static long diagnosticNow() {
+        try {
+            return h.Hchat.utils.SlowPathLog.now();
+        } catch (Throwable ignored) {
+            return -1L;
+        }
+    }
+
+    private static long diagnosticElapsed(long startNanos) {
+        if (startNanos < 0L) return 0L;
+        try {
+            return h.Hchat.utils.SlowPathLog.elapsedSince(startNanos);
+        } catch (Throwable ignored) {
+            return 0L;
+        }
+    }
+
+    private static final class AddMsgTiming {
+        private long accountMs;
+        private long parseMs;
+        private long messagePostMs;
+        private long redPacketPostMs;
+        private long totalMs;
+        private int type = -1;
+        private int contentLength = -1;
     }
 
     private void installPatMsgHook() {
@@ -135,13 +211,7 @@ public final class WeChatMessageEventApi {
                 || eventBus == null) {
             return;
         }
-        HookRegistry.get().hook(dexFinder.patDisplayTemplateMethod, new XC_MethodHook() {
-            @Override
-            public void beforeHookedMethod(MethodHookParam param) {
-                if (param.args == null || param.args.length < 1) return;
-                dispatchPatMsg(param.args[0], param.args.length > 1 ? param.args[1] : null);
-            }
-        });
+        HookRegistry.get().hook(dexFinder.patDisplayTemplateMethod, new PatMessageHooker(this));
         patHooked = true;
         log("拍一拍事件Hook: " + dexFinder.patDisplayTemplateMethod.getDeclaringClass().getName()
                 + "#" + dexFinder.patDisplayTemplateMethod.getName());
@@ -219,4 +289,45 @@ public final class WeChatMessageEventApi {
     private void log(String message) {
         if (logger != null) logger.log("[WeChatMessageEventApi] " + message);
     }
+
+    private static final class AddMessageHooker implements XposedInterface.Hooker {
+        private final WeChatMessageEventApi owner;
+        private final List<Integer> indexes;
+        private AddMessageHooker(WeChatMessageEventApi owner, List<Integer> indexes) {
+            this.owner = owner; this.indexes = new ArrayList<>(indexes);
+        }
+        @Override
+        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+            List<Object> args = chain.getArgs();
+            // 保持现有顺序：先执行宿主，再在当前线程同步派发模块事件。
+            // 后置同步回调仍会占用当前线程，不能仅凭位置在 proceed 后就断言不影响上屏；
+            // 各段耗时只测量模块派发，不包含宿主方法耗时。
+            Object result = chain.proceed();
+            long started = diagnosticNow();
+            AddMsgTiming timing = new AddMsgTiming();
+            try {
+                for (int index : indexes) {
+                    if (index >= 0 && index < args.size() && args.get(index) != null) {
+                        owner.dispatchAddMsg(args.get(index), timing);
+                    }
+                }
+            } finally {
+                timing.totalMs = diagnosticElapsed(started);
+                owner.reportAddMsgTiming(timing);
+            }
+            return result;
+        }
+    }
+
+    private static final class PatMessageHooker implements XposedInterface.Hooker {
+        private final WeChatMessageEventApi owner;
+        private PatMessageHooker(WeChatMessageEventApi owner) { this.owner = owner; }
+        @Override
+        public Object intercept(XposedInterface.Chain chain) throws Throwable {
+            List<Object> args = chain.getArgs();
+            if (!args.isEmpty()) owner.dispatchPatMsg(args.get(0), args.size() > 1 ? args.get(1) : null);
+            return chain.proceed();
+        }
+    }
+
 }

@@ -6,7 +6,7 @@ import android.os.Looper
 import android.view.MenuItem
 import android.view.View
 import android.widget.Toast
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.event.Events
 import h.Hchat.hooks.api.core.WeChatApis
 import h.Hchat.hooks.api.message.SingleMessageMenuLocator
@@ -93,18 +93,10 @@ private class VoicePreviewRuntime(
     @Synchronized
     fun install(): Boolean {
         val createHooked = SingleMessageMenuLocator.menuCreateMethods(context, logger).count { method ->
-            hook(method, object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    addPreviewMenu(param)
-                }
-            })
+            hook(method, MenuCreateHooker(this))
         }
         val clickHooked = SingleMessageMenuLocator.menuClickMethods(context, logger).count { method ->
-            hook(method, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    handlePreviewClick(param)
-                }
-            })
+            hook(method, MenuClickHooker(this))
         }
         if (createHooked <= 0) logger("语音预览菜单创建 Hook 未安装", null)
         if (clickHooked <= 0) logger("语音预览菜单点击 Hook 未安装", null)
@@ -121,7 +113,22 @@ private class VoicePreviewRuntime(
         }
     }
 
-    private fun hook(method: Method, callback: XC_MethodHook): Boolean {
+    private class MenuCreateHooker(private val runtime: VoicePreviewRuntime) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val result = chain.proceed()
+            runtime.addPreviewMenu(chain.args.toTypedArray())
+            return result
+        }
+    }
+
+    private class MenuClickHooker(private val runtime: VoicePreviewRuntime) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            runtime.handlePreviewClick(chain.args.toTypedArray())
+            return chain.proceed()
+        }
+    }
+
+    private fun hook(method: Method, callback: XposedInterface.Hooker): Boolean {
         if (Modifier.isAbstract(method.modifiers) || method.declaringClass.isInterface) return false
         if (!hookedMethods.add(method)) return true
         return runCatching {
@@ -134,10 +141,9 @@ private class VoicePreviewRuntime(
         }
     }
 
-    private fun addPreviewMenu(param: XC_MethodHook.MethodHookParam) {
+    private fun addPreviewMenu(args: Array<Any?>) {
         clearMenuMessageBinding()
         if (!enabled()) return
-        val args = param.args ?: return
         val menu = args.getOrNull(0) ?: return
         val view = args.getOrNull(1) as? View ?: return
         val message = resolveNativeMessage(view.tag) ?: return
@@ -149,9 +155,9 @@ private class VoicePreviewRuntime(
         messagesByMenuGroup[item.groupId] = binding
     }
 
-    private fun handlePreviewClick(param: XC_MethodHook.MethodHookParam) {
+    private fun handlePreviewClick(args: Array<Any?>) {
         if (!enabled()) return
-        val item = param.args?.firstNotNullOfOrNull { it as? MenuItem } ?: return
+        val item = args.firstNotNullOfOrNull { it as? MenuItem } ?: return
         if (item.itemId != MENU_ITEM_ID) return
         val activity = WeChatApis.currentActivity()?.currentActivity()
         val binding = consumeMenuMessageBinding(item)

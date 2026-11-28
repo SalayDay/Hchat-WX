@@ -30,7 +30,7 @@ object ScriptNewFriendHook {
         val observeApi = runCatching { WeChatApis.messageObserve() }.getOrNull()
         if (observeApi != null && observeApi.isAvailable()) {
             runCatching { observeApi.install() }
-            observeApi.subscribe { message ->
+            observeApi.subscribe("script_new_friend") { message ->
                 handleMessage(ScriptMessageBean(message))
             }
         } else {

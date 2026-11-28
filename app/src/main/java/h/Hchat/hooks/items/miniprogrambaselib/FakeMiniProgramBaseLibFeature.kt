@@ -1,7 +1,7 @@
 package h.Hchat.hooks.items.miniprogrambaselib
 
 import android.content.Context
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.dexkit.DexMethodCache
 import h.Hchat.hooks.core.BaseFeature
 import h.Hchat.hooks.core.DexInstallScheduler
@@ -97,13 +97,7 @@ private class MiniProgramCompatibilityRuntime(
         return runCatching {
             val launchConstructor = locateLaunchConstructor() ?: return false
             locatePrivateOpenUrlMethod() ?: return false
-            HookRegistry.get().hook(launchConstructor, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    if (!FakeMiniProgramBaseLibFeature.isEnabled(context.hostContext())) return
-                    if (param.args.size <= LIB_VERSION_ARG_INDEX) return
-                    param.args[LIB_VERSION_ARG_INDEX] = SPOOFED_LIB_VERSION
-                }
-            })
+            HookRegistry.get().hook(launchConstructor, LaunchVersionHooker(this))
             installed = true
             true
         }.getOrElse {
@@ -245,6 +239,39 @@ private class MiniProgramCompatibilityRuntime(
         private const val PRIVATE_OPEN_URL_RAW_URL_KEY = "rawUrl"
         private const val PRIVATE_OPEN_URL_APP_ID_KEY = "geta8key_open_webview_appid"
     }
+
+    private class LaunchVersionHooker(private val owner: MiniProgramCompatibilityRuntime) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val args = chain.args.toTypedArray()
+            val receiver = chain.thisObject
+            with(owner) {
+            run patch@{
+                if (!FakeMiniProgramBaseLibFeature.isEnabled(context.hostContext())) return@patch
+                if (args.size <= LIB_VERSION_ARG_INDEX) return@patch
+                args[LIB_VERSION_ARG_INDEX] = SPOOFED_LIB_VERSION
+            }
+            return chain.proceed(args)
+            }
+        }
+    }
+
+    class PrivateOpenUrlHooker(private val context: Context) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val args = chain.args.toTypedArray()
+            val receiver = chain.thisObject
+            run {
+            run patch@{
+                if (!FakeMiniProgramBaseLibFeature.isEnabled(context)) return@patch
+                val request = args.getOrNull(1) as? JSONObject ?: return@patch
+                val url = request.optString("url")
+                if (!isWeChatUpdateUrl(url)) return@patch
+                request.put("url", "")
+            }
+            return chain.proceed(args)
+            }
+        }
+    }
+
 }
 
 private fun isPrivateOpenUrlMethod(method: Method): Boolean {
@@ -257,15 +284,7 @@ private fun isPrivateOpenUrlMethod(method: Method): Boolean {
 }
 
 private fun hookPrivateOpenUrlMethod(method: Method, context: Context) {
-    HookRegistry.get().hook(method, object : XC_MethodHook() {
-        override fun beforeHookedMethod(param: MethodHookParam) {
-            if (!FakeMiniProgramBaseLibFeature.isEnabled(context)) return
-            val request = param.args.getOrNull(1) as? JSONObject ?: return
-            val url = request.optString("url")
-            if (!isWeChatUpdateUrl(url)) return
-            request.put("url", "")
-        }
-    })
+    HookRegistry.get().hook(method, MiniProgramCompatibilityRuntime.PrivateOpenUrlHooker(context))
 }
 
 private fun isWeChatUpdateUrl(url: String): Boolean {

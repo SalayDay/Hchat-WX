@@ -2,7 +2,7 @@ package h.Hchat.hooks.items.moments
 
 import android.content.Context
 import android.os.SystemClock
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.dexkit.DexMethodCache
 import h.Hchat.hooks.core.BaseFeature
 import h.Hchat.hooks.core.DexInstallScheduler
@@ -226,7 +226,7 @@ class MomentsVideoAutoPlayFeature : BaseFeature() {
                         val primitive = method.returnType == java.lang.Boolean.TYPE
                         HookRegistry.get().hook(
                             method,
-                            AutoPlayGuardHook(hostContext, primitive)
+                            AutoPlayGuardHook(hostContext, primitive, method)
                         )
                         hooked++
                         HLog.e(
@@ -375,31 +375,26 @@ class MomentsVideoAutoPlayFeature : BaseFeature() {
         private class AutoPlayGuardHook(
             private val hostContext: Context,
             /** 目标方法是否返回 primitive boolean（否则是 Boxed Boolean）。安装期算好。 */
-            private val primitiveResult: Boolean
-        ) : XC_MethodHook() {
-            override fun afterHookedMethod(param: MethodHookParam) {
-                if (!isEnabled(hostContext)) return
-                val result = param.result
-                // 只在「判定为允许自动播放」时覆盖；微信自己判 false 时不动。
-                // 注意 Kotlin 的 `is Boolean` 同时匹配 primitive 装箱结果与 Object 形态，
-                // 两种返回类型的目标方法都走这一条路径。
-                if (result !is Boolean || !result) return
-
-                param.result = if (primitiveResult) false else java.lang.Boolean.FALSE
-
+            private val primitiveResult: Boolean,
+            private val method: Method
+        ) : XposedInterface.Hooker {
+            override fun intercept(chain: XposedInterface.Chain): Any? {
+                val result = chain.proceed()
+                if (!isEnabled(hostContext) || result !is Boolean || !result) return result
                 val hits = HIT_COUNT.incrementAndGet()
                 if (hitLogCount.getAndIncrement() < MAX_HIT_LOGS) {
                     HLog.e(
-                        "$TAG 已拦截自动播放：${param.method.declaringClass.name}" +
-                            "#${param.method.name} 返回 true → false（累计 $hits）"
+                        "$TAG 已拦截自动播放：${method.declaringClass.name}" +
+                            "#${method.name} 返回 true → false（累计 $hits）"
                     )
                 }
                 writeHitsThrottled(hostContext, hits)
+                return if (primitiveResult) false else java.lang.Boolean.FALSE
             }
         }
 
         /**
-         * 拦截计数回显到设置页。afterHookedMethod 可能发生在主线程（信息流布局），
+         * 拦截计数回显到设置页。拦截结果处理可能发生在主线程（信息流布局），
          * 不能每条都写偏好——用 CAS 节流，每 10 秒最多写一次盘；第一次命中立即写，
          * 用户拨完开关进入朋友圈马上能看到「已拦截 1 次」。
          */

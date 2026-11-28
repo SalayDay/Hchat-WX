@@ -1,20 +1,19 @@
 package h.Hchat.hooks.core
 
-import de.robv.android.xposed.XC_MethodHook
-import h.Hchat.compat.RuntimeHooks
+import h.Hchat.utils.HLog
+import h.Hchat.utils.KavaReflector
 import h.Hchat.utils.SelfFrameRegistry
+import io.github.libxposed.api.XposedInterface
+import io.github.libxposed.api.XposedInterface.HookHandle
+import io.github.libxposed.api.XposedInterface.Hooker
+import java.lang.reflect.Executable
 import java.lang.reflect.Member
 import java.util.concurrent.CancellationException
 
-/**
- * 统一保存 hook 句柄，便于防御性卸载。
- *
- * 迁移到 LibXposed 后，句柄类型换成 [io.github.libxposed.api.XposedInterface.HookHandle]，
- * 对外仍是 `XC_MethodHook.Unhook`（由 [RuntimeHooks] 包装），因此 100+ 处调用点不用改。
- */
+/** 原生 HookHandle 的生命周期登记表，不转换拦截器或调用上下文。 */
 class HookRegistry private constructor() {
     private val lock = Any()
-    private val unhooks = ArrayList<XC_MethodHook.Unhook>()
+    private val handles = LinkedHashSet<HookHandle>()
     private val installationLease = ThreadLocal<Long>()
     @Volatile private var generation = 0L
 
@@ -28,53 +27,115 @@ class HookRegistry private constructor() {
             throw CancellationException("安装代次已失效")
         }
         installationLease.set(generation)
-        try { return action() }
-        finally {
+        try {
+            return action()
+        } finally {
             if (previous == null) installationLease.remove() else installationLease.set(previous)
         }
     }
 
-    fun hook(method: Member, callback: XC_MethodHook): XC_MethodHook.Unhook = synchronized(lock) {
+    @JvmOverloads
+    fun hook(
+        method: Member,
+        hooker: Hooker,
+        priority: Int = XposedInterface.PRIORITY_DEFAULT
+    ): HookHandle = synchronized(lock) {
         if (!isInstallationGenerationActive(installationGeneration())) {
             throw CancellationException("安装代次已失效")
         }
-        val executable = method as? java.lang.reflect.Executable
-            ?: throw IllegalArgumentException("只能 hook Method / Constructor：$method")
-        val unhook = XC_MethodHook.Unhook(RuntimeHooks.hook(executable, callback))
-        unhooks.add(unhook)
-        // release 走 R8 后类名会被改短，反检测的栈帧过滤没法按前缀识别自身帧，
-        // 所以在注册这一刻把回调类的真实运行时类名记下来（见 SelfFrameRegistry）。
-        SelfFrameRegistry.register(callback.javaClass)
-        unhook
+        val executable = method as? Executable
+            ?: throw IllegalArgumentException("只能 Hook Method / Constructor：$method")
+        val handle = ModuleRuntime.api().hook(executable)
+            .setPriority(priority)
+            .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+            .intercept(hooker)
+        handles.add(handle)
+        // 保存经过 R8 后的真实类名，维持模块自身栈帧的归属判断。
+        SelfFrameRegistry.register(hooker.javaClass)
+        handle
     }
 
-    fun add(unhook: XC_MethodHook.Unhook?) {
-        if (unhook == null) return
+    @JvmOverloads
+    fun hookAllMethods(
+        clazz: Class<*>?,
+        methodName: String?,
+        hooker: Hooker,
+        priority: Int = XposedInterface.PRIORITY_DEFAULT
+    ): Set<HookHandle> {
+        if (clazz == null || methodName.isNullOrEmpty()) return emptySet()
+        val installed = LinkedHashSet<HookHandle>()
+        for (method in KavaReflector.declaredMethods(clazz)) {
+            if (method.name != methodName) continue
+            try {
+                installed.add(hook(method, hooker, priority))
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Throwable) {
+                HLog.e("[Hchat:Hook] 安装失败: ${method.toGenericString()}", failure)
+            }
+        }
+        return installed
+    }
+
+    @JvmOverloads
+    fun hookAllConstructors(
+        clazz: Class<*>?,
+        hooker: Hooker,
+        priority: Int = XposedInterface.PRIORITY_DEFAULT
+    ): Set<HookHandle> {
+        if (clazz == null) return emptySet()
+        val installed = LinkedHashSet<HookHandle>()
+        for (constructor in KavaReflector.declaredConstructors(clazz)) {
+            try {
+                installed.add(hook(constructor, hooker, priority))
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Throwable) {
+                HLog.e("[Hchat:Hook] 安装失败: ${constructor.toGenericString()}", failure)
+            }
+        }
+        return installed
+    }
+
+    /** 对已登记的句柄幂等；过期任务新产生的句柄立即卸载。 */
+    fun add(handle: HookHandle?) {
+        if (handle == null) return
         synchronized(lock) {
             if (isInstallationGenerationActive(installationGeneration())) {
-                unhooks.add(unhook)
+                handles.add(handle)
                 return
             }
         }
-        unhook.unhook()
+        try {
+            handle.unhook()
+        } catch (failure: Throwable) {
+            HLog.e("[Hchat:Hook] 卸载过期安装失败", failure)
+        }
         throw CancellationException("安装代次已失效")
     }
 
-    fun size(): Int = synchronized(lock) { unhooks.size }
+    fun size(): Int = synchronized(lock) { handles.size }
 
-    fun unhook(unhook: XC_MethodHook.Unhook?) {
-        if (unhook == null) return
-        unhook.unhook()
-        synchronized(lock) { unhooks.remove(unhook) }
+    fun unhook(handle: HookHandle?) {
+        if (handle == null) return
+        try {
+            handle.unhook()
+        } finally {
+            synchronized(lock) { handles.remove(handle) }
+        }
     }
 
     fun unhookAll() {
         val previous = synchronized(lock) {
             generation++
-            unhooks.toList().also { unhooks.clear() }
+            handles.toList().also { handles.clear() }
         }
-        for (unhook in previous) {
-            runCatching { unhook.unhook() }
+        for (handle in previous) {
+            try {
+                handle.unhook()
+            } catch (failure: Throwable) {
+                HLog.e("[Hchat:Hook] 卸载失败", failure)
+            }
         }
     }
 

@@ -1,7 +1,7 @@
 package h.Hchat.hooks.items.miniprogramsplashad
 
 import android.content.Context
-import de.robv.android.xposed.XC_MethodHook
+import io.github.libxposed.api.XposedInterface
 import h.Hchat.dexkit.DexMethodCache
 import h.Hchat.hooks.core.BaseFeature
 import h.Hchat.hooks.core.DexInstallScheduler
@@ -181,6 +181,22 @@ private class SkipGlobalMiniProgramSplashAdsRuntime(
         private const val SPLASH_AD_LOG_TAG = "MicroMsg.AppBrandAdUtils[AppBrandSplashAd]"
         private const val SPLASH_AD_RESULT_LOG = "isAdContact, appId:%s, canShowAd:%s"
     }
+
+    class SplashEligibilityHooker(private val context: Context) : XposedInterface.Hooker {
+        override fun intercept(chain: XposedInterface.Chain): Any? {
+            val args = chain.args.toTypedArray()
+            val receiver = chain.thisObject
+            run {
+            run patch@{
+                if (SkipGlobalMiniProgramSplashAdsFeature.isEnabled(context)) {
+                    return false
+                }
+            }
+            return chain.proceed(args)
+            }
+        }
+    }
+
 }
 
 private fun isSplashAdCheckMethod(method: Method): Boolean {
@@ -190,11 +206,5 @@ private fun isSplashAdCheckMethod(method: Method): Boolean {
 }
 
 private fun hookSplashAdCheckMethod(method: Method, context: Context) {
-    HookRegistry.get().hook(method, object : XC_MethodHook() {
-        override fun beforeHookedMethod(param: MethodHookParam) {
-            if (SkipGlobalMiniProgramSplashAdsFeature.isEnabled(context)) {
-                param.setResult(false)
-            }
-        }
-    })
+    HookRegistry.get().hook(method, SkipGlobalMiniProgramSplashAdsRuntime.SplashEligibilityHooker(context))
 }

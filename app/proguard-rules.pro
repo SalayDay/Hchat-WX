@@ -26,6 +26,9 @@
 -keep class h.Hchat.hooks.items.script.ScriptAudioBridge { *; }
 -keep class h.Hchat.hooks.items.script.ScriptMessageBean { *; }
 -keep class h.Hchat.hooks.items.script.ScriptQuoteMsgBean { *; }
+# 脚本 Hook ABI：脚本按类名声明拦截参数、并按名字调用 chain 的方法，
+# R8 改名或裁剪后 import 解析不到，Hook 会静默不触发。
+-keep class h.Hchat.hooks.items.script.ScriptHookChain { *; }
 -keep class h.Hchat.hooks.items.script.ScriptPluginRuntime$SendResult { *; }
 -keep class h.Hchat.hooks.items.protobuf.ProtobufPacketRuntime$Packet { *; }
 -keep class h.Hchat.hooks.api.model.ContactLabelBean { *; }
@@ -62,14 +65,14 @@
 -keep,allowoptimization,allowobfuscation public class * extends io.github.libxposed.api.XposedModule {
     public <init>();
 }
-# 兼容层必须保留可读类名与字段名。
-# 脚本插件按文档用 `param.thisObject` / `param.args` / `param.method` /
-# `param.getResult()` 反射访问 MethodHookParam；一旦被 R8 改名成 `sa6.b` 这种，
-# 脚本侧就地抛 NoSuchFieldException: sa6.thisObject，插件静默失效。
-# 迁移前这里是 `-keep class de.robv.android.xposed.** { *; }`，迁移时被替换掉，
-# 必须按新包名补回来。
--keep class de.robv.android.xposed.** { *; }
--keep class h.Hchat.compat.** { *; }
+# 原生 Hooker 由框架反射实例化/调用 intercept；类与签名必须稳定，
+# 否则 R8 改名后运行时 Hook 静默失效。
+-keep class * implements io.github.libxposed.api.XposedInterface$Hooker {
+    <init>(...);
+    public java.lang.Object intercept(io.github.libxposed.api.XposedInterface$Chain);
+}
+-keep class h.Hchat.hooks.core.ModuleRuntime { *; }
+-keep class h.Hchat.hooks.core.HostRuntime { *; }
 -keep class h.Hchat.ModuleEntry { *; }
 -keep class h.Hchat.crash.NativeCrashBridge { *; }
 -keep class h.Hchat.crash.CrashExitInfoApi30 { *; }

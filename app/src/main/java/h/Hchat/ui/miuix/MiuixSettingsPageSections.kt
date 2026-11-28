@@ -502,8 +502,6 @@ import h.Hchat.ui.FeatureSettingsProvider
 import h.Hchat.ui.UIRegistry
 import h.Hchat.utils.KavaReflector
 import h.Hchat.utils.KeywordReplacementRule
-import de.robv.android.xposed.XC_MethodHook
-import de.robv.android.xposed.XposedBridge
 import org.json.JSONArray
 import org.json.JSONObject
 import top.yukonga.miuix.kmp.basic.BreadcrumbBar
@@ -12895,6 +12893,12 @@ internal fun CrashReportMiuixPage(
             logTotal = lines.size
             lastRefresh = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())
         }
+    }
+
+    // 新日志总是追加在末尾：刷新后自动滚到底，否则用户看到的永远是窗口里最旧的那几行，
+    // 会误以为「只有启动日志，后面不抓了」。
+    LaunchedEffect(logLines) {
+        runCatching { logScroll.scrollTo(logScroll.maxValue) }
     }
 
     fun copyLogs() {

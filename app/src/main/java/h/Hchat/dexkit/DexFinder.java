@@ -24,13 +24,14 @@ import org.luckypray.dexkit.result.UsingFieldData;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 
-import de.robv.android.xposed.XposedBridge;
+import h.Hchat.utils.HLog;
 
 /**
  * DexFinder - 使用 DexKit 定位微信混淆后的类和方法
@@ -44,6 +45,10 @@ public class DexFinder {
     private static final String CACHE_KEY = "cache.key";
     private static final String CACHE_SNAPSHOT_VERSION_KEY = "cache.snapshot.version";
     private static final String CACHE_SNAPSHOT_VERSION = "4";
+    private static final String LOCAL_MESSAGE_TIME_VERSION_KEY = "local.message.time.locator.version";
+    private static final String LOCAL_MESSAGE_TIME_VERSION = "2";
+    private static final String LOCAL_SYSTEM_INSERT_VERSION_KEY = "local.system.insert.locator.version";
+    private static final String LOCAL_SYSTEM_INSERT_VERSION = "1";
     private static final String SEND_TEXT_LOCATOR_VERSION_KEY = "send.text.locator.version";
     private static final String SEND_TEXT_LOCATOR_VERSION = "1";
     private static final String CACHE_SEND_TEXT_LOCATOR_RESOLVED = "locator.send.text.resolved";
@@ -165,13 +170,21 @@ public class DexFinder {
     public Method localSystemMessageMethod;
     public Method localMessageInsertMethod;
     public Method localMessageCreateTimeMethod;
+    /** 系统提示 Listener 直接调用的原生存储插入，返回实际本地 msgId。 */
+    public Method localSystemMessageStorageInsertMethod;
     // 本地消息 API 已经完整扫过几轮。
     // 用来避免「createTime 方法确实定位不到」的机型在每次撤回时都重跑一遍全量 DexKit 扫描。
     // 不设成一次性开关：hook 安装早期就会调用一次（那时 DexKit 可能还没预热好），
     // 一旦失败就把后续真正有效的解析永久挡住，撤回提示会整进程失效。
     private final java.util.concurrent.atomic.AtomicInteger localMessageApiResolveAttempts =
             new java.util.concurrent.atomic.AtomicInteger();
-    private static final int MAX_LOCAL_MESSAGE_RESOLVE_ATTEMPTS = 3;
+    /**
+     * 本地消息 API 的解析次数上限。
+     *
+     * 时间方法定位依赖系统提示入口的调用关系，会随 ClassLoader/热更新就绪时序变化，
+     * 偶尔首次失败属于正常；上限过小会让整个进程生命周期永久失效。
+     */
+    private static final int MAX_LOCAL_MESSAGE_RESOLVE_ATTEMPTS = 8;
     // 视频发送高层入口
     public Method sendVideoMethod;
     public Class<?> sendVideoTaskClass;
@@ -3028,25 +3041,36 @@ public class DexFinder {
                 && method.getDeclaringClass().isAssignableFrom(build.getReturnType());
     }
 
-    public void resolveLocalMessageApi() {
-        // 插入能力实际由 localSystemMessageMethod 决定；localMessageCreateTimeMethod 只决定
-        // 提示插入到哪个时间点。只要系统消息方法在，就不必再触发昂贵的全量扫描。
-        if (localSystemMessageMethod != null) {
-            if (localMessageCreateTimeMethod == null) {
-                localMessageCreateTimeMethod =
-                        findLocalMessageCreateTimeMethod(localSystemMessageMethod.getDeclaringClass());
-            }
-            return;
-        }
-        // 不能只凭 ensureSnapshotLoaded() 早退：缓存命中时 resolvedAll 会被置为 true，
-        // 若上一轮解析失败把 null 写进了缓存，这里就会永远早退，
-        // 本地消息 API（撤回提示、系统提示插入）在整个进程生命周期内永久失效，
-        // 且没有任何日志——正是「防撤回保留消息但不显示提示」这类现象的来源。
+    public synchronized void resolveLocalMessageApi() {
+        ensureSnapshotLoaded();
+        if (localSystemMessageMethod != null && localMessageCreateTimeMethod != null
+                && localSystemMessageStorageInsertMethod != null) return;
         if (localMessageApiResolveAttempts.get() >= MAX_LOCAL_MESSAGE_RESOLVE_ATTEMPTS) return;
-        if (ensureSnapshotLoaded() && localSystemMessageMethod != null) return;
         localMessageApiResolveAttempts.incrementAndGet();
         try {
             int candidateCount = resolveLocalMessageApiBySignature();
+            // 历史快照即使命中，缺失/旧版时间定位也必须独立补齐，不能因 system 非空就早退。
+            // 真正的时间函数在 MsgInfoStorageLogic，Listener 的声明类中根本没有它。
+            if (localSystemMessageMethod != null && localMessageCreateTimeMethod == null) {
+                localMessageCreateTimeMethod = findLocalSystemMessageCreateTimeMethod();
+            }
+            if (localSystemMessageMethod != null && localSystemMessageStorageInsertMethod == null) {
+                localSystemMessageStorageInsertMethod = findLocalSystemMessageStorageInsertMethod();
+                if (localSystemMessageStorageInsertMethod != null) {
+                    localMessageClass = localSystemMessageStorageInsertMethod.getParameterTypes()[0];
+                    localMessageCtor = findLocalMessageConstructor(localMessageClass);
+                }
+            }
+            if (cachePrefs != null && localSystemMessageStorageInsertMethod != null) {
+                SharedPreferences.Editor editor = cachePrefs.edit();
+                putMethod(editor, "localSystemMessageStorageInsertMethod", localSystemMessageStorageInsertMethod);
+                editor.putString(LOCAL_SYSTEM_INSERT_VERSION_KEY, LOCAL_SYSTEM_INSERT_VERSION).apply();
+            }
+            if (cachePrefs != null && localMessageCreateTimeMethod != null) {
+                SharedPreferences.Editor editor = cachePrefs.edit();
+                putMethod(editor, "localMessageCreateTimeMethod", localMessageCreateTimeMethod);
+                editor.putString(LOCAL_MESSAGE_TIME_VERSION_KEY, LOCAL_MESSAGE_TIME_VERSION).apply();
+            }
             logDetail("本地消息API: insert=" + methodName(localMessageInsertMethod)
                     + " system=" + methodName(localSystemMessageMethod)
                     + " createTime=" + methodName(localMessageCreateTimeMethod)
@@ -3064,10 +3088,8 @@ public class DexFinder {
     private int resolveLocalMessageApiBySignature() {
         int count = 0;
         resolveLocalSystemMessageMethod();
+        if (localSystemMessageMethod != null) return count;
         try {
-            if (localMessageInsertMethod != null && localMessageCreateTimeMethod == null) {
-                localMessageCreateTimeMethod = findLocalMessageCreateTimeMethod(localMessageInsertMethod.getDeclaringClass());
-            }
             if (localMessageInsertMethod != null && localMessageCreateTimeMethod != null) {
                 return count;
             }
@@ -3129,7 +3151,6 @@ public class DexFinder {
         localMessageInsertMethod = method;
         localMessageClass = method.getParameterTypes()[0];
         localMessageCtor = findLocalMessageConstructor(localMessageClass);
-        localMessageCreateTimeMethod = findLocalMessageCreateTimeMethod(method.getDeclaringClass());
     }
 
     public void resolveGroupMemberDisplayName() {
@@ -3702,8 +3723,27 @@ public class DexFinder {
             groupSolitaireSendMethod = loadMethod("groupSolitaireSendMethod");
             localSystemMessageMethod = loadMethod("localSystemMessageMethod");
             localMessageInsertMethod = loadMethod("localMessageInsertMethod");
-            localMessageCreateTimeMethod = loadMethod("localMessageCreateTimeMethod");
+            if (LOCAL_MESSAGE_TIME_VERSION.equals(
+                    cachePrefs.getString(LOCAL_MESSAGE_TIME_VERSION_KEY, ""))) {
+                localMessageCreateTimeMethod = loadMethod("localMessageCreateTimeMethod");
+                if (!isLocalMessageCreateTimeMethod(localMessageCreateTimeMethod)) {
+                    localMessageCreateTimeMethod = null;
+                }
+            } else {
+                // 仅废弃旧时间定位，保留其它 DexFinder 描述符，避免整包重新扫描。
+                localMessageCreateTimeMethod = null;
+                cachePrefs.edit().remove("localMessageCreateTimeMethod").apply();
+            }
             localMessageClass = loadClass("localMessageClass");
+            localSystemMessageStorageInsertMethod = null;
+            if (LOCAL_SYSTEM_INSERT_VERSION.equals(
+                    cachePrefs.getString(LOCAL_SYSTEM_INSERT_VERSION_KEY, ""))) {
+                Method cachedInsert = loadMethod("localSystemMessageStorageInsertMethod");
+                if (isLocalSystemStorageInsert(cachedInsert)) {
+                    localSystemMessageStorageInsertMethod = cachedInsert;
+                    localMessageClass = cachedInsert.getParameterTypes()[0];
+                }
+            }
             sendVideoMethod = loadMethod("sendVideoMethod");
             sendVideoTaskClass = loadClass("sendVideoTaskClass");
             videoPathMethod = loadMethod("videoPathMethod");
@@ -3789,9 +3829,6 @@ public class DexFinder {
                 localMessageClass = localMessageInsertMethod.getParameterTypes()[0];
             }
             localMessageCtor = findLocalMessageConstructor(localMessageClass);
-            if (localMessageCreateTimeMethod == null && localMessageInsertMethod != null) {
-                localMessageCreateTimeMethod = findLocalMessageCreateTimeMethod(localMessageInsertMethod.getDeclaringClass());
-            }
             voiceUploadCtor = findCtorByExactTypes(voiceUploadClass, String.class, int.class);
             voiceUploadCdnCtor = findCtorByExactTypes(voiceUploadClass, String.class, boolean.class);
             sendPatSceneCtor = findSendPatSceneCtor(sendPatSceneClass);
@@ -4977,9 +5014,14 @@ public class DexFinder {
             putClass(editor, "groupSolitairePluginClass", groupSolitairePluginClass);
             putMethod(editor, "groupSolitaireSendMethod", groupSolitaireSendMethod);
             putMethod(editor, "localSystemMessageMethod", localSystemMessageMethod);
+            putMethod(editor, "localSystemMessageStorageInsertMethod", localSystemMessageStorageInsertMethod);
+            editor.putString(LOCAL_SYSTEM_INSERT_VERSION_KEY,
+                    localSystemMessageStorageInsertMethod != null ? LOCAL_SYSTEM_INSERT_VERSION : "");
             putClass(editor, "localMessageClass", localMessageClass);
             putMethod(editor, "localMessageInsertMethod", localMessageInsertMethod);
             putMethod(editor, "localMessageCreateTimeMethod", localMessageCreateTimeMethod);
+            editor.putString(LOCAL_MESSAGE_TIME_VERSION_KEY,
+                    localMessageCreateTimeMethod != null ? LOCAL_MESSAGE_TIME_VERSION : "");
             putMethod(editor, "sendVideoMethod", sendVideoMethod);
             putClass(editor, "sendVideoTaskClass", sendVideoTaskClass);
             putMethod(editor, "videoPathMethod", videoPathMethod);
@@ -5457,19 +5499,102 @@ public class DexFinder {
         return null;
     }
 
-    private Method findLocalMessageCreateTimeMethod(Class<?> owner) {
-        if (owner == null) return null;
-        Method fallback = null;
-        for (Method method : KavaReflector.declaredMethods(owner)) {
-            if (!isLocalMessageCreateTimeMethod(method)) continue;
-            if ("m".equals(method.getName())) {
-                return KavaReflector.accessible(method);
-            }
-            if (fallback == null) {
-                fallback = KavaReflector.accessible(method);
+    private Method findLocalSystemMessageStorageInsertMethod() {
+        List<Method> candidates = new ArrayList<>();
+        for (MethodData entry : dexKit.findMethod(mkMethodUsingStrings(
+                "will insert sysmsg from:", "content null, cannot to insert sysmsg!",
+                "failed to insert sysmsg", "sysmsg inserted"))) {
+            try {
+                if (!localSystemMessageMethod.equals(entry.getMethodInstance(classLoader))) continue;
+            } catch (Throwable ignored) { continue; }
+            for (MethodData invoked : entry.getInvokes()) {
+                // invokes 包括构造器，逐个失败隔离，不能让 <init> 打断后续定位。
+                try {
+                    Method method = invoked.getMethodInstance(classLoader);
+                    if (isLocalSystemStorageInsert(method) && !candidates.contains(method)) {
+                        candidates.add(KavaReflector.accessible(method));
+                    }
+                } catch (Throwable ignored) {}
             }
         }
-        return fallback;
+        if (candidates.size() != 1) {
+            h.Hchat.utils.HLog.e(TAG + " 系统提示原生插入入口不唯一或缺失: " + candidates.size());
+            return null;
+        }
+        return candidates.get(0);
+    }
+
+    private boolean isLocalSystemStorageInsert(Method method) {
+        if (method == null || method.getReturnType() != long.class
+                || KavaReflector.isStatic(method) || Modifier.isAbstract(method.getModifiers())
+                || !method.getDeclaringClass().getName().startsWith("com.tencent.mm.storage.")) return false;
+        Class<?>[] types = method.getParameterTypes();
+        if (types.length != 1 || types[0].isPrimitive()) return false;
+        String[] names = {"field_talker", "field_content", "field_createTime", "field_msgId", "field_type"};
+        Class<?>[] fieldTypes = {String.class, String.class, long.class, long.class, int.class};
+        for (int i = 0; i < names.length; i++) {
+            Field field = KavaReflector.findFieldRecursive(types[0], names[i]);
+            if (field == null || field.getType() != fieldTypes[i] || Modifier.isStatic(field.getModifiers())) return false;
+        }
+        return true;
+    }
+
+    private Method findLocalSystemMessageCreateTimeMethod() {
+        if (localSystemMessageMethod == null) return null;
+        // 8.0.76/80 的系统提示入口都同步调用这个 MsgInfoStorageLogic 函数。
+        // 它把秒转毫秒并 max(会话末条时间+1, 输入时间)，因此必须覆盖的是此函数，
+        // 而不是 Listener 的同名方法、消息 getter 或任意 (String,long) 重载。
+        List<Method> semanticCandidates = new ArrayList<>();
+        for (MethodData data : dexKit.findMethod(mkMethodUsingStrings(
+                "MicroMsg.MsgInfoStorageLogic",
+                "[oneliang] fix recv msg db create time, last:%s",
+                "[oneliang] fix recv msg create time, check lastRecvMsgCreateTime %s, fixedTime is :%s"))) {
+            try {
+                Method candidate = data.getMethodInstance(classLoader);
+                if (isLocalMessageCreateTimeMethod(candidate) && !semanticCandidates.contains(candidate)) {
+                    semanticCandidates.add(candidate);
+                }
+            } catch (Throwable ignored) {}
+        }
+        if (semanticCandidates.isEmpty()) return null;
+        List<Method> calledCandidates = new ArrayList<>();
+        for (MethodData entry : dexKit.findMethod(mkMethodUsingStrings(
+                "will insert sysmsg from:", "content null, cannot to insert sysmsg!",
+                "failed to insert sysmsg", "sysmsg inserted"))) {
+            Method entryMethod;
+            try {
+                entryMethod = entry.getMethodInstance(classLoader);
+            } catch (Throwable error) {
+                continue;
+            }
+            if (!localSystemMessageMethod.equals(entryMethod)) continue;
+            for (MethodData invoked : entry.getInvokes()) {
+                // getInvokes() 会混进构造器和字段访问，getMethodInstance 对它们抛
+                // IllegalArgumentException（如 Ljava/lang/StringBuilder;-><init>...）。
+                // 这类条目必须逐条跳过：外层的 try/catch 会把整轮定位中断，
+                // 表现就是「系统提示时间调用链定位失败」，时间方法永远为 null。
+                Method method;
+                try {
+                    method = invoked.getMethodInstance(classLoader);
+                } catch (Throwable ignored) {
+                    continue;
+                }
+                if (semanticCandidates.contains(method) && !calledCandidates.contains(method)) {
+                    calledCandidates.add(KavaReflector.accessible(method));
+                }
+            }
+        }
+        if (calledCandidates.size() == 1) return calledCandidates.get(0);
+        // 调用集合没命中（例如该方法走 invoke-polymorphic 或解析差异）时，
+        // 语义候选唯一也可以直接用；多候选则拒绝猜测，交给上层报告失败。
+        if (calledCandidates.isEmpty() && semanticCandidates.size() == 1) {
+            logDetail("系统提示时间方法按语义唯一命中: "
+                    + methodName(semanticCandidates.get(0)) + "（调用链未解析）");
+            return KavaReflector.accessible(semanticCandidates.get(0));
+        }
+        h.Hchat.utils.HLog.e(TAG + " 系统提示时间方法定位失败: semantic="
+                + semanticCandidates.size() + " called=" + calledCandidates.size());
+        return null;
     }
 
     private boolean isLocalMessageCreateTimeMethod(Method method) {
@@ -6281,7 +6406,7 @@ public class DexFinder {
 
     private void logDetail(String message) {
         if (VERBOSE) {
-            XposedBridge.log(TAG + " " + message);
+            HLog.e(TAG + " " + message);
             return;
         }
         // 打开「记录运行日志」时，把定位细节也收进设置页的日志缓冲。
